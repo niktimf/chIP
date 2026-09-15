@@ -1,0 +1,31 @@
+[package]
+name = "chip-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chip-core = { workspace = true }
+anyhow = { workspace = true }
+backon = { workspace = true }
+ipnet = { workspace = true }
+itertools = { workspace = true }
+openssh = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+shlex = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+x509-parser = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+rstest = { workspace = true }
+pretty_assertions = { workspace = true }
+
+[lints]
+workspace = true
