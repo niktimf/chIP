@@ -3,3 +3,6 @@
 
 pub mod model;
 pub use model::{CheckResult, CountryCode, GateId, InvalidCountryCode, Severity, Verdict};
+
+pub mod report;
+pub use report::Report;
