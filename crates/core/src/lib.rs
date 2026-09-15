@@ -6,3 +6,6 @@ pub use model::{CheckResult, CountryCode, GateId, InvalidCountryCode, Severity, 
 
 pub mod report;
 pub use report::Report;
+
+pub mod gate;
+pub use gate::GateOverrides;
