@@ -6,3 +6,4 @@ pub mod blocklists;
 pub mod services;
 pub mod tampering;
 pub mod service_geo;
+pub mod ai;
