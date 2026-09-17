@@ -214,6 +214,14 @@ pub struct ReputationFacts {
     pub operator: Option<String>,
 }
 
+/// One vote per keyless `GeoIP` source, or `None` if the source did not
+/// answer (including "answered with something that wasn't a two-letter
+/// code" — `io::geoip`, Task 22, folds that case into `None` too).
+#[derive(Debug, Clone)]
+pub struct GeoConsensusFacts {
+    pub votes: Vec<Option<CountryCode>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
