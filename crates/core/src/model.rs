@@ -201,6 +201,19 @@ pub struct PingSweepFacts {
     pub city_anchors: Vec<AnchorSeries>,
 }
 
+#[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ReputationFacts {
+    pub vpn: bool,
+    pub proxy: bool,
+    pub tor: bool,
+    pub compromised: bool,
+    pub anonymous: bool,
+    pub scraper: bool,
+    pub risk: Option<u32>,
+    pub operator: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
