@@ -1,0 +1,96 @@
+use crate::model::{HttpProbeOutcome, ReachFacts};
+use crate::Verdict;
+
+const FAIL_SHARE: f64 = 0.25;
+const MIN_VALID_PROBES: usize = 6;
+
+pub fn judge_reach(facts: &ReachFacts) -> Verdict {
+    let valid = facts.control.iter().filter(|c| **c == HttpProbeOutcome::Ok).count();
+    if valid < MIN_VALID_PROBES {
+        return Verdict::error(format!(
+            "only {valid} of {} probes had a working control anchor (need >= {MIN_VALID_PROBES})",
+            facts.control.len()
+        ));
+    }
+    let failed = facts
+        .candidate
+        .iter()
+        .zip(&facts.control)
+        .filter(|(_, control)| **control == HttpProbeOutcome::Ok)
+        .filter(|(candidate, _)| **candidate == HttpProbeOutcome::Failed)
+        .count();
+    #[allow(clippy::cast_precision_loss)]
+    let share = failed as f64 / valid as f64;
+    let detail = format!("{failed}/{valid} valid probes could not reach the candidate over HTTPS");
+    if share >= FAIL_SHARE {
+        Verdict::fail(detail)
+    } else if failed > 0 {
+        Verdict::warn(detail)
+    } else {
+        Verdict::ok(detail)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::HttpProbeOutcome::{Failed, Ok as HttpOk};
+    use crate::model::Severity;
+
+    fn facts(candidate: &[bool], control: &[bool]) -> ReachFacts {
+        // true = Ok, false = Failed, for readability in each test.
+        ReachFacts {
+            probe_labels: (0..candidate.len()).map(|i| format!("probe{i}")).collect(),
+            candidate: candidate.iter().map(|&ok| if ok { HttpOk } else { Failed }).collect(),
+            control: control.iter().map(|&ok| if ok { HttpOk } else { Failed }).collect(),
+        }
+    }
+
+    #[test]
+    fn all_reachable_is_ok() {
+        let f = facts(&[true; 10], &[true; 10]);
+        assert_eq!(judge_reach(&f).severity, Severity::Ok);
+    }
+
+    #[test]
+    fn a_probe_where_the_control_itself_failed_does_not_count_against_the_candidate() {
+        // Control fails on probes 0-1 (excluded); of the remaining 10, candidate fails none.
+        let candidate = vec![true; 12];
+        let mut control = vec![true; 12];
+        control[0] = false;
+        control[1] = false;
+        let f = facts(&candidate, &control);
+        assert_eq!(judge_reach(&f).severity, Severity::Ok, "{}", judge_reach(&f).detail);
+    }
+
+    #[test]
+    fn thirty_percent_of_valid_probes_failing_fails() {
+        // 10 valid probes, candidate fails 3 of them (30% >= 25% threshold).
+        let mut candidate = vec![true; 10];
+        candidate[0] = false;
+        candidate[1] = false;
+        candidate[2] = false;
+        let f = facts(&candidate, &[true; 10]);
+        assert_eq!(judge_reach(&f).severity, Severity::Fail, "{}", judge_reach(&f).detail);
+    }
+
+    #[test]
+    fn ten_percent_of_valid_probes_failing_warns() {
+        let mut candidate = vec![true; 10];
+        candidate[0] = false;
+        let f = facts(&candidate, &[true; 10]);
+        assert_eq!(judge_reach(&f).severity, Severity::Warn, "{}", judge_reach(&f).detail);
+    }
+
+    #[test]
+    fn fewer_than_six_valid_probes_is_an_error() {
+        // Control fails everywhere except 4 probes — too few to judge.
+        let mut control = vec![false; 10];
+        control[0] = true;
+        control[1] = true;
+        control[2] = true;
+        control[3] = true;
+        let f = facts(&[true; 10], &control);
+        assert_eq!(judge_reach(&f).severity, Severity::Error, "{}", judge_reach(&f).detail);
+    }
+}

@@ -164,6 +164,21 @@ impl CheckResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpProbeOutcome {
+    Ok,
+    Failed,
+}
+
+/// HTTPS reachability of the candidate's temporary listener, and of a known-
+/// good control anchor, measured by the same Globalping probe set.
+#[derive(Debug, Clone)]
+pub struct ReachFacts {
+    pub probe_labels: Vec<String>,
+    pub candidate: Vec<HttpProbeOutcome>,
+    pub control: Vec<HttpProbeOutcome>,
+}
+
 /// One anchor's round-trip series against the same probe set as the
 /// candidate. `None` at index `i` means this anchor did not answer probe
 /// `i` (its own measurement failed or timed out) — not that it was slow.
