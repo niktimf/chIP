@@ -46,23 +46,72 @@ pub fn classify_youtube_premium(body: &str) -> ServiceState {
     }
 }
 
+/// Returns whether `bytes[..marker_pos]` ends with the `,\d+,\d+` digit-group
+/// prefix that `reGeminiRegion` requires immediately before its `,200,"`
+/// literal (`marker_pos` is the index of that literal's leading comma). Each
+/// digit group only needs to be one-or-more digits; like upstream, the
+/// digits' actual *values* are never pinned to anything.
+fn has_digit_group_prefix(bytes: &[u8], marker_pos: usize) -> bool {
+    let mut pos = marker_pos;
+
+    let digit2_end = pos;
+    while pos > 0 && bytes[pos - 1].is_ascii_digit() {
+        pos -= 1;
+    }
+    if pos == digit2_end || pos == 0 || bytes[pos - 1] != b',' {
+        return false;
+    }
+    pos -= 1; // consume the comma before the second digit group
+
+    let digit1_end = pos;
+    while pos > 0 && bytes[pos - 1].is_ascii_digit() {
+        pos -= 1;
+    }
+    if pos == digit1_end || pos == 0 || bytes[pos - 1] != b',' {
+        return false;
+    }
+    true
+}
+
 /// Pulls the ISO 3166-1 alpha-3 region code out of the configuration block
 /// Google's account bar embeds in every one of its pages, mirroring
 /// geocheck's `reGeminiRegion` regex (`,\d+,\d+,200,"([A-Z]{3})"`,
 /// `internal/access/checks.go`, confirmed via `gh api` 2026-09-17) without
 /// pulling in a `regex` dependency for a single call site. Like the upstream
-/// comment says of its own regex, the two leading numbers are not re-verified
-/// here — "matched loosely rather than pinned".
+/// comment says of its own regex, the two leading digit groups' *values* are
+/// not re-verified here — "matched loosely rather than pinned" — but their
+/// *presence* (each is one-or-more digits) is still required, same as the
+/// real regex. A candidate `,200,"..."` occurrence that fails validation
+/// (missing digit-group prefix, or the quoted body isn't exactly three
+/// uppercase ASCII letters) is skipped in favor of the next occurrence
+/// further in the body, mirroring how a real regex search backtracks/retries
+/// rather than giving up at the first failed attempt.
 fn extract_gemini_region(body: &str) -> Option<&str> {
+    let bytes = body.as_bytes();
     let marker = ",200,\"";
-    let start = body.find(marker)? + marker.len();
-    let candidate = body.get(start..start + 3)?;
-    let closes_with_quote = body.as_bytes().get(start + 3) == Some(&b'"');
-    if closes_with_quote && candidate.bytes().all(|b| b.is_ascii_uppercase()) {
-        Some(candidate)
-    } else {
-        None
+    let mut search_start = 0usize;
+
+    while let Some(rel_pos) = body[search_start..].find(marker) {
+        let marker_pos = search_start + rel_pos;
+        let candidate_start = marker_pos + marker.len();
+
+        if let Some(candidate) = body.get(candidate_start..candidate_start + 3) {
+            let closes_with_quote = bytes.get(candidate_start + 3) == Some(&b'"');
+            if closes_with_quote
+                && candidate.bytes().all(|b| b.is_ascii_uppercase())
+                && has_digit_group_prefix(bytes, marker_pos)
+            {
+                return Some(candidate);
+            }
+        }
+
+        // `marker_pos` is the byte index of the marker's leading comma (a
+        // single-byte ASCII char), so `marker_pos + 1` is always a valid
+        // char-boundary to resume the search from.
+        search_start = marker_pos + 1;
     }
+
+    None
 }
 
 /// Countries where Google does not offer Gemini, ported verbatim from
@@ -236,6 +285,25 @@ mod tests {
     #[test]
     fn gemini_with_no_readable_region_is_an_error_not_a_verdict() {
         assert!(matches!(classify_gemini(200, "no region code embedded here"), ServiceState::Error(_)));
+    }
+
+    #[test]
+    fn gemini_skips_a_decoy_200_quote_match_lacking_the_digit_group_prefix() {
+        // "ABC" is shaped like a match (`,200,"ABC"`) but is not preceded by
+        // the `,\d+,\d+,` structural prefix the real regex requires, so it is
+        // a decoy. The real account-bar entry (`,7,42,200,"RUS"`) comes later
+        // in the body and must be the one that wins.
+        let body = r#",200,"ABC" junk ,7,42,200,"RUS" tail"#;
+        assert_eq!(classify_gemini(200, body), ServiceState::Blocked);
+    }
+
+    #[test]
+    fn gemini_with_only_an_invalid_looking_match_is_still_an_error() {
+        // The only `,200,"..."`-shaped substring here is missing the digit
+        // group prefix entirely, so there is no valid match anywhere in the
+        // body and this must still fall back to the "could not read" error.
+        let body = r#"preamble ,200,"ABC" trailer"#;
+        assert!(matches!(classify_gemini(200, body), ServiceState::Error(_)));
     }
 
     #[test]
