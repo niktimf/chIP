@@ -9,3 +9,5 @@ pub use report::Report;
 
 pub mod gate;
 pub use gate::GateOverrides;
+
+pub mod verdict;

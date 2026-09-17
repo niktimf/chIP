@@ -164,6 +164,28 @@ impl CheckResult {
     }
 }
 
+/// One anchor's round-trip series against the same probe set as the
+/// candidate. `None` at index `i` means this anchor did not answer probe
+/// `i` (its own measurement failed or timed out) — not that it was slow.
+#[derive(Debug, Clone)]
+pub struct AnchorSeries {
+    pub anchor_id: String,
+    pub rtt_ms: Vec<Option<f64>>,
+    pub loss_pct: Vec<Option<f64>>,
+}
+
+/// Ping (or, when ICMP is closed, TCP-handshake) round-trip data for the
+/// candidate and the anchors of its declared city, all measured by the same
+/// Globalping probe set so index `i` means the same physical probe
+/// everywhere in this struct.
+#[derive(Debug, Clone)]
+pub struct PingSweepFacts {
+    pub probe_labels: Vec<String>,
+    pub candidate_rtt_ms: Vec<Option<f64>>,
+    pub candidate_loss_pct: Vec<Option<f64>>,
+    pub city_anchors: Vec<AnchorSeries>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
