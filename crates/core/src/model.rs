@@ -222,6 +222,15 @@ pub struct GeoConsensusFacts {
     pub votes: Vec<Option<CountryCode>>,
 }
 
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct BlockListFacts {
+    pub spamhaus_hit: bool,
+    pub spamhaus_available: bool,
+    pub firehol_hit: bool,
+    pub firehol_available: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
