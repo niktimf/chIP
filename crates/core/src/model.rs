@@ -170,6 +170,20 @@ pub enum HttpProbeOutcome {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortalOutcome {
+    Ok,
+    Altered,
+    Unreachable,
+}
+
+pub struct PortalProbe {
+    pub name: &'static str,
+    pub expected_status: u16,
+    pub actual_status: Option<u16>,
+    pub redirected: bool,
+}
+
 /// HTTPS reachability of the candidate's temporary listener, and of a known-
 /// good control anchor, measured by the same Globalping probe set.
 #[derive(Debug, Clone)]
