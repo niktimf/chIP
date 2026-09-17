@@ -236,6 +236,16 @@ pub struct GeoConsensusFacts {
     pub votes: Vec<Option<CountryCode>>,
 }
 
+/// A country vote from a single streaming service (Google, `YouTube`, Apple,
+/// Bing, Spotify, Netflix, `TikTok`). Used by `verdict::service_geo` to
+/// determine whether the IP's location detection is consistent across major
+/// services.
+#[derive(Debug, Clone)]
+pub struct ServiceCountryVote {
+    pub service: &'static str,
+    pub country: Option<CountryCode>,
+}
+
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct BlockListFacts {
