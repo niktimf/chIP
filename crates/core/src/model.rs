@@ -231,6 +231,18 @@ pub struct BlockListFacts {
     pub firehol_available: bool,
 }
 
+/// The outcome of probing one streaming/AI service, as classified by
+/// `verdict::services` from an HTTP status and/or a response body/final URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceState {
+    Available,
+    Restricted,
+    Blocked,
+    /// The probe reached no conclusion (Cloudflare challenge, unrecognized
+    /// body, transport error) — never read as evidence of either verdict.
+    Error(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
