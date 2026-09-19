@@ -37,11 +37,21 @@ impl BlockLists {
 
     async fn fetch_from(http: &reqwest::Client, spamhaus_url: &str, firehol_url: &str) -> Self {
         let (spamhaus, spamhaus_available) = match Self::get_text(http, spamhaus_url).await {
-            Some(body) => (parse_spamhaus(&body), true),
+            Some(body) => {
+                let nets = parse_spamhaus(&body);
+                // A real list is never empty; empty parse means corrupted
+                // response.
+                (nets.clone(), !nets.is_empty())
+            }
             None => (Vec::new(), false),
         };
         let (firehol, firehol_available) = match Self::get_text(http, firehol_url).await {
-            Some(body) => (parse_firehol(&body), true),
+            Some(body) => {
+                let nets = parse_firehol(&body);
+                // A real list is never empty; empty parse means corrupted
+                // response.
+                (nets.clone(), !nets.is_empty())
+            }
             None => (Vec::new(), false),
         };
         Self {
@@ -152,5 +162,32 @@ mod tests {
 
         assert!(!facts.spamhaus_available);
         assert!(facts.firehol_available && facts.firehol_hit);
+    }
+
+    #[tokio::test]
+    async fn a_200_response_that_parses_to_no_entries_is_marked_unavailable() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/spamhaus"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>error</html>"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/firehol"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(FIREHOL_SAMPLE))
+            .mount(&server)
+            .await;
+
+        let lists = BlockLists::fetch_from(
+            &reqwest::Client::new(),
+            &format!("{}/spamhaus", server.uri()),
+            &format!("{}/firehol", server.uri()),
+        )
+        .await;
+        let facts = lists.check(Ipv4Addr::new(192, 0, 2, 1));
+
+        assert!(!facts.spamhaus_available);
+        assert!(!facts.spamhaus_hit);
+        assert!(facts.firehol_available);
     }
 }
