@@ -6,3 +6,4 @@ pub mod proxycheck;
 pub mod geoip;
 pub mod blocklists;
 pub mod ripestat;
+pub mod ssh;
