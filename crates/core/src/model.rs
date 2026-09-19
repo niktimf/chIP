@@ -289,6 +289,15 @@ pub struct RoutingFacts {
     pub origin_count: u32,
 }
 
+/// `/proc/stat`'s first `cpu ` line, reduced to what `steal_pct` needs: the
+/// kernel's own steal-time counter (field 8) and the sum of all ten fields.
+/// Both are monotonically increasing tick counts since boot.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcStatSnapshot {
+    pub steal_ticks: u64,
+    pub total_ticks: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

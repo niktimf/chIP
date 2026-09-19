@@ -9,3 +9,4 @@ pub mod service_geo;
 pub mod ai;
 pub mod neighbors;
 pub mod provenance;
+pub mod steal;
