@@ -282,6 +282,13 @@ pub struct NeighborProbe {
     pub handshake: Option<TlsHandshakeFacts>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RoutingFacts {
+    pub ris_peers_seeing: u32,
+    pub total_ris_peers: u32,
+    pub origin_count: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
