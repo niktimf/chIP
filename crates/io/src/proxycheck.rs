@@ -51,6 +51,11 @@ impl ProxycheckClient {
             }
             _ => {}
         }
+        if !body[ip].is_object() {
+            return Err(ProxycheckError::Api(format!(
+                "no entry for {ip} in the response"
+            )));
+        }
         let entry = &body[ip];
         let detections = &entry["detections"];
         let get_bool = |field: &str| detections[field].as_bool().unwrap_or(false);
@@ -156,6 +161,27 @@ mod tests {
         let err = client.lookup("203.0.113.3").await.unwrap_err();
 
         assert!(matches!(err, ProxycheckError::QuotaExceeded), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_response_without_an_entry_for_the_ip_is_an_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/203.0.113.7"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "ok"})),
+            )
+            .mount(&server)
+            .await;
+        let client = ProxycheckClient {
+            http: reqwest::Client::new(),
+            api_key: None,
+            base_url: server.uri(),
+        };
+
+        let err = client.lookup("203.0.113.7").await.unwrap_err();
+
+        assert!(matches!(err, ProxycheckError::Api(_)), "{err:?}");
     }
 
     #[tokio::test]
