@@ -267,6 +267,21 @@ pub enum ServiceState {
     Error(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct TlsHandshakeFacts {
+    pub cert_cn: Option<String>,
+    pub cert_issuer: Option<String>,
+    pub cert_san: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NeighborProbe {
+    pub ip: String,
+    pub ptr: Option<String>,
+    pub tcp_open: bool,
+    pub handshake: Option<TlsHandshakeFacts>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
