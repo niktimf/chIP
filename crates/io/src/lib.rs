@@ -5,3 +5,4 @@ pub mod globalping;
 pub mod proxycheck;
 pub mod geoip;
 pub mod blocklists;
+pub mod ripestat;
