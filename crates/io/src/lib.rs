@@ -3,3 +3,4 @@
 pub mod atlas;
 pub mod globalping;
 pub mod proxycheck;
+pub mod geoip;
