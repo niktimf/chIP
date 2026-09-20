@@ -100,12 +100,12 @@ async fn handshake(
 }
 
 async fn reverse_dns(ip: Ipv4Addr, timeout: Duration) -> PtrLookup {
-    let mut command = Command::new("dig");
-    command
+    let dig = Command::new("dig")
         .args(["+short", "+time=2", "+tries=1", "-x", &ip.to_string()])
         .stdin(Stdio::null())
-        .kill_on_drop(true);
-    let output = match tokio::time::timeout(timeout, command.output()).await {
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(timeout, dig).await {
         Err(_) => {
             return PtrLookup::Unavailable("lookup timed out".to_string());
         }
