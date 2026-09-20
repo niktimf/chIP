@@ -7,9 +7,15 @@ use super::client::{TunnelClient, TunnelResponse};
 use super::services::BROWSER_UA;
 
 const FAST_API_URL: &str = "https://api.fast.com/netflix/speedtest/v2?https=true&token=YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm&urlCount=1";
+/// Russian airport codes a CDN edge can carry. The `service-geo:cdn` gate
+/// fails on RU and only on RU, so a missing code here is a gate that stays
+/// silent — the list covers every city with a sizeable edge presence, not
+/// just the capitals.
 const RU_IATA_CODES: &[&str] = &[
     "SVO", "DME", "VKO", "MOW", "LED", "KZN", "SVX", "OVB", "KJA", "ROV",
-    "AER", "KHV", "VVO",
+    "AER", "KHV", "VVO", "UFA", "KUF", "GOJ", "IKT", "MRV", "CEK", "PEE",
+    "VOG", "KRR", "TJM", "OMS", "BAX", "HTA", "YKS", "ARH", "MMK", "KGD",
+    "SCW", "ULY", "NOZ", "TOF", "BQS", "UUD", "ABA", "STW", "ESL", "REN",
 ];
 
 fn country(raw: &str) -> Option<CountryCode> {
@@ -224,13 +230,40 @@ fn iata_country(code: &str) -> Option<CountryCode> {
         "HEL" => "FI",
         "FRA" | "BER" | "MUC" | "DUS" | "HAM" => "DE",
         "AMS" => "NL",
-        "ARN" | "STO" => "SE",
-        "LHR" | "LON" => "GB",
-        "CDG" | "PAR" => "FR",
-        "WAW" => "PL",
+        "ARN" | "STO" | "GOT" => "SE",
+        "LHR" | "LON" | "MAN" => "GB",
+        "CDG" | "PAR" | "MRS" => "FR",
+        "WAW" | "KTW" | "GDN" => "PL",
         "RIX" => "LV",
         "TLL" => "EE",
         "VNO" => "LT",
+        "OSL" => "NO",
+        "CPH" => "DK",
+        "VIE" => "AT",
+        "ZRH" | "GVA" => "CH",
+        "MXP" | "MIL" | "FCO" | "ROM" => "IT",
+        "MAD" | "BCN" => "ES",
+        "LIS" => "PT",
+        "PRG" => "CZ",
+        "BUD" => "HU",
+        "OTP" | "BUH" => "RO",
+        "SOF" => "BG",
+        "BEG" => "RS",
+        "ZAG" => "HR",
+        "ATH" => "GR",
+        "DUB" => "IE",
+        "BRU" => "BE",
+        "IST" | "ISL" => "TR",
+        // Neighbours whose edges show up on Russian-facing routes; the gate
+        // does not fail on them, but naming the country beats "no country".
+        "KBP" | "IEV" | "HRK" | "ODS" | "LWO" | "DNK" => "UA",
+        "MSQ" => "BY",
+        "ALA" | "NQZ" | "TSE" => "KZ",
+        "TBS" => "GE",
+        "EVN" => "AM",
+        "GYD" | "BAK" => "AZ",
+        "TAS" => "UZ",
+        "KIV" => "MD",
         _ => return None,
     };
     country(mapped)
@@ -297,8 +330,26 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::moscow("SVO", "RU")]
+    // A Russian edge outside the handful of capital-city codes still has to
+    // be recognized — the CDN-edge gate fails on RU and nothing else.
+    #[case::ufa("UFA", "RU")]
+    #[case::novosibirsk("OVB", "RU")]
+    // Seen for real on 2026-09-20: a Finnish address was served by the
+    // Kharkiv GGC edge, and the short table read it as "no country".
+    #[case::kharkiv("HRK", "UA")]
+    #[case::minsk("MSQ", "BY")]
+    #[case::helsinki("HEL", "FI")]
+    fn an_edge_airport_code_names_its_country(
+        #[case] sut: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(iata_country(sut).unwrap().as_str(), expected);
+    }
+
     #[test]
-    fn russian_iata_codes_are_recognized() {
-        assert_eq!(iata_country("SVO").unwrap().as_str(), "RU");
+    fn an_unknown_airport_code_is_no_country_rather_than_a_guess() {
+        assert!(iata_country("ZZZ").is_none());
     }
 }
