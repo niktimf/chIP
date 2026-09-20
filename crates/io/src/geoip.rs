@@ -58,10 +58,10 @@ fn default_sources() -> Vec<GeoSource> {
             |ip| format!("https://api.ipbase.com/v2/info?ip={ip}"),
             "/data/location/country/alpha2",
         ),
-        // ipapi.is's free tier sometimes returns a full country name here
-        // instead of a code — `extract`'s registry check turns that into
-        // a graceful "no vote" rather than a wrong one.
-        s("ipapi.is", |ip| format!("https://api.ipapi.is/?q={ip}"), "/country"),
+        // ipapi.is used to sit here. Its free tier answers `country` with a
+        // full country name ("Finland"), never an alpha-2 code, so it never
+        // cast a vote and only cost a request per scan. Verified 2026-09-20
+        // against four addresses in three countries.
     ]
 }
 
