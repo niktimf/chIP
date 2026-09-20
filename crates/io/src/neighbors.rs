@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -105,27 +105,27 @@ async fn reverse_dns(ip: Ipv4Addr, timeout: Duration) -> PtrLookup {
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .output();
-    let output = match tokio::time::timeout(timeout, dig).await {
-        Err(_) => {
-            return PtrLookup::Unavailable("lookup timed out".to_string());
-        }
-        Ok(Err(error)) => return PtrLookup::Unavailable(error.to_string()),
-        Ok(Ok(output)) if !output.status.success() => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let reason = stderr
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .map_or_else(
-                    || format!("dig exited with {}", output.status),
-                    |line| line.trim().to_string(),
-                );
-            return PtrLookup::Unavailable(reason);
-        }
-        Ok(Ok(output)) => output,
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    let Some(name) = text.lines().map(str::trim).find(|line| !line.is_empty())
-    else {
+    match tokio::time::timeout(timeout, dig).await {
+        Err(_) => PtrLookup::Unavailable("lookup timed out".to_string()),
+        Ok(Err(error)) => PtrLookup::Unavailable(error.to_string()),
+        Ok(Ok(output)) => ptr_from_dig(&output),
+    }
+}
+
+/// Reads what dig printed, without any I/O of its own: a failed run is
+/// reported by its first stderr line, a successful one by the first PTR name
+/// it listed.
+fn ptr_from_dig(output: &Output) -> PtrLookup {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason = first_nonempty_line(&stderr).map_or_else(
+            || format!("dig exited with {}", output.status),
+            str::to_owned,
+        );
+        return PtrLookup::Unavailable(reason);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(name) = first_nonempty_line(&stdout) else {
         return PtrLookup::NotFound;
     };
     PtrName::try_from(name).map_or_else(
@@ -134,6 +134,10 @@ async fn reverse_dns(ip: Ipv4Addr, timeout: Duration) -> PtrLookup {
         },
         PtrLookup::Resolved,
     )
+}
+
+fn first_nonempty_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
 /// Surveys every host in a subnet with bounded concurrency. A task owns its
