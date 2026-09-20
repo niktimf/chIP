@@ -53,6 +53,20 @@ pub struct LatencySummary {
     pub valid_probes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LatencySummaryError {
+    #[error("no anchor for this city survived outlier rejection")]
+    NoUsableAnchors,
+    #[error(
+        "only {valid} of {total} probes were valid on both sides (need >= {required})"
+    )]
+    TooFewValidProbes {
+        valid: usize,
+        total: usize,
+        required: usize,
+    },
+}
+
 fn median(xs: &[f64]) -> f64 {
     let mut sorted: Vec<f64> = xs.to_vec();
     sorted.sort_by(f64::total_cmp);
@@ -131,12 +145,10 @@ pub fn select_anchors(anchors: &[AnchorSeries]) -> Vec<&AnchorSeries> {
 /// side to trust the arithmetic.
 pub fn summarize_latency(
     facts: &PingSweepFacts,
-) -> Result<LatencySummary, String> {
+) -> Result<LatencySummary, LatencySummaryError> {
     let kept = select_anchors(facts.city_anchors());
     if kept.is_empty() {
-        return Err(
-            "no anchor for this city survived outlier rejection".to_string()
-        );
+        return Err(LatencySummaryError::NoUsableAnchors);
     }
 
     let mut excess = Vec::new();
@@ -161,11 +173,11 @@ pub fn summarize_latency(
     }
 
     if excess.len() < MIN_VALID_PROBES {
-        return Err(format!(
-            "only {} of {} probes were valid on both sides (need >= {MIN_VALID_PROBES})",
-            excess.len(),
-            facts.candidate().len()
-        ));
+        return Err(LatencySummaryError::TooFewValidProbes {
+            valid: excess.len(),
+            total: facts.candidate().len(),
+            required: MIN_VALID_PROBES,
+        });
     }
 
     Ok(LatencySummary {
@@ -182,7 +194,7 @@ pub fn judge_latency(
 ) -> Verdict {
     let summary = match summarize_latency(facts) {
         Ok(s) => s,
-        Err(reason) => return Verdict::error(reason),
+        Err(reason) => return Verdict::error(reason.to_string()),
     };
     let LatencySummary {
         median_excess_ms: med,
@@ -415,6 +427,30 @@ mod tests {
     }
 
     #[test]
+    fn too_few_probes_exposes_counts_as_typed_error_data() {
+        let facts = facts(
+            optional_samples(
+                &[Some(20.0), Some(20.0), None, None, None, None, None, None],
+                0.0,
+            ),
+            vec![anchor("only", &[20.0; 8])],
+        );
+
+        let error = summarize_latency(&facts)
+            .err()
+            .expect("summary must reject insufficient samples");
+
+        assert_eq!(
+            error,
+            LatencySummaryError::TooFewValidProbes {
+                valid: 2,
+                total: 8,
+                required: 6,
+            }
+        );
+    }
+
+    #[test]
     fn no_surviving_anchors_is_an_error() {
         let facts = facts(samples(&[20.0], 0.0), vec![]);
 
@@ -426,6 +462,17 @@ mod tests {
             "{}",
             verdict.detail
         );
+    }
+
+    #[test]
+    fn missing_anchors_has_a_matchable_error_variant() {
+        let facts = facts(samples(&[20.0], 0.0), vec![]);
+
+        let error = summarize_latency(&facts)
+            .err()
+            .expect("summary must reject an empty anchor set");
+
+        assert_eq!(error, LatencySummaryError::NoUsableAnchors);
     }
 
     /// `cli::calibrate` reads these raw numbers directly, so they

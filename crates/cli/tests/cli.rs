@@ -46,3 +46,51 @@ fn secrets_cannot_be_passed_in_process_arguments() {
     assert!(stderr.contains("unexpected argument '--globalping-token'"));
     assert!(!stderr.contains("SECRET123"), "{stderr}");
 }
+
+#[test]
+fn invalid_probe_selection_exits_before_network_work() {
+    let output = chip()
+        .args([
+            "scan",
+            "203.0.113.1",
+            "--country",
+            "FI",
+            "--eyeball-probes",
+            "0",
+            "--dc-probes",
+            "0",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot both be 0"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn malformed_calibration_target_exits_before_network_work() {
+    let output = chip().args(["calibrate", "not-a-target"]).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("expected IP=City"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn calibrate_does_not_read_scan_only_secrets() {
+    let output = chip()
+        .env("SSH_PRIVATE_KEY", "   ")
+        .env("PROXYCHECK_API_KEY", "   ")
+        .args(["calibrate", "not-a-target"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("expected IP=City"), "{stderr}");
+    assert!(!stderr.contains("SSH_PRIVATE_KEY"), "{stderr}");
+    assert!(!stderr.contains("PROXYCHECK_API_KEY"), "{stderr}");
+}

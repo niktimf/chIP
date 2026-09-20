@@ -14,28 +14,24 @@ async fn main() -> ExitCode {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
-    let mut cli = Cli::parse();
-    if let Err(error) = cli.load_secrets_from_env() {
-        eprintln!("error: invalid secret configuration: {error:#}");
-        return ExitCode::from(2);
-    }
-
-    match cli.command {
+    let command = match Cli::parse().into_command() {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("error: invalid configuration: {error:#}");
+            return ExitCode::from(2);
+        }
+    };
+    match command {
         Command::Scan(args) => run_scan_command(*args).await,
         Command::Calibrate(args) => run_calibrate_command(&args).await,
     }
 }
 
-async fn run_scan_command(args: config::ScanArgs) -> ExitCode {
-    if let Err(error) = args.validate() {
-        eprintln!("error: {error}");
-        return ExitCode::from(2);
-    }
-
-    let report = scan::run_scan(&args).await;
+async fn run_scan_command(command: config::ScanCommand) -> ExitCode {
+    let report = scan::run_scan(&command).await;
     println!("{}", report.table());
 
-    if let Some(path) = &args.json {
+    if let Some(path) = command.json_path() {
         let document = serde_json::json!({
             "schema": 1,
             "overall": report.overall().to_string(),
@@ -79,8 +75,8 @@ async fn run_scan_command(args: config::ScanArgs) -> ExitCode {
     ExitCode::from(u8::try_from(report.exit_code()).unwrap_or(2))
 }
 
-async fn run_calibrate_command(args: &config::CalibrateArgs) -> ExitCode {
-    match calibrate::run_calibrate(args).await {
+async fn run_calibrate_command(command: &config::CalibrateCommand) -> ExitCode {
+    match calibrate::run_calibrate(command).await {
         Ok(rows) => {
             println!("{}", calibrate::render_calibration(&rows));
             ExitCode::SUCCESS

@@ -8,7 +8,7 @@ use chip_core::model::RiskScore;
 use chip_core::verdict::ai::judge_ai_endpoints;
 use chip_core::verdict::blocklists::judge_blocklists;
 use chip_core::verdict::geo::judge_geo;
-use chip_core::verdict::latency::{LatencyThresholds, judge_latency};
+use chip_core::verdict::latency::judge_latency;
 use chip_core::verdict::neighbors::{
     judge_candidate_ptr, judge_neighbor_extremes,
 };
@@ -43,7 +43,7 @@ use chip_io::tunnel::{
 };
 use ipnet::Ipv4Net;
 
-use crate::config::ScanArgs;
+use crate::config::ScanCommand;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const GLOBALPING_DEADLINE: Duration = Duration::from_secs(90);
@@ -55,11 +55,8 @@ pub fn network_24(ip: Ipv4Addr) -> Ipv4Net {
         .trunc()
 }
 
-pub fn should_short_circuit(
-    results: &[CheckResult],
-    no_fail_fast: bool,
-) -> bool {
-    !no_fail_fast
+pub fn should_short_circuit(results: &[CheckResult], fail_fast: bool) -> bool {
+    fail_fast
         && results
             .iter()
             .any(|result| result.severity == Severity::Fail)
@@ -78,13 +75,21 @@ pub fn pick_free_port() -> std::io::Result<NonZeroU16> {
     })
 }
 
+#[tracing::instrument(
+    name = "scan.phase_a",
+    level = "info",
+    skip_all,
+    fields(candidate_ip = %command.ip(), country = %command.country())
+)]
 pub async fn run_phase_a(
-    args: &ScanArgs,
+    command: &ScanCommand,
     http: &reqwest::Client,
 ) -> Vec<CheckResult> {
-    let ip = args.ip.as_ipv4();
-    let reputation_client =
-        ProxycheckClient::new(http.clone(), args.proxycheck_api_key.clone());
+    let ip = command.ip();
+    let reputation_client = ProxycheckClient::new(
+        http.clone(),
+        command.proxycheck_api_key().cloned(),
+    );
     let geo_client = GeoIpClient::new(http.clone(), Duration::from_secs(6));
     let ripestat_client = RipestatClient::new(http.clone());
     let prefix = network_24(ip);
@@ -110,7 +115,7 @@ pub async fn run_phase_a(
             ),
         ),
         CheckResult::new("blocklists", judge_blocklists(&blocklists.check(ip))),
-        CheckResult::new("geo", judge_geo(&geo, &args.country)),
+        CheckResult::new("geo", judge_geo(&geo, command.country())),
         CheckResult::new(
             "provenance",
             provenance.map_or_else(
@@ -223,7 +228,7 @@ async fn reach_measurement(
 
 async fn run_globalping_measurements(
     client: &GlobalpingClient,
-    args: &ScanArgs,
+    command: &ScanCommand,
     city_anchors: &[Anchor],
     listener: Option<u16>,
     control_anchor: Option<&Anchor>,
@@ -241,12 +246,13 @@ async fn run_globalping_measurements(
         results
     }
 
-    let locations = match Locations::ru(args.eyeball_probes, args.dc_probes) {
+    let probes = command.probes();
+    let locations = match Locations::ru(probes.eyeball(), probes.datacenter()) {
         Ok(locations) => locations,
         Err(error) => return unavailable(&error, listener),
     };
     let candidate_id = match client
-        .create(&MeasurementKind::ping(args.ip.as_ipv4()), &locations)
+        .create(&MeasurementKind::ping(command.ip()), &locations)
         .await
     {
         Ok(id) => id,
@@ -261,23 +267,19 @@ async fn run_globalping_measurements(
     };
     let anchors =
         anchor_measurements(client, &candidate_id, city_anchors).await;
-    let latency = LatencyThresholds::new(args.max_excess_ms, args.max_loss_pct)
-        .map_or_else(
-            |error| Verdict::error(error.to_string()),
-            |thresholds| {
-                ping_sweep_facts(&candidate, &anchors).map_or_else(
-                    |error| Verdict::error(error.to_string()),
-                    |facts: PingSweepFacts| judge_latency(&facts, &thresholds),
-                )
-            },
-        );
+    let latency = ping_sweep_facts(&candidate, &anchors).map_or_else(
+        |error| Verdict::error(error.to_string()),
+        |facts: PingSweepFacts| {
+            judge_latency(&facts, command.latency_thresholds())
+        },
+    );
     let mut results = vec![CheckResult::new("latency", latency)];
     if let Some(port) = listener {
         results.push(
             reach_measurement(
                 client,
                 &candidate_id,
-                args.ip.as_ipv4(),
+                command.ip(),
                 port,
                 control_anchor,
             )
@@ -409,22 +411,21 @@ async fn run_tunnel_checks(
 }
 
 fn select_anchors(
-    args: &ScanArgs,
+    command: &ScanCommand,
     anchors: &[Anchor],
 ) -> (Vec<Anchor>, Vec<Anchor>) {
-    let city = args
-        .city
-        .as_ref()
+    let city = command
+        .city()
         .map_or_else(Vec::new, |city| select_for_city(anchors, city, 3));
     let city = if city.is_empty() {
-        select_for_country(anchors, &args.country, 3)
+        select_for_country(anchors, command.country(), 3)
     } else {
         city
     };
-    let city = args
-        .anchor
-        .map_or(city, |ip| vec![manual_anchor(ip, args.country)]);
-    let reference = select_for_city(anchors, &args.reference_city, 2);
+    let city = command
+        .anchor()
+        .map_or(city, |ip| vec![manual_anchor(ip, *command.country())]);
+    let reference = select_for_city(anchors, command.reference_city(), 2);
     (city, reference)
 }
 
@@ -489,23 +490,62 @@ struct SshSetup {
     listener_port: Option<u16>,
 }
 
+impl SshSetup {
+    async fn stop_listener(&self) -> Option<CheckResult> {
+        let port = self.listener_port?;
+        let session = self.session.as_ref()?;
+        match session.stop_listener(port).await {
+            Ok(()) => {
+                tracing::debug!(port, "temporary listener stopped");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(port, error = %error, "temporary listener cleanup failed");
+                Some(CheckResult::new(
+                    "listener-cleanup",
+                    Verdict::error(error.to_string()),
+                ))
+            }
+        }
+    }
+}
+
+async fn run_until_deadline_then_cleanup<T, CleanupOutput>(
+    deadline: tokio::time::Instant,
+    work: impl std::future::Future<Output = T>,
+    cleanup: impl std::future::Future<Output = CleanupOutput>,
+) -> (Result<T, tokio::time::error::Elapsed>, CleanupOutput) {
+    let outcome = tokio::time::timeout_at(deadline, work).await;
+    let cleanup_output = cleanup.await;
+    (outcome, cleanup_output)
+}
+
+#[tracing::instrument(
+    name = "scan.prepare_globalping",
+    level = "debug",
+    skip_all,
+    fields(candidate_ip = %command.ip())
+)]
 async fn prepare_globalping(
-    args: &ScanArgs,
+    command: &ScanCommand,
     http: &reqwest::Client,
 ) -> Result<GlobalpingSources, GlobalpingSetupError> {
-    let globalping =
-        GlobalpingClient::new(http.clone(), args.globalping_token.clone());
+    let globalping = GlobalpingClient::new(
+        http.clone(),
+        command.globalping_token().cloned(),
+    );
+    let probes = command.probes();
     match globalping.limits().await {
         Ok(limits)
             if limits.remaining
-                < globalping_budget(args.eyeball_probes, args.dc_probes) =>
+                < globalping_budget(probes.eyeball(), probes.datacenter()) =>
         {
             return Err(GlobalpingSetupError {
                 gate: "globalping-quota",
                 detail: format!(
                     "only {} Globalping tests remain; need approximately {}",
                     limits.remaining,
-                    globalping_budget(args.eyeball_probes, args.dc_probes)
+                    globalping_budget(probes.eyeball(), probes.datacenter())
                 ),
             });
         }
@@ -526,7 +566,7 @@ async fn prepare_globalping(
                 gate: "latency",
                 detail: format!("could not load RIPE Atlas anchors: {error}"),
             })?;
-    let (city_anchors, reference_anchors) = select_anchors(args, &anchors);
+    let (city_anchors, reference_anchors) = select_anchors(command, &anchors);
     Ok(GlobalpingSources {
         client: globalping,
         city_anchors,
@@ -534,22 +574,28 @@ async fn prepare_globalping(
     })
 }
 
-fn ssh_config(args: &ScanArgs) -> SshConfig {
+fn ssh_config(command: &ScanCommand) -> SshConfig {
     SshConfig {
-        user: Some(args.ssh_user.clone()),
-        port: args.ssh_port,
-        private_key: args.ssh_private_key.clone(),
-        known_hosts: args.ssh_known_hosts.clone(),
+        user: Some(command.ssh_user().to_owned()),
+        port: command.ssh_port(),
+        private_key: command.ssh_private_key().cloned(),
+        known_hosts: command.ssh_known_hosts().map(str::to_owned),
         connect_timeout: Duration::from_secs(15),
         command_timeout: Duration::from_secs(20),
     }
 }
 
-async fn prepare_ssh(args: &ScanArgs) -> (SshSetup, Vec<CheckResult>) {
-    let config = ssh_config(args);
-    let ip = args.ip.as_ipv4();
+#[tracing::instrument(
+    name = "scan.prepare_ssh",
+    level = "debug",
+    skip_all,
+    fields(candidate_ip = %command.ip())
+)]
+async fn prepare_ssh(command: &ScanCommand) -> (SshSetup, Vec<CheckResult>) {
+    let config = ssh_config(command);
+    let ip = command.ip();
     let mut results = Vec::new();
-    if args.no_ssh {
+    if !command.ssh_enabled() {
         results.push(CheckResult::new(
             "reach",
             Verdict::ok("skipped by --no-ssh"),
@@ -608,14 +654,14 @@ async fn prepare_ssh(args: &ScanArgs) -> (SshSetup, Vec<CheckResult>) {
 
 async fn run_globalping_branch(
     sources: Result<GlobalpingSources, GlobalpingSetupError>,
-    args: &ScanArgs,
+    command: &ScanCommand,
     listener_port: Option<u16>,
 ) -> Vec<CheckResult> {
     match sources {
         Ok(sources) => {
             run_globalping_measurements(
                 &sources.client,
-                args,
+                command,
                 &sources.city_anchors,
                 listener_port,
                 sources.reference_anchors.first(),
@@ -645,7 +691,7 @@ async fn run_globalping_branch(
 }
 
 async fn run_socks_checks(
-    args: &ScanArgs,
+    command: &ScanCommand,
     setup: &SshSetup,
 ) -> Vec<CheckResult> {
     let Some(_session) = &setup.session else {
@@ -659,23 +705,20 @@ async fn run_socks_checks(
             )));
         }
     };
-    let tunnel = match SocksTunnel::start(
-        args.ip.as_ipv4(),
-        &setup.config,
-        port,
-    )
-    .await
-    {
-        Ok(tunnel) => tunnel,
-        Err(error) => {
-            return tunnel_results(&Verdict::error(format!(
-                "SOCKS tunnel failed: {error}"
-            )));
-        }
-    };
+    let tunnel =
+        match SocksTunnel::start(command.ip(), &setup.config, port).await {
+            Ok(tunnel) => tunnel,
+            Err(error) => {
+                return tunnel_results(&Verdict::error(format!(
+                    "SOCKS tunnel failed: {error}"
+                )));
+            }
+        };
     let results = match TunnelClient::new(tunnel.local_addr(), REQUEST_TIMEOUT)
     {
-        Ok(client) => Box::pin(run_tunnel_checks(&client, &args.country)).await,
+        Ok(client) => {
+            Box::pin(run_tunnel_checks(&client, command.country())).await
+        }
         Err(error) => tunnel_results(&Verdict::error(error.to_string())),
     };
     tunnel.stop().await;
@@ -696,29 +739,32 @@ async fn run_steal_check(session: &SshSession) -> CheckResult {
     CheckResult::new("steal", verdict)
 }
 
-async fn run_ssh_checks(args: &ScanArgs, setup: &SshSetup) -> Vec<CheckResult> {
+async fn run_ssh_checks(
+    command: &ScanCommand,
+    setup: &SshSetup,
+) -> Vec<CheckResult> {
     let Some(session) = &setup.session else {
         return Vec::new();
     };
-    let (mut results, steal) =
-        tokio::join!(run_socks_checks(args, setup), run_steal_check(session));
+    let (mut results, steal) = tokio::join!(
+        run_socks_checks(command, setup),
+        run_steal_check(session)
+    );
     results.push(steal);
-    if let Some(port) = setup.listener_port {
-        if let Err(error) = session.stop_listener(port).await {
-            results.push(CheckResult::new(
-                "listener-cleanup",
-                Verdict::error(error.to_string()),
-            ));
-        }
-    }
     results
 }
 
-async fn run_neighbor_checks(args: &ScanArgs) -> Vec<CheckResult> {
-    if args.no_neighbors {
+#[tracing::instrument(
+    name = "scan.neighbors",
+    level = "debug",
+    skip_all,
+    fields(candidate_ip = %command.ip())
+)]
+async fn run_neighbor_checks(command: &ScanCommand) -> Vec<CheckResult> {
+    if !command.neighbors_enabled() {
         return Vec::new();
     }
-    let ip = args.ip.as_ipv4();
+    let ip = command.ip();
     let probes = sweep(network_24(ip), &SweepConfig::default()).await;
     let candidate_ptr = probes.iter().find(|probe| probe.ip == ip).map_or_else(
         || {
@@ -734,44 +780,66 @@ async fn run_neighbor_checks(args: &ScanArgs) -> Vec<CheckResult> {
     ]
 }
 
-async fn run_phase_b_inner(
-    args: &ScanArgs,
-    http: &reqwest::Client,
-) -> Vec<CheckResult> {
-    let (sources, (ssh, mut results)) =
-        tokio::join!(prepare_globalping(args, http), prepare_ssh(args));
-    let (globalping, ssh_checks, neighbors) = tokio::join!(
-        run_globalping_branch(sources, args, ssh.listener_port),
-        run_ssh_checks(args, &ssh),
-        run_neighbor_checks(args),
-    );
-    results.extend(globalping);
-    results.extend(ssh_checks);
-    results.extend(neighbors);
-    results
-}
-
+#[tracing::instrument(
+    name = "scan.phase_b",
+    level = "info",
+    skip_all,
+    fields(
+        candidate_ip = %command.ip(),
+        country = %command.country(),
+        deadline_secs = command.deadline().as_secs()
+    )
+)]
 pub async fn run_phase_b(
-    args: &ScanArgs,
+    command: &ScanCommand,
     http: &reqwest::Client,
 ) -> Vec<CheckResult> {
-    Box::pin(tokio::time::timeout(
-        Duration::from_secs(args.deadline_secs.get()),
-        run_phase_b_inner(args, http),
-    ))
-    .await
-    .unwrap_or_else(|_| {
-        vec![CheckResult::new(
+    let deadline = tokio::time::Instant::now() + command.deadline();
+    // Preparation is individually bounded by the HTTP and SSH adapters. Keep
+    // it outside the cancelling timeout so a listener cannot be created in a
+    // future that is then dropped before its owner gets a chance to clean up.
+    let (sources, (ssh, mut results)) =
+        tokio::join!(prepare_globalping(command, http), prepare_ssh(command));
+    let listener_port = ssh.listener_port;
+    let checks = Box::pin(async {
+        let (globalping, ssh_checks, neighbors) = tokio::join!(
+            run_globalping_branch(sources, command, listener_port),
+            run_ssh_checks(command, &ssh),
+            run_neighbor_checks(command),
+        );
+        let mut checks = globalping;
+        checks.extend(ssh_checks);
+        checks.extend(neighbors);
+        checks
+    });
+    let (outcome, cleanup_error) =
+        run_until_deadline_then_cleanup(deadline, checks, ssh.stop_listener())
+            .await;
+    if let Ok(checks) = outcome {
+        results.extend(checks);
+    } else {
+        tracing::warn!("phase B deadline exceeded");
+        results.push(CheckResult::new(
             "scan-deadline",
             Verdict::error(format!(
                 "phase B exceeded the {}s overall deadline",
-                args.deadline_secs
+                command.deadline().as_secs()
             )),
-        )]
-    })
+        ));
+    }
+    if let Some(cleanup_error) = cleanup_error {
+        results.push(cleanup_error);
+    }
+    results
 }
 
-pub async fn run_scan(args: &ScanArgs) -> Report {
+#[tracing::instrument(
+    name = "scan",
+    level = "info",
+    skip_all,
+    fields(candidate_ip = %command.ip(), country = %command.country())
+)]
+pub async fn run_scan(command: &ScanCommand) -> Report {
     let http = match reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(concat!("chip/", env!("CARGO_PKG_VERSION")))
@@ -787,17 +855,23 @@ pub async fn run_scan(args: &ScanArgs) -> Report {
             };
         }
     };
-    let mut results = run_phase_a(args, &http).await;
-    if !should_short_circuit(&results, args.no_fail_fast) {
-        results.extend(run_phase_b(args, &http).await);
+    let mut results = run_phase_a(command, &http).await;
+    if !should_short_circuit(&results, command.fail_fast()) {
+        results.extend(run_phase_b(command, &http).await);
     }
-    let overrides = args.gate_overrides();
-    Report {
+    let overrides = command.gate_overrides();
+    let report = Report {
         results: results
             .into_iter()
             .map(|result| overrides.apply(result))
             .collect(),
-    }
+    };
+    tracing::debug!(
+        overall = %report.overall(),
+        result_count = report.results.len(),
+        "scan completed"
+    );
+    report
 }
 
 #[cfg(test)]
@@ -813,17 +887,17 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::fail_fast_on_fail(Verdict::fail("wrong country"), false, true)]
-    #[case::error_is_not_fail(Verdict::error("unavailable"), false, false)]
-    #[case::fail_fast_disabled(Verdict::fail("wrong country"), true, false)]
+    #[case::fail_fast_on_fail(Verdict::fail("wrong country"), true, true)]
+    #[case::error_is_not_fail(Verdict::error("unavailable"), true, false)]
+    #[case::fail_fast_disabled(Verdict::fail("wrong country"), false, false)]
     fn fail_fast_obeys_the_verdict_and_opt_out(
         #[case] verdict: Verdict,
-        #[case] no_fail_fast: bool,
+        #[case] fail_fast: bool,
         #[case] expected: bool,
     ) {
         let results = [CheckResult::new("geo", verdict)];
 
-        let actual = should_short_circuit(&results, no_fail_fast);
+        let actual = should_short_circuit(&results, fail_fast);
 
         assert_eq!(actual, expected);
     }
@@ -831,5 +905,22 @@ mod tests {
     #[test]
     fn globalping_budget_matches_the_documented_full_scan() {
         assert_eq!(globalping_budget(8, 4), 84);
+    }
+
+    #[tokio::test]
+    async fn deadline_cancellation_still_runs_resource_cleanup() {
+        let cleaned = std::cell::Cell::new(false);
+        let work = std::future::pending::<()>();
+        let cleanup = async { cleaned.set(true) };
+
+        let (outcome, ()) = run_until_deadline_then_cleanup(
+            tokio::time::Instant::now(),
+            work,
+            cleanup,
+        )
+        .await;
+
+        assert!(outcome.is_err());
+        assert!(cleaned.get());
     }
 }
