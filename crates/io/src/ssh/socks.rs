@@ -225,7 +225,7 @@ mod tests {
             stream.write_all(&[0x05, 0x00]).await.unwrap();
         });
 
-        let tunnel = SocksTunnel::start_with_program(
+        let sut = SocksTunnel::start_with_program(
             &program,
             "203.0.113.5".parse().unwrap(),
             &config(),
@@ -235,11 +235,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            tunnel.local_addr(),
+            sut.local_addr(),
             SocketAddr::from(([127, 0, 0, 1], port.get()))
         );
         responder.await.unwrap();
-        tunnel.stop().await;
+        sut.stop().await;
     }
 
     #[tokio::test]

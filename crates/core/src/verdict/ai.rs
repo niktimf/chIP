@@ -114,18 +114,20 @@ mod tests {
 
     #[test]
     fn judge_ai_endpoints_never_fails_only_warns_on_a_block() {
-        let states = [
+        let sut = [
             ("openai", ServiceState::Blocked),
             ("anthropic", ServiceState::Available),
         ];
-        let v = judge_ai_endpoints(&states);
-        assert_eq!(v.severity, Severity::Warn);
+        let verdict = judge_ai_endpoints(&sut);
+
+        assert_eq!(verdict.severity, Severity::Warn);
     }
 
     #[test]
     fn judge_ai_endpoints_is_ok_when_nothing_is_blocked() {
-        let states = [("openai", ServiceState::Available)];
-        assert_eq!(judge_ai_endpoints(&states).severity, Severity::Ok);
+        let sut = [("openai", ServiceState::Available)];
+
+        assert_eq!(judge_ai_endpoints(&sut).severity, Severity::Ok);
     }
 
     #[test]
@@ -141,8 +143,8 @@ mod tests {
 
     #[test]
     fn an_unreachable_endpoint_is_an_error() {
-        let states = [("openai", ServiceState::Unavailable("timeout".into()))];
+        let sut = [("openai", ServiceState::Unavailable("timeout".into()))];
 
-        assert_eq!(judge_ai_endpoints(&states).severity, Severity::Error);
+        assert_eq!(judge_ai_endpoints(&sut).severity, Severity::Error);
     }
 }

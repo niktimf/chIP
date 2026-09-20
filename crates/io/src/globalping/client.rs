@@ -306,9 +306,9 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = client_against(&server);
+        let sut = client_against(&server);
 
-        let id = client
+        let id = sut
             .create(
                 &MeasurementKind::ping(ip("192.0.2.1")),
                 &Locations::ru(8, 4).unwrap(),
@@ -341,9 +341,9 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = client_against(&server);
+        let sut = client_against(&server);
 
-        let id = client
+        let id = sut
             .create(
                 &MeasurementKind::ping(ip("192.0.2.2")),
                 &Locations::reuse(measurement_id("meas-1")),
@@ -369,18 +369,17 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = client_against(&server);
+        let sut = client_against(&server);
 
-        client
-            .create(
-                &MeasurementKind::https(
-                    ip("192.0.2.1"),
-                    NonZeroU16::new(443).unwrap(),
-                ),
-                &Locations::reuse(measurement_id("meas-1")),
-            )
-            .await
-            .unwrap();
+        sut.create(
+            &MeasurementKind::https(
+                ip("192.0.2.1"),
+                NonZeroU16::new(443).unwrap(),
+            ),
+            &Locations::reuse(measurement_id("meas-1")),
+        )
+        .await
+        .unwrap();
 
         let body = received_body(&server).await;
         assert_eq!(body["type"], "http");
@@ -398,9 +397,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(429))
             .mount(&server)
             .await;
-        let client = client_against(&server);
+        let sut = client_against(&server);
 
-        let err = client
+        let err = sut
             .create(
                 &MeasurementKind::ping(ip("192.0.2.1")),
                 &Locations::reuse(measurement_id("x")),
@@ -419,9 +418,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(422))
             .mount(&server)
             .await;
-        let client = client_against(&server);
+        let sut = client_against(&server);
 
-        let err = client
+        let err = sut
             .create(
                 &MeasurementKind::ping(ip("192.0.2.1")),
                 &Locations::reuse(measurement_id("x")),
@@ -443,9 +442,9 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        let client = client_against(&server);
+        let sut = client_against(&server);
 
-        let measurement = client
+        let measurement = sut
             .poll_until_finished(
                 &measurement_id("meas-1"),
                 Duration::from_secs(5),
@@ -467,9 +466,9 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        let client = client_against(&server);
+        let sut = client_against(&server);
 
-        let err = client
+        let err = sut
             .poll_until_finished(
                 &measurement_id("meas-1"),
                 Duration::from_millis(50),
@@ -490,9 +489,9 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = client_against(&server);
+        let sut = client_against(&server);
 
-        let limits = client.limits().await.unwrap();
+        let limits = sut.limits().await.unwrap();
 
         assert_eq!(
             limits,

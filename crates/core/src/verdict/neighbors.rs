@@ -365,18 +365,18 @@ mod tests {
 
     #[test]
     fn no_extreme_pattern_among_ordinary_neighbors_is_ok() {
-        let probes = vec![
+        let sut = vec![
             handshake("203.0.113.10", "blog.example.org", "R3", &[]),
             handshake("203.0.113.11", "www.apple.com", "DigiCert", &[]),
             no_handshake("203.0.113.12"),
             closed("203.0.113.13"),
         ];
-        assert_eq!(judge_neighbor_extremes(&probes).severity, Severity::Ok);
+        assert_eq!(judge_neighbor_extremes(&sut).severity, Severity::Ok);
     }
 
     #[test]
     fn twenty_plus_responding_with_zero_real_sites_warns_as_a_proxy_farm() {
-        let probes: Vec<NeighborProbe> = (0..22)
+        let sut: Vec<NeighborProbe> = (0..22)
             .map(|i| {
                 handshake(
                     &format!("203.0.113.{i}"),
@@ -386,33 +386,38 @@ mod tests {
                 )
             })
             .collect();
-        let v = judge_neighbor_extremes(&probes);
-        assert_eq!(v.severity, Severity::Warn, "{}", v.detail);
-        assert!(v.detail.contains("proxy farm"), "{}", v.detail);
+        let verdict = judge_neighbor_extremes(&sut);
+
+        assert_eq!(verdict.severity, Severity::Warn, "{}", verdict.detail);
+        assert!(verdict.detail.contains("proxy farm"), "{}", verdict.detail);
     }
 
     #[test]
     fn twenty_plus_identical_self_signed_certs_warns_as_one_operator() {
-        let mut probes: Vec<NeighborProbe> = (0..22)
+        let mut sut: Vec<NeighborProbe> = (0..22)
             .map(|i| handshake(&format!("203.0.113.{i}"), "", "", &[]))
             .collect();
-        probes.push(handshake("203.0.113.99", "blog.example.org", "R3", &[])); // keep at least one real site
-        let v = judge_neighbor_extremes(&probes);
-        assert_eq!(v.severity, Severity::Warn, "{}", v.detail);
-        assert!(v.detail.contains("one operator"), "{}", v.detail);
+        sut.push(handshake("203.0.113.99", "blog.example.org", "R3", &[])); // keep at least one real site
+
+        let verdict = judge_neighbor_extremes(&sut);
+
+        assert_eq!(verdict.severity, Severity::Warn, "{}", verdict.detail);
+        assert!(verdict.detail.contains("one operator"), "{}", verdict.detail);
     }
 
     #[test]
     fn five_plus_vpn_labeled_ptrs_among_neighbors_warns() {
-        let mut probes: Vec<NeighborProbe> = (0..5)
+        let mut sut: Vec<NeighborProbe> = (0..5)
             .map(|i| NeighborProbe {
                 ip: format!("203.0.113.{i}").parse().unwrap(),
                 ptr: ptr(&format!("vpn{i}.example.net")),
                 https: NeighborHttps::Open { handshake: None },
             })
             .collect();
-        probes.push(handshake("203.0.113.99", "blog.example.org", "R3", &[]));
-        let v = judge_neighbor_extremes(&probes);
-        assert_eq!(v.severity, Severity::Warn, "{}", v.detail);
+        sut.push(handshake("203.0.113.99", "blog.example.org", "R3", &[]));
+
+        let verdict = judge_neighbor_extremes(&sut);
+
+        assert_eq!(verdict.severity, Severity::Warn, "{}", verdict.detail);
     }
 }

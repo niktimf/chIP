@@ -129,14 +129,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let lists = BlockLists::fetch_from(
+        let sut = BlockLists::fetch_from(
             &reqwest::Client::new(),
             &format!("{}/spamhaus", server.uri()),
             &format!("{}/firehol", server.uri()),
         )
         .await;
-        let hit = lists.check(Ipv4Addr::new(203, 0, 113, 5));
-        let clean = lists.check(Ipv4Addr::new(8, 8, 8, 8));
+        let hit = sut.check(Ipv4Addr::new(203, 0, 113, 5));
+        let clean = sut.check(Ipv4Addr::new(8, 8, 8, 8));
 
         assert_eq!(hit.spamhaus, BlockListStatus::Listed);
         assert_eq!(hit.firehol, BlockListStatus::Listed);
@@ -161,13 +161,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let lists = BlockLists::fetch_from(
+        let sut = BlockLists::fetch_from(
             &reqwest::Client::new(),
             &format!("{}/spamhaus", server.uri()),
             &format!("{}/firehol", server.uri()),
         )
         .await;
-        let facts = lists.check(Ipv4Addr::new(192, 0, 2, 1));
+        let facts = sut.check(Ipv4Addr::new(192, 0, 2, 1));
 
         assert_eq!(facts.spamhaus, BlockListStatus::Unavailable);
         assert_eq!(facts.firehol, BlockListStatus::Listed);
@@ -192,13 +192,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let lists = BlockLists::fetch_from(
+        let sut = BlockLists::fetch_from(
             &reqwest::Client::new(),
             &format!("{}/spamhaus", server.uri()),
             &format!("{}/firehol", server.uri()),
         )
         .await;
-        let facts = lists.check(Ipv4Addr::new(192, 0, 2, 1));
+        let facts = sut.check(Ipv4Addr::new(192, 0, 2, 1));
 
         assert_eq!(facts.spamhaus, BlockListStatus::Unavailable);
         assert_eq!(facts.firehol, BlockListStatus::Listed);

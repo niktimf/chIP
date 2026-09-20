@@ -40,37 +40,37 @@ mod tests {
 
     #[test]
     fn present_on_spamhaus_fails() {
-        let f = BlockListFacts {
+        let sut = BlockListFacts {
             spamhaus: BlockListStatus::Listed,
             ..clean()
         };
-        assert_eq!(judge_blocklists(&f).severity, Severity::Fail);
+        assert_eq!(judge_blocklists(&sut).severity, Severity::Fail);
     }
 
     #[test]
     fn present_on_firehol_fails() {
-        let f = BlockListFacts {
+        let sut = BlockListFacts {
             firehol: BlockListStatus::Listed,
             ..clean()
         };
-        assert_eq!(judge_blocklists(&f).severity, Severity::Fail);
+        assert_eq!(judge_blocklists(&sut).severity, Severity::Fail);
     }
 
     #[test]
     fn one_list_unavailable_is_judged_on_the_other() {
-        let f = BlockListFacts {
+        let sut = BlockListFacts {
             spamhaus: BlockListStatus::Unavailable,
             ..clean()
         };
-        assert_eq!(judge_blocklists(&f).severity, Severity::Ok);
+        assert_eq!(judge_blocklists(&sut).severity, Severity::Ok);
     }
 
     #[test]
     fn both_lists_unavailable_is_an_error() {
-        let f = BlockListFacts {
+        let sut = BlockListFacts {
             spamhaus: BlockListStatus::Unavailable,
             firehol: BlockListStatus::Unavailable,
         };
-        assert_eq!(judge_blocklists(&f).severity, Severity::Error);
+        assert_eq!(judge_blocklists(&sut).severity, Severity::Error);
     }
 }

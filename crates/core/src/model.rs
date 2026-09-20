@@ -630,15 +630,15 @@ mod tests {
 
     #[test]
     fn severity_orders_least_to_most_severe() {
-        let mut xs = vec![
+        let mut sut = vec![
             Severity::Fail,
             Severity::Ok,
             Severity::Error,
             Severity::Warn,
         ];
-        xs.sort();
+        sut.sort();
         assert_eq!(
-            xs,
+            sut,
             vec![
                 Severity::Ok,
                 Severity::Warn,
@@ -683,9 +683,9 @@ mod tests {
 
     #[test]
     fn a_city_name_is_trimmed_at_the_input_boundary() {
-        let city: CityName = "  Helsinki  ".parse().unwrap();
+        let sut: CityName = "  Helsinki  ".parse().unwrap();
 
-        assert_eq!(city.as_str(), "Helsinki");
+        assert_eq!(sut.as_str(), "Helsinki");
     }
 
     #[test]
@@ -719,9 +719,9 @@ mod tests {
 
     #[test]
     fn a_ptr_name_is_trimmed_and_normalized_from_dns_form() {
-        let ptr = PtrName::try_from("  vpn1.example.net.  ").unwrap();
+        let sut = PtrName::try_from("  vpn1.example.net.  ").unwrap();
 
-        assert_eq!(ptr.as_str(), "vpn1.example.net");
+        assert_eq!(sut.as_str(), "vpn1.example.net");
     }
 
     #[test]

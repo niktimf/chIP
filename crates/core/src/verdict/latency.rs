@@ -320,12 +320,12 @@ mod tests {
             14.12, 65.123, 64.007, 29.98, 7.003, 65.357, 34.615, 24.915,
             22.934, 18.065, 18.86, 19.305,
         ];
-        let facts = facts(
+        let sut = facts(
             samples(&candidate, 0.0),
             vec![anchor("helsinki-winner", &best_anchor)],
         );
 
-        let verdict = judge_latency(&facts, &thresholds());
+        let verdict = judge_latency(&sut, &thresholds());
 
         assert_eq!(
             verdict.severity,
@@ -342,10 +342,10 @@ mod tests {
 
     #[test]
     fn a_large_median_excess_fails() {
-        let facts =
+        let sut =
             facts(samples(&[80.0; 8], 0.0), vec![anchor("only", &[20.0; 8])]);
 
-        let verdict = judge_latency(&facts, &thresholds());
+        let verdict = judge_latency(&sut, &thresholds());
 
         assert_eq!(
             verdict.severity,
@@ -360,10 +360,10 @@ mod tests {
         // 8 probes: six near-zero excess, two spikes — median stays low,
         // p75 (6th of 8 sorted values) does not.
         let candidate = [20.0, 20.5, 20.2, 20.1, 20.3, 20.0, 60.0, 65.0];
-        let facts =
+        let sut =
             facts(samples(&candidate, 0.0), vec![anchor("only", &[20.0; 8])]);
 
-        let verdict = judge_latency(&facts, &thresholds());
+        let verdict = judge_latency(&sut, &thresholds());
 
         assert_eq!(
             verdict.severity,
@@ -375,12 +375,12 @@ mod tests {
 
     #[test]
     fn a_loss_delta_over_threshold_fails_even_with_good_rtt() {
-        let facts = facts(
+        let sut = facts(
             samples(&[21.0; 8], 10.0), // 10% vs anchor's 0%
             vec![anchor("only", &[20.0; 8])],
         );
 
-        let verdict = judge_latency(&facts, &thresholds());
+        let verdict = judge_latency(&sut, &thresholds());
 
         assert_eq!(
             verdict.severity,
@@ -392,10 +392,10 @@ mod tests {
 
     #[test]
     fn a_strongly_negative_median_warns_about_the_declared_city() {
-        let facts =
+        let sut =
             facts(samples(&[5.0; 8], 0.0), vec![anchor("only", &[30.0; 8])]);
 
-        let verdict = judge_latency(&facts, &thresholds());
+        let verdict = judge_latency(&sut, &thresholds());
 
         assert_eq!(
             verdict.severity,
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn fewer_than_six_valid_probes_is_an_error_not_a_verdict() {
-        let facts = facts(
+        let sut = facts(
             optional_samples(
                 &[Some(20.0), Some(20.0), None, None, None, None, None, None],
                 0.0,
@@ -416,7 +416,7 @@ mod tests {
             vec![anchor("only", &[20.0; 8])],
         );
 
-        let verdict = judge_latency(&facts, &thresholds());
+        let verdict = judge_latency(&sut, &thresholds());
 
         assert_eq!(
             verdict.severity,
@@ -428,7 +428,7 @@ mod tests {
 
     #[test]
     fn too_few_probes_exposes_counts_as_typed_error_data() {
-        let facts = facts(
+        let sut = facts(
             optional_samples(
                 &[Some(20.0), Some(20.0), None, None, None, None, None, None],
                 0.0,
@@ -436,7 +436,7 @@ mod tests {
             vec![anchor("only", &[20.0; 8])],
         );
 
-        let error = summarize_latency(&facts)
+        let error = summarize_latency(&sut)
             .err()
             .expect("summary must reject insufficient samples");
 
@@ -452,9 +452,9 @@ mod tests {
 
     #[test]
     fn no_surviving_anchors_is_an_error() {
-        let facts = facts(samples(&[20.0], 0.0), vec![]);
+        let sut = facts(samples(&[20.0], 0.0), vec![]);
 
-        let verdict = judge_latency(&facts, &thresholds());
+        let verdict = judge_latency(&sut, &thresholds());
 
         assert_eq!(
             verdict.severity,
@@ -466,9 +466,9 @@ mod tests {
 
     #[test]
     fn missing_anchors_has_a_matchable_error_variant() {
-        let facts = facts(samples(&[20.0], 0.0), vec![]);
+        let sut = facts(samples(&[20.0], 0.0), vec![]);
 
-        let error = summarize_latency(&facts)
+        let error = summarize_latency(&sut)
             .err()
             .expect("summary must reject an empty anchor set");
 
@@ -487,12 +487,12 @@ mod tests {
             14.12, 65.123, 64.007, 29.98, 7.003, 65.357, 34.615, 24.915,
             22.934, 18.065, 18.86, 19.305,
         ];
-        let facts = facts(
+        let sut = facts(
             samples(&candidate, 0.0),
             vec![anchor("winner", &best_anchor)],
         );
 
-        let summary = summarize_latency(&facts).unwrap();
+        let summary = summarize_latency(&sut).unwrap();
 
         assert_eq!(summary.valid_probes, 12);
         assert!(

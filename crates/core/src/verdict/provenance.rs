@@ -33,26 +33,30 @@ mod tests {
     #[test]
     fn fully_visible_single_origin_is_ok() {
         // Real FI-1 numbers, 2026-09-14: 325/325 peers, one origin (AS57043).
-        let f = RoutingFacts::new(325, 325, 1).unwrap();
-        assert_eq!(judge_routing(&f).severity, Severity::Ok);
+        let sut = RoutingFacts::new(325, 325, 1).unwrap();
+
+        assert_eq!(judge_routing(&sut).severity, Severity::Ok);
     }
 
     #[test]
     fn below_ninety_percent_visibility_warns() {
-        let f = RoutingFacts::new(250, 325, 1).unwrap();
-        assert_eq!(judge_routing(&f).severity, Severity::Warn);
+        let sut = RoutingFacts::new(250, 325, 1).unwrap();
+
+        assert_eq!(judge_routing(&sut).severity, Severity::Warn);
     }
 
     #[test]
     fn more_than_one_origin_as_warns() {
-        let f = RoutingFacts::new(325, 325, 2).unwrap();
-        assert_eq!(judge_routing(&f).severity, Severity::Warn);
+        let sut = RoutingFacts::new(325, 325, 2).unwrap();
+
+        assert_eq!(judge_routing(&sut).severity, Severity::Warn);
     }
 
     #[test]
     fn zero_total_peers_is_an_error_not_a_verdict() {
-        let f = RoutingFacts::new(0, 0, 0).unwrap();
-        assert_eq!(judge_routing(&f).severity, Severity::Error);
+        let sut = RoutingFacts::new(0, 0, 0).unwrap();
+
+        assert_eq!(judge_routing(&sut).severity, Severity::Error);
     }
 
     #[test]

@@ -109,11 +109,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = AnchorClient::with_base_url(
+        let sut = AnchorClient::with_base_url(
             reqwest::Client::new(),
             format!("{}/page1", server.uri()),
         );
-        let anchors = client.anchors().await.unwrap();
+        let anchors = sut.anchors().await.unwrap();
 
         assert_eq!(
             anchors.iter().map(|a| a.fqdn.as_str()).collect::<Vec<_>>(),

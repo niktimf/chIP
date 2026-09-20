@@ -134,11 +134,9 @@ mod tests {
     #[tokio::test]
     async fn a_clean_hosting_address_parses_into_facts_with_no_hard_flags() {
         let server = MockServer::start().await;
-        let client =
-            client_against(&server, "203.0.113.1", CLEAN_HOSTING).await;
+        let sut = client_against(&server, "203.0.113.1", CLEAN_HOSTING).await;
 
-        let facts =
-            client.lookup("203.0.113.1".parse().unwrap()).await.unwrap();
+        let facts = sut.lookup("203.0.113.1".parse().unwrap()).await.unwrap();
 
         assert!(!facts.vpn && !facts.proxy && !facts.tor && !facts.compromised);
         assert_eq!(facts.risk.map(RiskScore::value), Some(33));
@@ -148,11 +146,9 @@ mod tests {
     #[tokio::test]
     async fn a_named_vpn_operator_is_read_into_the_operator_field() {
         let server = MockServer::start().await;
-        let client =
-            client_against(&server, "203.0.113.2", NAMED_OPERATOR).await;
+        let sut = client_against(&server, "203.0.113.2", NAMED_OPERATOR).await;
 
-        let facts =
-            client.lookup("203.0.113.2".parse().unwrap()).await.unwrap();
+        let facts = sut.lookup("203.0.113.2".parse().unwrap()).await.unwrap();
 
         assert!(facts.vpn);
         assert_eq!(facts.operator.as_deref(), Some("Snowd"));
@@ -193,13 +189,13 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = ProxycheckClient {
+        let sut = ProxycheckClient {
             http: reqwest::Client::new(),
             api_key: None,
             base_url: server.uri(),
         };
 
-        let err = client
+        let err = sut
             .lookup("203.0.113.3".parse().unwrap())
             .await
             .unwrap_err();
@@ -218,13 +214,13 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = ProxycheckClient {
+        let sut = ProxycheckClient {
             http: reqwest::Client::new(),
             api_key: None,
             base_url: server.uri(),
         };
 
-        let err = client
+        let err = sut
             .lookup("203.0.113.7".parse().unwrap())
             .await
             .unwrap_err();
@@ -241,7 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_transport_error_does_not_leak_the_api_key() {
-        let client = ProxycheckClient {
+        let sut = ProxycheckClient {
             http: reqwest::Client::new(),
             api_key: Some(
                 ProxycheckApiKey::try_from("SECRET123".to_string()).unwrap(),
@@ -249,7 +245,7 @@ mod tests {
             base_url: "http://127.0.0.1:1".into(),
         };
 
-        let err = client
+        let err = sut
             .lookup("203.0.113.9".parse().unwrap())
             .await
             .unwrap_err();

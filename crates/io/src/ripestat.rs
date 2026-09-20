@@ -82,12 +82,12 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = RipestatClient {
+        let sut = RipestatClient {
             http: reqwest::Client::new(),
             base_url: server.uri(),
         };
 
-        let facts = client
+        let facts = sut
             .routing_status("203.0.113.0/24".parse().unwrap())
             .await
             .unwrap();
@@ -108,12 +108,12 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = RipestatClient {
+        let sut = RipestatClient {
             http: reqwest::Client::new(),
             base_url: server.uri(),
         };
 
-        let err = client
+        let err = sut
             .routing_status("203.0.113.0/24".parse().unwrap())
             .await
             .unwrap_err();

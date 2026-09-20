@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn thresholds_add_five_ms_to_the_worst_p75() {
-        let rows = vec![
+        let sut = vec![
             CalibrationRow {
                 label: "a".into(),
                 median_excess_ms: 4.95,
@@ -147,7 +147,7 @@ mod tests {
             },
         ];
 
-        let (excess, loss) = suggest_thresholds(&rows).unwrap();
+        let (excess, loss) = suggest_thresholds(&sut).unwrap();
 
         assert!((excess - 14.12).abs() < 0.01);
         assert!((loss - 0.5).abs() < 0.01);

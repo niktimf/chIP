@@ -448,20 +448,17 @@ mod tests {
 
     #[test]
     fn scan_parses_domain_values_and_defaults() {
-        let command =
+        let sut =
             scan_command(&["scan", "203.0.113.1", "--country", "fi"]).unwrap();
 
-        assert_eq!(command.ip(), Ipv4Addr::new(203, 0, 113, 1));
-        assert_eq!(command.country().as_str(), "FI");
-        assert_eq!(command.ssh_user(), "root");
-        assert_eq!(command.reference_city().as_str(), "Helsinki");
-        assert_eq!(
-            (command.probes().eyeball(), command.probes().datacenter()),
-            (8, 4)
-        );
-        assert!(command.ssh_enabled());
-        assert!(command.neighbors_enabled());
-        assert!(command.fail_fast());
+        assert_eq!(sut.ip(), Ipv4Addr::new(203, 0, 113, 1));
+        assert_eq!(sut.country().as_str(), "FI");
+        assert_eq!(sut.ssh_user(), "root");
+        assert_eq!(sut.reference_city().as_str(), "Helsinki");
+        assert_eq!((sut.probes().eyeball(), sut.probes().datacenter()), (8, 4));
+        assert!(sut.ssh_enabled());
+        assert!(sut.neighbors_enabled());
+        assert!(sut.fail_fast());
     }
 
     #[test]
@@ -514,7 +511,7 @@ mod tests {
 
     #[test]
     fn repeated_and_comma_separated_gate_flags_accumulate() {
-        let command = scan_command(&[
+        let sut = scan_command(&[
             "scan",
             "203.0.113.1",
             "--country",
@@ -527,7 +524,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            command.gate_overrides().escalate,
+            sut.gate_overrides().escalate,
             ["service:claude", "neighbors", "reputation:operator"]
                 .into_iter()
                 .map(GateId::from)
@@ -593,13 +590,13 @@ mod tests {
             parse(&["calibrate", "203.0.113.7=Helsinki", "198.51.100.9=Turku"])
                 .into_command_with(SecretInputs::default())
                 .unwrap();
-        let Command::Calibrate(command) = command else {
+        let Command::Calibrate(sut) = command else {
             panic!("expected calibrate command")
         };
 
-        assert_eq!(command.targets().len(), 2);
-        assert_eq!(command.targets()[0].ip(), Ipv4Addr::new(203, 0, 113, 7));
-        assert_eq!(command.targets()[0].city().as_str(), "Helsinki");
+        assert_eq!(sut.targets().len(), 2);
+        assert_eq!(sut.targets()[0].ip(), Ipv4Addr::new(203, 0, 113, 7));
+        assert_eq!(sut.targets()[0].city().as_str(), "Helsinki");
     }
 
     #[rstest::rstest]

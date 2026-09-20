@@ -58,8 +58,9 @@ mod tests {
 
     #[test]
     fn all_reachable_is_ok() {
-        let f = facts(&[true; 10], &[true; 10]);
-        assert_eq!(judge_reach(&f).severity, Severity::Ok);
+        let sut = facts(&[true; 10], &[true; 10]);
+
+        assert_eq!(judge_reach(&sut).severity, Severity::Ok);
     }
 
     #[test]
@@ -70,13 +71,11 @@ mod tests {
         let mut control = vec![true; 12];
         control[0] = false;
         control[1] = false;
-        let f = facts(&candidate, &control);
-        assert_eq!(
-            judge_reach(&f).severity,
-            Severity::Ok,
-            "{}",
-            judge_reach(&f).detail
-        );
+        let sut = facts(&candidate, &control);
+
+        let verdict = judge_reach(&sut);
+
+        assert_eq!(verdict.severity, Severity::Ok, "{}", verdict.detail);
     }
 
     #[test]
@@ -86,26 +85,22 @@ mod tests {
         candidate[0] = false;
         candidate[1] = false;
         candidate[2] = false;
-        let f = facts(&candidate, &[true; 10]);
-        assert_eq!(
-            judge_reach(&f).severity,
-            Severity::Fail,
-            "{}",
-            judge_reach(&f).detail
-        );
+        let sut = facts(&candidate, &[true; 10]);
+
+        let verdict = judge_reach(&sut);
+
+        assert_eq!(verdict.severity, Severity::Fail, "{}", verdict.detail);
     }
 
     #[test]
     fn ten_percent_of_valid_probes_failing_warns() {
         let mut candidate = vec![true; 10];
         candidate[0] = false;
-        let f = facts(&candidate, &[true; 10]);
-        assert_eq!(
-            judge_reach(&f).severity,
-            Severity::Warn,
-            "{}",
-            judge_reach(&f).detail
-        );
+        let sut = facts(&candidate, &[true; 10]);
+
+        let verdict = judge_reach(&sut);
+
+        assert_eq!(verdict.severity, Severity::Warn, "{}", verdict.detail);
     }
 
     #[test]
@@ -116,12 +111,10 @@ mod tests {
         control[1] = true;
         control[2] = true;
         control[3] = true;
-        let f = facts(&[true; 10], &control);
-        assert_eq!(
-            judge_reach(&f).severity,
-            Severity::Error,
-            "{}",
-            judge_reach(&f).detail
-        );
+        let sut = facts(&[true; 10], &control);
+
+        let verdict = judge_reach(&sut);
+
+        assert_eq!(verdict.severity, Severity::Error, "{}", verdict.detail);
     }
 }

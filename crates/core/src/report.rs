@@ -137,63 +137,65 @@ mod tests {
 
     #[test]
     fn exit_code_is_zero_when_nothing_failed_or_errored() {
-        let report = Report {
+        let sut = Report {
             results: vec![
                 cr("geo", Verdict::ok("RU 90%")),
                 cr("neighbors", Verdict::warn("noisy")),
             ],
         };
-        assert_eq!(report.exit_code(), 0);
+        assert_eq!(sut.exit_code(), 0);
     }
 
     #[test]
     fn exit_code_is_one_when_anything_failed_even_alongside_an_error() {
-        let report = Report {
+        let sut = Report {
             results: vec![
                 cr("reputation", Verdict::fail("vpn")),
                 cr("geo", Verdict::error("no sources answered")),
             ],
         };
-        assert_eq!(report.exit_code(), 1);
+        assert_eq!(sut.exit_code(), 1);
     }
 
     #[test]
     fn exit_code_is_two_when_nothing_failed_but_something_could_not_be_judged()
     {
-        let report = Report {
+        let sut = Report {
             results: vec![cr(
                 "latency",
                 Verdict::error("fewer than 6 valid probes"),
             )],
         };
-        assert_eq!(report.exit_code(), 2);
+        assert_eq!(sut.exit_code(), 2);
     }
 
     #[test]
     fn overall_is_the_most_severe_result_present() {
-        let report = Report {
+        let sut = Report {
             results: vec![
                 cr("a", Verdict::ok("x")),
                 cr("b", Verdict::warn("y")),
             ],
         };
-        assert_eq!(report.overall(), Severity::Warn);
+        assert_eq!(sut.overall(), Severity::Warn);
     }
 
     #[test]
     fn overall_of_an_empty_report_is_ok() {
-        assert_eq!(Report { results: vec![] }.overall(), Severity::Ok);
+        let sut = Report { results: vec![] };
+
+        assert_eq!(sut.overall(), Severity::Ok);
     }
 
     #[test]
     fn table_lists_the_worst_result_first() {
-        let report = Report {
+        let sut = Report {
             results: vec![
                 cr("geo", Verdict::ok("RU 90%")),
                 cr("reputation", Verdict::fail("vpn flag")),
             ],
         };
-        let table = report.table();
+        let table = sut.table();
         let fail_pos = table.find("FAIL").unwrap();
         let ok_pos = table.find("OK").unwrap();
         assert!(fail_pos < ok_pos, "table:\n{table}");
@@ -204,7 +206,7 @@ mod tests {
 
     #[test]
     fn markdown_neutralizes_markup_and_control_characters_in_cells() {
-        let report = Report {
+        let sut = Report {
             results: vec![cr(
                 "tampering|<gate>",
                 Verdict::warn(
@@ -213,7 +215,7 @@ mod tests {
             )],
         };
 
-        let md = report.markdown();
+        let md = sut.markdown();
 
         assert!(
             md.contains(
@@ -228,14 +230,14 @@ mod tests {
 
     #[test]
     fn terminal_table_keeps_each_result_on_one_escape_free_line() {
-        let report = Report {
+        let sut = Report {
             results: vec![cr(
                 "reputation\nforged-gate",
                 Verdict::warn("operator\r\nFAIL fake\x1b[31m\u{202e}"),
             )],
         };
 
-        let table = report.table();
+        let table = sut.table();
 
         assert_eq!(table.lines().count(), 2, "table:\n{table}");
         assert!(table.contains(r"reputation\nforged-gate"), "table:\n{table}");

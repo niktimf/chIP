@@ -78,15 +78,15 @@ mod tests {
     #[case::tor(ReputationFacts { tor: true, ..clean() })]
     #[case::compromised(ReputationFacts { compromised: true, ..clean() })]
     #[case::operator(ReputationFacts { operator: Some("Snowd".into()), ..clean() })]
-    fn each_hard_flag_fails_on_its_own(#[case] facts: ReputationFacts) {
-        assert_eq!(judge_reputation(&facts, risk(50)).severity, Severity::Fail);
+    fn each_hard_flag_fails_on_its_own(#[case] sut: ReputationFacts) {
+        assert_eq!(judge_reputation(&sut, risk(50)).severity, Severity::Fail);
     }
 
     #[rstest::rstest]
     #[case::anonymous(ReputationFacts { anonymous: true, ..clean() })]
     #[case::scraper(ReputationFacts { scraper: true, ..clean() })]
-    fn each_soft_flag_only_warns(#[case] facts: ReputationFacts) {
-        assert_eq!(judge_reputation(&facts, risk(50)).severity, Severity::Warn);
+    fn each_soft_flag_only_warns(#[case] sut: ReputationFacts) {
+        assert_eq!(judge_reputation(&sut, risk(50)).severity, Severity::Warn);
     }
 
     #[rstest::rstest]
@@ -96,22 +96,22 @@ mod tests {
         #[case] value: u8,
         #[case] expected: Severity,
     ) {
-        let facts = ReputationFacts {
+        let sut = ReputationFacts {
             risk: Some(risk(value)),
             ..clean()
         };
 
-        let verdict = judge_reputation(&facts, risk(50));
+        let verdict = judge_reputation(&sut, risk(50));
 
         assert_eq!(verdict.severity, expected, "{}", verdict.detail);
     }
 
     #[test]
     fn the_operator_name_is_named_in_the_detail() {
-        let facts = ReputationFacts {
+        let sut = ReputationFacts {
             operator: Some("Snowd".into()),
             ..clean()
         };
-        assert!(judge_reputation(&facts, risk(50)).detail.contains("Snowd"));
+        assert!(judge_reputation(&sut, risk(50)).detail.contains("Snowd"));
     }
 }

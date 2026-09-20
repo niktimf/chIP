@@ -78,9 +78,9 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = TunnelClient::from_client(reqwest::Client::new());
+        let sut = TunnelClient::from_client(reqwest::Client::new());
 
-        let response = client
+        let response = sut
             .get(
                 &format!("{}/premium", server.uri()),
                 &[("Accept-Language", "en-US")],
@@ -102,10 +102,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
-        let client = TunnelClient::from_client(reqwest::Client::new());
+        let sut = TunnelClient::from_client(reqwest::Client::new());
 
-        client
-            .get(&format!("{}/echo", server.uri()), &[("X-Test", "one")])
+        sut.get(&format!("{}/echo", server.uri()), &[("X-Test", "one")])
             .await
             .unwrap();
     }

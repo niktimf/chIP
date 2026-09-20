@@ -895,9 +895,9 @@ mod tests {
         #[case] fail_fast: bool,
         #[case] expected: bool,
     ) {
-        let results = [CheckResult::new("geo", verdict)];
+        let sut = [CheckResult::new("geo", verdict)];
 
-        let actual = should_short_circuit(&results, fail_fast);
+        let actual = should_short_circuit(&sut, fail_fast);
 
         assert_eq!(actual, expected);
     }
