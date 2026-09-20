@@ -64,19 +64,28 @@ pub fn judge_cdn_edge(edges: &[(&str, Option<CountryCode>)]) -> Verdict {
         .filter(|(_, c)| *c == Some(russia))
         .map(|(name, _)| *name)
         .collect();
-    if edges.iter().all(|(_, country)| country.is_none()) {
+    let named: Vec<String> = edges
+        .iter()
+        .filter_map(|&(name, country)| {
+            country.map(|code| format!("{name}={code}"))
+        })
+        .collect();
+    let silent: Vec<&str> = edges
+        .iter()
+        .filter(|(_, country)| country.is_none())
+        .map(|&(name, _)| name)
+        .collect();
+    if named.is_empty() {
         Verdict::error("no CDN edge reported a country")
     } else if ru.is_empty() {
         Verdict::ok(format!(
-            "edges: {}",
-            edges
-                .iter()
-                .map(|&(n, c)| format!(
-                    "{n}={}",
-                    c.map_or_else(|| "?".to_string(), |code| code.to_string())
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
+            "edges: {}{}",
+            named.join(", "),
+            if silent.is_empty() {
+                String::new()
+            } else {
+                format!("; no country from: {}", silent.join(", "))
+            }
         ))
     } else {
         Verdict::fail(format!("CDN edge in Russia: {}", ru.join(", ")))
@@ -211,6 +220,35 @@ mod tests {
         let sut = vec![("cloudflare", Some(cc("SE"))), ("youtube_ggc", None)];
 
         assert_eq!(judge_cdn_edge(&sut).severity, Severity::Ok);
+    }
+
+    #[test]
+    fn edges_without_a_country_are_named_apart_from_the_ones_with_one() {
+        let sut = vec![
+            ("cloudflare", Some(cc("FI"))),
+            ("youtube_ggc", None),
+            ("netflix_oca", Some(cc("LV"))),
+        ];
+
+        let verdict = judge_cdn_edge(&sut);
+
+        assert_eq!(
+            verdict.detail,
+            "edges: cloudflare=FI, netflix_oca=LV; \
+             no country from: youtube_ggc"
+        );
+    }
+
+    #[test]
+    fn the_detail_stays_short_when_every_edge_named_a_country() {
+        let sut = vec![
+            ("cloudflare", Some(cc("FI"))),
+            ("netflix_oca", Some(cc("LV"))),
+        ];
+
+        let verdict = judge_cdn_edge(&sut);
+
+        assert_eq!(verdict.detail, "edges: cloudflare=FI, netflix_oca=LV");
     }
 
     #[test]

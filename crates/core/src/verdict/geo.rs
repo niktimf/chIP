@@ -19,8 +19,16 @@ pub fn judge_geo(facts: &GeoConsensusFacts, expected: &CountryCode) -> Verdict {
     let matching = answered.iter().filter(|c| *c == expected).count();
     let share = matching as f64 / answered.len() as f64;
     let ru_seen = expected != &russia && answered.contains(&russia);
-    let detail =
-        format!("{matching}/{} geo sources say {expected}", answered.len());
+    let silent = facts.votes.len() - answered.len();
+    let detail = format!(
+        "{matching}/{} geo sources say {expected}{}",
+        answered.len(),
+        if silent == 0 {
+            String::new()
+        } else {
+            format!(" ({silent} of {} did not answer)", facts.votes.len())
+        }
+    );
     if share < 0.5 {
         Verdict::fail(detail)
     } else if share < 0.8 || ru_seen {
@@ -102,6 +110,43 @@ mod tests {
         ]);
 
         assert_eq!(judge_geo(&sut, &cc("FI")).severity, Severity::Warn);
+    }
+
+    #[test]
+    fn the_detail_counts_the_sources_that_never_answered() {
+        let sut = votes(&[
+            Some("FI"),
+            Some("FI"),
+            Some("FI"),
+            Some("FI"),
+            Some("FI"),
+            Some("DE"),
+            None,
+            None,
+            None,
+        ]);
+
+        let verdict = judge_geo(&sut, &cc("FI"));
+
+        assert_eq!(
+            verdict.detail,
+            "5/6 geo sources say FI (3 of 9 did not answer)"
+        );
+    }
+
+    #[test]
+    fn the_detail_stays_short_when_every_source_answered() {
+        let sut = votes(&[
+            Some("FI"),
+            Some("FI"),
+            Some("FI"),
+            Some("FI"),
+            Some("FI"),
+        ]);
+
+        let verdict = judge_geo(&sut, &cc("FI"));
+
+        assert_eq!(verdict.detail, "5/5 geo sources say FI");
     }
 
     #[test]

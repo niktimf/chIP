@@ -17,15 +17,20 @@ pub enum Severity {
     Fail,
 }
 
-impl fmt::Display for Severity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let word = match self {
+impl Severity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
             Self::Ok => "OK",
             Self::Warn => "WARN",
             Self::Error => "ERROR",
             Self::Fail => "FAIL",
-        };
-        f.write_str(word)
+        }
+    }
+}
+
+impl fmt::Display for Severity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -201,6 +206,11 @@ pub struct CheckResult {
     pub gate: GateId,
     pub severity: Severity,
     pub detail: String,
+    /// Set when nothing was judged: the gate was turned off by `--skip-gate`,
+    /// `--no-ssh` or `--no-neighbors`. The severity is then `Ok` only because
+    /// no verdict was reached, so the report prints `SKIP` instead of `OK`
+    /// and the exit code stays unaffected.
+    pub skipped: bool,
 }
 
 impl CheckResult {
@@ -209,6 +219,28 @@ impl CheckResult {
             gate: gate.into(),
             severity: verdict.severity,
             detail: verdict.detail,
+            skipped: false,
+        }
+    }
+
+    /// A gate the operator turned off. `reason` is what would otherwise have
+    /// been judged (or why judging was impossible) and reaches the report
+    /// unchanged.
+    pub fn skipped(gate: impl Into<GateId>, reason: impl Into<String>) -> Self {
+        Self {
+            gate: gate.into(),
+            severity: Severity::Ok,
+            detail: reason.into(),
+            skipped: true,
+        }
+    }
+
+    /// What the report prints in the severity column.
+    pub const fn label(&self) -> &'static str {
+        if self.skipped {
+            "SKIP"
+        } else {
+            self.severity.as_str()
         }
     }
 }
@@ -646,6 +678,25 @@ mod tests {
                 Severity::Fail
             ]
         );
+    }
+
+    #[test]
+    fn a_skipped_check_is_labelled_skip_and_keeps_the_reason_it_carried() {
+        let sut = CheckResult::skipped(
+            "reach",
+            "ports 443 and 8443 are already in use",
+        );
+
+        assert_eq!(sut.severity, Severity::Ok);
+        assert_eq!(sut.label(), "SKIP");
+        assert_eq!(sut.detail, "ports 443 and 8443 are already in use");
+    }
+
+    #[test]
+    fn a_judged_check_is_labelled_by_its_severity() {
+        let sut = CheckResult::new("geo", Verdict::warn("50/50 split"));
+
+        assert_eq!(sut.label(), "WARN");
     }
 
     #[test]

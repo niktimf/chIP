@@ -39,6 +39,7 @@ async fn run_scan_command(command: config::ScanCommand) -> ExitCode {
             "results": report.results.iter().map(|result| serde_json::json!({
                 "gate": result.gate.as_str(),
                 "severity": result.severity.to_string(),
+                "skipped": result.skipped,
                 "detail": result.detail,
             })).collect::<Vec<_>>(),
         });

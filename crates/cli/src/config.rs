@@ -44,9 +44,22 @@ pub struct Cli {
     command: CliCommand,
 }
 
+/// Credentials are read from the environment only: there are deliberately no
+/// flags for them, so they stay out of shell history and `ps` output.
+const SCAN_AFTER_HELP: &str = "\
+Credentials (environment only):
+  SSH_PRIVATE_KEY     private key for the candidate, the key itself, not a path
+  SSH_KNOWN_HOSTS     host key entries; without them the first key is accepted
+  GLOBALPING_TOKEN    raises the Globalping quota from 250 to 500 tests/hour
+  PROXYCHECK_API_KEY  raises the proxycheck.io limit to 1000 queries/day
+
+Exit codes: 0 nothing failed, 1 a gate failed (rotate the IP), 2 a gate could \
+not be judged (retry).";
+
 #[derive(Subcommand)]
 enum CliCommand {
     /// Run all enabled vetting gates for one candidate.
+    #[command(after_help = SCAN_AFTER_HELP)]
     Scan(Box<ScanArgs>),
     /// Measure known-good nodes and suggest latency thresholds.
     Calibrate(CalibrateArgs),
@@ -147,41 +160,72 @@ impl Cli {
 
 #[derive(Args, Clone)]
 struct ScanArgs {
+    /// The candidate IPv4 address to vet.
     ip: CandidateIp,
+    /// Country the address was ordered in; the geo gate fails when the public
+    /// sources disagree with it.
     #[arg(long)]
     country: CountryCode,
+    /// City the address was ordered in; picks the RIPE Atlas anchors the
+    /// latency gate compares against. Without it, anchors of the country are
+    /// used.
     #[arg(long)]
     city: Option<CityName>,
+    /// SSH user on the candidate.
     #[arg(long, env = "SSH_USER", default_value = "root")]
     ssh_user: String,
+    /// SSH port on the candidate.
     #[arg(long, env = "SSH_PORT", default_value = "22")]
     ssh_port: NonZeroU16,
+    /// Known-hosts entries for strict host key checking; without them the
+    /// first key seen is accepted.
     #[arg(long, env = "SSH_KNOWN_HOSTS")]
     ssh_known_hosts: Option<String>,
+    /// Fail the latency gate above this median excess over the best anchor of
+    /// the candidate's city, in milliseconds.
     #[arg(long, default_value_t = 14.0)]
     max_excess_ms: f64,
+    /// Fail the latency gate when packet loss exceeds the anchors' own loss by
+    /// more than this many percentage points.
     #[arg(long, default_value_t = 2.0)]
     max_loss_pct: f64,
+    /// City the candidate's city is priced against in the report. Reported for
+    /// choosing a country, never a gate.
     #[arg(long, default_value = "Helsinki")]
     reference_city: CityName,
+    /// How many probes in Russian home networks to measure from.
     #[arg(long, default_value_t = 8)]
     eyeball_probes: u8,
+    /// How many probes in Russian datacenters to measure from.
     #[arg(long, default_value_t = 4)]
     dc_probes: u8,
+    /// Deadline for phase B. What is still unmeasured when it passes is
+    /// reported as an error; the listener and tunnel are cleaned up anyway.
     #[arg(long, default_value = "300")]
     deadline_secs: NonZeroU64,
+    /// Promote a warning to a failure for this gate id, e.g.
+    /// `--gate service:claude`. Repeatable and comma-separated.
     #[arg(long = "gate", value_delimiter = ',')]
     gate: Vec<String>,
+    /// Turn this gate off, e.g. `--skip-gate reach`. It is reported as SKIP
+    /// and cannot change the exit code. Repeatable and comma-separated.
     #[arg(long = "skip-gate", value_delimiter = ',')]
     skip_gate: Vec<String>,
+    /// Compare latency against this address instead of the RIPE Atlas anchors
+    /// picked for the city.
     #[arg(long)]
     anchor: Option<Ipv4Addr>,
+    /// Do not sweep the candidate's /24; both neighbor gates report SKIP.
     #[arg(long)]
     no_neighbors: bool,
+    /// Do not touch the candidate over SSH; every gate that needs the listener
+    /// or the tunnel reports SKIP.
     #[arg(long)]
     no_ssh: bool,
+    /// Run phase B even when a phase-A gate already failed.
     #[arg(long)]
     no_fail_fast: bool,
+    /// Write the machine-readable report to this path.
     #[arg(long)]
     json: Option<PathBuf>,
 }
@@ -191,8 +235,10 @@ struct CalibrateArgs {
     /// One or more `IP=City` targets.
     #[arg(required = true)]
     targets: Vec<String>,
+    /// How many probes in Russian home networks to measure from.
     #[arg(long, default_value_t = 8)]
     eyeball_probes: u8,
+    /// How many probes in Russian datacenters to measure from.
     #[arg(long, default_value_t = 4)]
     dc_probes: u8,
 }

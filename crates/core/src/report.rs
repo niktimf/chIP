@@ -99,7 +99,7 @@ impl Report {
             let _ = writeln!(
                 out,
                 "{:<5}  {:<28}  {}",
-                row.severity.to_string(),
+                row.label(),
                 terminal_cell(row.gate.as_str()),
                 terminal_cell(&row.detail)
             );
@@ -117,7 +117,7 @@ impl Report {
             let _ = writeln!(
                 out,
                 "| {} | {} | {} |",
-                row.severity,
+                row.label(),
                 markdown_cell(row.gate.as_str()),
                 markdown_cell(&row.detail)
             );
@@ -133,6 +133,39 @@ mod tests {
 
     fn cr(gate: &str, v: Verdict) -> CheckResult {
         CheckResult::new(gate, v)
+    }
+
+    #[test]
+    fn a_skipped_gate_is_shown_as_skip_in_both_renderings() {
+        let sut = Report {
+            results: vec![CheckResult::skipped(
+                "reach",
+                "ports 443 and 8443 are already in use",
+            )],
+        };
+
+        let table = sut.table();
+        let markdown = sut.markdown();
+
+        assert!(table.starts_with("SKIP "), "{table}");
+        assert!(
+            table.contains("ports 443 and 8443 are already in use"),
+            "{table}"
+        );
+        assert!(markdown.contains("| SKIP | reach |"), "{markdown}");
+    }
+
+    #[test]
+    fn a_skipped_gate_does_not_change_the_exit_code_or_the_overall_severity() {
+        let sut = Report {
+            results: vec![
+                CheckResult::skipped("reach", "ports are already in use"),
+                cr("geo", Verdict::ok("7/7 say FI")),
+            ],
+        };
+
+        assert_eq!(sut.exit_code(), 0);
+        assert_eq!(sut.overall(), Severity::Ok);
     }
 
     #[test]

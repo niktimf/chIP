@@ -15,6 +15,24 @@ fn help_names_both_subcommands() {
 }
 
 #[test]
+fn scan_help_explains_every_flag_and_names_the_secret_variables() {
+    let output = chip().args(["scan", "--help"]).output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "excess over the best anchor",
+        "probes in Russian home networks",
+        "Promote a warning to a failure",
+        "SSH_PRIVATE_KEY",
+        "GLOBALPING_TOKEN",
+        "PROXYCHECK_API_KEY",
+    ] {
+        assert!(stdout.contains(expected), "{expected} missing:\n{stdout}");
+    }
+}
+
+#[test]
 fn invalid_ip_exits_two_before_any_network_work() {
     let output = chip()
         .args(["scan", "not-an-ip", "--country", "FI"])

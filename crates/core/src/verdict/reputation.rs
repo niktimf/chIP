@@ -5,23 +5,27 @@ pub fn judge_reputation(
     facts: &ReputationFacts,
     warn_risk: RiskScore,
 ) -> Verdict {
+    let flags = [
+        facts.vpn.then_some("vpn"),
+        facts.proxy.then_some("proxy"),
+        facts.tor.then_some("tor"),
+        facts.compromised.then_some("compromised"),
+        facts.anonymous.then_some("anonymous"),
+        facts.scraper.then_some("scraper"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
     let detail = format!(
-        "risk {}, flags: {}{}",
+        "risk {}, {}{}",
         facts
             .risk
             .map_or_else(|| "?".to_string(), |r| r.to_string()),
-        [
-            facts.vpn.then_some("vpn"),
-            facts.proxy.then_some("proxy"),
-            facts.tor.then_some("tor"),
-            facts.compromised.then_some("compromised"),
-            facts.anonymous.then_some("anonymous"),
-            facts.scraper.then_some("scraper"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(", "),
+        if flags.is_empty() {
+            "no flags".to_string()
+        } else {
+            format!("flags: {}", flags.join(", "))
+        },
         facts
             .operator
             .as_deref()
@@ -104,6 +108,28 @@ mod tests {
         let verdict = judge_reputation(&sut, risk(50));
 
         assert_eq!(verdict.severity, expected, "{}", verdict.detail);
+    }
+
+    #[test]
+    fn a_clean_address_says_so_instead_of_an_empty_flag_list() {
+        let sut = clean();
+
+        let verdict = judge_reputation(&sut, risk(50));
+
+        assert_eq!(verdict.detail, "risk 33, no flags");
+    }
+
+    #[test]
+    fn a_flagged_address_lists_its_flags() {
+        let sut = ReputationFacts {
+            vpn: true,
+            anonymous: true,
+            ..clean()
+        };
+
+        let verdict = judge_reputation(&sut, risk(50));
+
+        assert_eq!(verdict.detail, "risk 33, flags: vpn, anonymous");
     }
 
     #[test]

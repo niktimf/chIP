@@ -17,7 +17,7 @@ impl GateOverrides {
         if self.skip.contains(&result.gate) {
             return CheckResult {
                 severity: Severity::Ok,
-                detail: format!("skipped by --skip-gate: {}", result.detail),
+                skipped: true,
                 ..result
             };
         }
@@ -83,7 +83,7 @@ mod tests {
     }
 
     #[test]
-    fn skip_neutralizes_the_result_but_says_so_in_the_detail() {
+    fn skip_neutralizes_the_result_and_marks_it_skipped_keeping_the_reason() {
         let sut = overrides(&[], &["reputation:operator"]);
 
         let out = sut.apply(CheckResult::new(
@@ -92,8 +92,8 @@ mod tests {
         ));
 
         assert_eq!(out.severity, Severity::Ok);
-        assert!(out.detail.contains("skipped"), "{}", out.detail);
-        assert!(out.detail.contains("named Snowd"), "{}", out.detail);
+        assert_eq!(out.label(), "SKIP");
+        assert_eq!(out.detail, "named Snowd");
     }
 
     #[test]

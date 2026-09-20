@@ -18,6 +18,11 @@ Exit codes are designed for automation:
 - `2`: no gate failed, but at least one check could not reach a verdict, so
   retry rather than rejecting the IP.
 
+A gate turned off with `--skip-gate`, `--no-ssh` or `--no-neighbors` still
+appears in the report, as a `SKIP` row carrying the reason it was not judged,
+and it never changes the exit code. In `--json` such a row is
+`"severity": "OK"` with `"skipped": true`.
+
 Write the structured verdict to a file with `--json report.json`. When
 `GITHUB_STEP_SUMMARY` is set, `chip` also writes a Markdown summary there.
 
@@ -49,8 +54,8 @@ Warnings can be promoted with `--gate <id>`, for example
   temporary reachability listener.
 - SSH access to the candidate. Configure `SSH_PRIVATE_KEY` (key contents),
   `SSH_USER` (default `root`), `SSH_PORT` (default `22`) and optionally
-  `SSH_KNOWN_HOSTS`. `--no-ssh` records SSH-dependent gates as explicitly
-  skipped while still running independent checks.
+  `SSH_KNOWN_HOSTS`. `--no-ssh` reports every SSH-dependent gate as `SKIP`
+  while still running the independent checks.
 - `GLOBALPING_TOKEN` is recommended for a larger measurement quota.
 - `PROXYCHECK_API_KEY` is optional and raises proxycheck.io limits.
 
@@ -65,10 +70,12 @@ Run `chip scan --help` for all thresholds, probe counts and opt-out flags.
 ## Operational behavior
 
 For the reachability check, `chip` starts a temporary TLS listener on the
-candidate over SSH, preferring port 443 and falling back to 8443. It removes
-the listener, private temporary key directory, and any firewall rule added by
-the run after the scan; the remote listener also has a ten-minute lifetime and
-self-cleans those resources as a safety net.
+candidate over SSH, preferring port 443 and falling back to 8443. When both
+are already in use — what an in-service node looks like — `reach` reports an
+error, so the gate is measurable only on a machine that is not serving yet.
+It removes the listener, private temporary key directory, and any firewall
+rule added by the run after the scan; the remote listener also has a
+ten-minute lifetime and self-cleans those resources as a safety net.
 
 The `/24` sweep originates from the machine running `chip`, uses bounded
 concurrency, and performs one short TLS/PTR probe per address. `chip` does not

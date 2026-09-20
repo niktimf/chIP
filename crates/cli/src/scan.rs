@@ -305,28 +305,34 @@ async fn verify_listener(ip: Ipv4Addr, port: u16) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Every gate that can only be judged through the SOCKS tunnel, so they are
+/// reported together whether they ran, were skipped, or could not run.
+const TUNNEL_GATES: [&str; 16] = [
+    "service:chatgpt_web",
+    "service:chatgpt_app",
+    "service:gemini",
+    "service:youtube_premium",
+    "service:netflix",
+    "service:claude",
+    "service:tiktok",
+    "service:notebooklm",
+    "tampering",
+    "service-geo",
+    "service-geo:captcha",
+    "service-geo:cdn",
+    "ai:openai",
+    "ai:anthropic",
+    "ai:gemini",
+    "ai:deepseek",
+];
+
+const NEIGHBOR_GATES: [&str; 2] = ["neighbors-ptr", "neighbors"];
+
 fn tunnel_results(verdict: &Verdict) -> Vec<CheckResult> {
-    [
-        "service:chatgpt_web",
-        "service:chatgpt_app",
-        "service:gemini",
-        "service:youtube_premium",
-        "service:netflix",
-        "service:claude",
-        "service:tiktok",
-        "service:notebooklm",
-        "tampering",
-        "service-geo",
-        "service-geo:captcha",
-        "service-geo:cdn",
-        "ai:openai",
-        "ai:anthropic",
-        "ai:gemini",
-        "ai:deepseek",
-    ]
-    .into_iter()
-    .map(|gate| CheckResult::new(gate, verdict.clone()))
-    .collect()
+    TUNNEL_GATES
+        .into_iter()
+        .map(|gate| CheckResult::new(gate, verdict.clone()))
+        .collect()
 }
 
 type NamedServiceState = (&'static str, ServiceState);
@@ -559,13 +565,12 @@ impl SshSetup {
 }
 
 fn skipped_ssh_results() -> Vec<CheckResult> {
-    let mut results = vec![CheckResult::new(
-        "reach",
-        Verdict::ok("skipped by --no-ssh"),
-    )];
-    results.extend(tunnel_results(&Verdict::ok("skipped by --no-ssh")));
-    results.push(CheckResult::new("steal", Verdict::ok("skipped by --no-ssh")));
-    results
+    const REASON: &str = "--no-ssh: nothing was measured from the candidate";
+    std::iter::once("reach")
+        .chain(TUNNEL_GATES)
+        .chain(std::iter::once("steal"))
+        .map(|gate| CheckResult::skipped(gate, REASON))
+        .collect()
 }
 
 fn unavailable_ssh_results(error: &impl std::fmt::Display) -> Vec<CheckResult> {
@@ -794,7 +799,15 @@ async fn run_ssh_checks(
 )]
 async fn run_neighbor_checks(command: &ScanCommand) -> Vec<CheckResult> {
     if !command.neighbors_enabled() {
-        return Vec::new();
+        return NEIGHBOR_GATES
+            .into_iter()
+            .map(|gate| {
+                CheckResult::skipped(
+                    gate,
+                    "--no-neighbors: the /24 was not swept",
+                )
+            })
+            .collect();
     }
     let ip = command.ip();
     let probes = sweep(network_24(ip), &SweepConfig::default()).await;
@@ -807,8 +820,11 @@ async fn run_neighbor_checks(command: &ScanCommand) -> Vec<CheckResult> {
         |probe| probe.ptr.clone(),
     );
     vec![
-        CheckResult::new("neighbors-ptr", judge_candidate_ptr(&candidate_ptr)),
-        CheckResult::new("neighbors", judge_neighbor_extremes(&probes)),
+        CheckResult::new(
+            NEIGHBOR_GATES[0],
+            judge_candidate_ptr(&candidate_ptr),
+        ),
+        CheckResult::new(NEIGHBOR_GATES[1], judge_neighbor_extremes(&probes)),
     ]
 }
 
@@ -932,6 +948,20 @@ mod tests {
         let actual = should_short_circuit(&sut, fail_fast);
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn no_ssh_reports_its_gates_as_skipped_rather_than_as_passing() {
+        let sut = Report {
+            results: skipped_ssh_results(),
+        };
+
+        let table = sut.table();
+
+        assert_eq!(sut.exit_code(), 0);
+        assert_eq!(sut.results.len(), TUNNEL_GATES.len() + 2);
+        assert!(sut.results.iter().all(|result| result.skipped), "{table}");
+        assert!(!table.contains("OK "), "{table}");
     }
 
     #[test]
