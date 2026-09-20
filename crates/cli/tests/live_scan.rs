@@ -16,8 +16,9 @@ use std::process::Command;
 /// Every gate a full scan owes a row for. A scan that silently drops one is
 /// the failure this test exists to catch — a missing row reads as "checked
 /// and fine" to whoever runs the rotation.
-const EXPECTED_GATES: [&str; 25] = [
+const EXPECTED_GATES: [&str; 26] = [
     "reputation",
+    "reputation:operator",
     "blocklists",
     "geo",
     "provenance",

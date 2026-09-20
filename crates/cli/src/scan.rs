@@ -16,7 +16,9 @@ use chip_core::verdict::neighbors::{
 };
 use chip_core::verdict::provenance::judge_routing;
 use chip_core::verdict::reach::judge_reach;
-use chip_core::verdict::reputation::judge_reputation;
+use chip_core::verdict::reputation::{
+    judge_reputation, judge_reputation_operator,
+};
 use chip_core::verdict::service_geo::{
     judge_cdn_edge, judge_search_captcha, judge_service_country,
 };
@@ -103,19 +105,25 @@ pub async fn run_phase_a(
         ripestat_client.routing_status(prefix)
     );
 
+    let (reputation_flags, reputation_operator) = reputation.map_or_else(
+        |error| {
+            let detail = error.to_string();
+            (Verdict::error(detail.clone()), Verdict::error(detail))
+        },
+        |facts| {
+            (
+                judge_reputation(
+                    &facts,
+                    RiskScore::new(50).expect("50 is a valid risk score"),
+                ),
+                judge_reputation_operator(&facts),
+            )
+        },
+    );
+
     vec![
-        CheckResult::new(
-            "reputation",
-            reputation.map_or_else(
-                |error| Verdict::error(error.to_string()),
-                |facts| {
-                    judge_reputation(
-                        &facts,
-                        RiskScore::new(50).expect("50 is a valid risk score"),
-                    )
-                },
-            ),
-        ),
+        CheckResult::new("reputation", reputation_flags),
+        CheckResult::new("reputation:operator", reputation_operator),
         CheckResult::new("blocklists", judge_blocklists(&blocklists.check(ip))),
         CheckResult::new("geo", judge_geo(&geo, command.country())),
         CheckResult::new(

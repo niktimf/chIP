@@ -17,7 +17,7 @@ pub fn judge_reputation(
     .flatten()
     .collect::<Vec<_>>();
     let detail = format!(
-        "risk {}, {}{}",
+        "risk {}, {}",
         facts
             .risk
             .map_or_else(|| "?".to_string(), |r| r.to_string()),
@@ -26,19 +26,9 @@ pub fn judge_reputation(
         } else {
             format!("flags: {}", flags.join(", "))
         },
-        facts
-            .operator
-            .as_deref()
-            .map(|o| format!(", operator: {o}"))
-            .unwrap_or_default(),
     );
 
-    if facts.vpn
-        || facts.proxy
-        || facts.tor
-        || facts.compromised
-        || facts.operator.is_some()
-    {
+    if facts.vpn || facts.proxy || facts.tor || facts.compromised {
         return Verdict::fail(detail);
     }
     let risk_over = facts.risk.is_some_and(|r| r >= warn_risk);
@@ -46,6 +36,18 @@ pub fn judge_reputation(
         return Verdict::warn(detail);
     }
     Verdict::ok(detail)
+}
+
+/// Whether proxycheck names a VPN operator behind the address.
+///
+/// Its own gate (`reputation:operator`), because a rotation may knowingly
+/// buy from a hosting company that also sells VPN service, and waving that
+/// through must not also disable the vpn/proxy/tor flags.
+pub fn judge_reputation_operator(facts: &ReputationFacts) -> Verdict {
+    facts.operator.as_deref().map_or_else(
+        || Verdict::ok("no VPN operator claims this address"),
+        |operator| Verdict::fail(format!("named VPN operator: {operator}")),
+    )
 }
 
 #[cfg(test)]
@@ -81,9 +83,35 @@ mod tests {
     #[case::proxy(ReputationFacts { proxy: true, ..clean() })]
     #[case::tor(ReputationFacts { tor: true, ..clean() })]
     #[case::compromised(ReputationFacts { compromised: true, ..clean() })]
-    #[case::operator(ReputationFacts { operator: Some("Snowd".into()), ..clean() })]
     fn each_hard_flag_fails_on_its_own(#[case] sut: ReputationFacts) {
         assert_eq!(judge_reputation(&sut, risk(50)).severity, Severity::Fail);
+    }
+
+    /// The operator is judged apart from the detection flags so an operator
+    /// this rotation accepts can be waved through with
+    /// `--skip-gate reputation:operator` without also disabling the vpn,
+    /// proxy and tor checks.
+    #[test]
+    fn a_named_operator_fails_its_own_gate_and_not_the_flag_gate() {
+        let sut = ReputationFacts {
+            operator: Some("Snowd".into()),
+            ..clean()
+        };
+
+        assert_eq!(judge_reputation(&sut, risk(50)).severity, Severity::Ok);
+        let operator = judge_reputation_operator(&sut);
+        assert_eq!(operator.severity, Severity::Fail);
+        assert_eq!(operator.detail, "named VPN operator: Snowd");
+    }
+
+    #[test]
+    fn an_address_no_operator_claims_passes_the_operator_gate() {
+        let sut = clean();
+
+        let verdict = judge_reputation_operator(&sut);
+
+        assert_eq!(verdict.severity, Severity::Ok);
+        assert_eq!(verdict.detail, "no VPN operator claims this address");
     }
 
     #[rstest::rstest]
@@ -130,14 +158,5 @@ mod tests {
         let verdict = judge_reputation(&sut, risk(50));
 
         assert_eq!(verdict.detail, "risk 33, flags: vpn, anonymous");
-    }
-
-    #[test]
-    fn the_operator_name_is_named_in_the_detail() {
-        let sut = ReputationFacts {
-            operator: Some("Snowd".into()),
-            ..clean()
-        };
-        assert!(judge_reputation(&sut, risk(50)).detail.contains("Snowd"));
     }
 }

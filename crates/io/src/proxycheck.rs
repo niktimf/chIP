@@ -77,7 +77,10 @@ impl ProxycheckClient {
             risk: detections["risk"]
                 .as_u64()
                 .and_then(|risk| RiskScore::try_from(risk).ok()),
-            operator: entry["operator"].as_str().map(str::to_string),
+            // v3 answers with an object ({"name": …, "url": …, "anonymity":
+            // …}), not a bare string: reading it as a string silently
+            // dropped every operator proxycheck ever named.
+            operator: entry["operator"]["name"].as_str().map(str::to_string),
         })
     }
 }
@@ -109,7 +112,23 @@ mod tests {
             "detections": {"proxy": false, "vpn": true, "compromised": false, "scraper": false, "tor": false,
                           "hosting": true, "anonymous": false, "risk": 50, "confidence": 100,
                           "first_seen": null, "last_seen": null, "times_seen": null},
-            "operator": "Snowd",
+            "operator": {"name": "Snowd", "url": "https://snowd.example/",
+                         "anonymity": "medium", "popularity": "low",
+                         "services": ["datacenter_vpns"],
+                         "protocols": ["WireGuard", "OpenVPN"]},
+            "location": {"country_code": "FI"}
+        }
+    }"#;
+
+    const OPERATOR_WITHOUT_FLAGS: &str = r#"{
+        "status": "ok",
+        "203.0.113.3": {
+            "network": {"asn": "AS64502", "range": "203.0.113.0/24", "hostname": null,
+                        "provider": "Example Hosting", "organisation": "Example VPN OU", "type": "Hosting"},
+            "detections": {"proxy": false, "vpn": false, "compromised": false, "scraper": false, "tor": false,
+                          "hosting": true, "anonymous": false, "risk": 33, "confidence": 100,
+                          "first_seen": null, "last_seen": null, "times_seen": null},
+            "operator": {"name": "Snowd", "url": "https://snowd.example/", "anonymity": "medium"},
             "location": {"country_code": "FI"}
         }
     }"#;
@@ -151,6 +170,22 @@ mod tests {
         let facts = sut.lookup("203.0.113.2".parse().unwrap()).await.unwrap();
 
         assert!(facts.vpn);
+        assert_eq!(facts.operator.as_deref(), Some("Snowd"));
+    }
+
+    /// proxycheck names the VPN operator of an address whose `detections`
+    /// are all false — that is exactly the case the `reputation:operator`
+    /// gate exists for, and the one a string-shaped parse used to miss.
+    #[tokio::test]
+    async fn an_operator_is_read_even_when_no_detection_flag_is_set() {
+        let server = MockServer::start().await;
+        let sut =
+            client_against(&server, "203.0.113.3", OPERATOR_WITHOUT_FLAGS)
+                .await;
+
+        let facts = sut.lookup("203.0.113.3".parse().unwrap()).await.unwrap();
+
+        assert!(!facts.vpn && !facts.proxy);
         assert_eq!(facts.operator.as_deref(), Some("Snowd"));
     }
 
