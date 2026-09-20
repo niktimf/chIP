@@ -198,6 +198,7 @@ dependencies = [
  "reqwest",
  "rstest",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
