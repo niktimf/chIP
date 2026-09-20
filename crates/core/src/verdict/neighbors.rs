@@ -13,9 +13,8 @@ pub enum NeighborBucket {
 }
 
 /// Brand substrings whose certificate on a hosting IP proves a Reality node
-/// forwarding to that brand's real site. Verbatim from
-/// the shell prototype this sweep replaces
-/// — keep the two in sync if either changes.
+/// forwarding to that brand's real site. Taken from the shell prototype this
+/// sweep replaces; keep the two in sync if either changes.
 const BRANDS: &[&str] = &[
     "microsoft.com",
     "apple.com",

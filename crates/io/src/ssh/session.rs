@@ -195,8 +195,9 @@ impl SshSession {
     }
 }
 
-/// The deepest source's last non-empty line, capped so it fits a report row
-/// - identical technique to an earlier tool of ours's `error_detail`.
+/// The deepest source's last non-empty line, capped so it fits a report row.
+/// `openssh` nests the real reason several sources deep, and only the last
+/// line of it names what actually went wrong.
 fn error_detail(err: &openssh::Error) -> String {
     let deepest =
         std::iter::successors(Some(err as &dyn std::error::Error), |e| {
