@@ -18,6 +18,12 @@ pub struct SocksTunnel {
     _known_hosts_file: Option<NamedTempFile>,
 }
 
+struct PreparedTunnelCommand {
+    command: Command,
+    key_file: Option<NamedTempFile>,
+    known_hosts_file: Option<NamedTempFile>,
+}
+
 impl SocksTunnel {
     pub async fn start(
         address: Ipv4Addr,
@@ -33,81 +39,15 @@ impl SocksTunnel {
         config: &SshConfig,
         local_port: NonZeroU16,
     ) -> Result<Self, SshError> {
-        let key_file = config
-            .private_key
-            .as_ref()
-            .map(|key| secret_file(key.expose()))
-            .transpose()
-            .map_err(|e| SshError::Connect(e.to_string()))?;
-        let known_hosts_file = config
-            .known_hosts
-            .as_deref()
-            .map(secret_file)
-            .transpose()
-            .map_err(|e| SshError::Connect(e.to_string()))?;
-
-        let mut cmd = Command::new(program);
-        cmd.arg("-N")
-            .arg("-D")
-            .arg(format!("127.0.0.1:{local_port}"))
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ExitOnForwardFailure=yes")
-            .arg("-o")
-            .arg(format!("ConnectTimeout={}", config.connect_timeout.as_secs()))
-            .arg("-p")
-            .arg(config.port.to_string());
-        match &known_hosts_file {
-            Some(f) => {
-                cmd.arg("-o")
-                    .arg("StrictHostKeyChecking=yes")
-                    .arg("-o")
-                    .arg(format!("UserKnownHostsFile={}", f.path().display()));
-            }
-            None => {
-                cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
-            }
-        }
-        if let Some(key) = &key_file {
-            cmd.arg("-i").arg(key.path());
-        }
-        if let Some(user) = &config.user {
-            cmd.arg("-l").arg(user);
-        }
-        cmd.arg("--").arg(address.to_string());
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped());
-        cmd.kill_on_drop(true);
-
-        let mut child = cmd.spawn().map_err(|e| {
+        let PreparedTunnelCommand {
+            mut command,
+            key_file,
+            known_hosts_file,
+        } = prepare_tunnel_command(program, address, config, local_port)?;
+        let mut child = command.spawn().map_err(|e| {
             SshError::Connect(format!("could not spawn ssh: {e}"))
         })?;
-        let ready_deadline = tokio::time::Instant::now()
-            + config.connect_timeout.min(Duration::from_secs(5));
-        loop {
-            if let Ok(Some(status)) = child.try_wait() {
-                return Err(SshError::Connect(
-                    child_error(&mut child, status).await,
-                ));
-            }
-            if socks5_ready(local_port).await {
-                break;
-            }
-            if tokio::time::Instant::now() >= ready_deadline {
-                let _ = child.kill().await;
-                child.wait().await.map_err(|error| {
-                    SshError::Connect(format!(
-                        "SOCKS listener did not become ready and ssh could not be reaped: {error}"
-                    ))
-                })?;
-                return Err(SshError::Connect(
-                    "SOCKS listener did not become ready".to_string(),
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        wait_for_socks(&mut child, local_port, config.connect_timeout).await?;
 
         Ok(Self {
             child,
@@ -124,6 +64,116 @@ impl SocksTunnel {
     pub async fn stop(mut self) {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
+    }
+}
+
+fn prepare_tunnel_command(
+    program: &str,
+    address: Ipv4Addr,
+    config: &SshConfig,
+    local_port: NonZeroU16,
+) -> Result<PreparedTunnelCommand, SshError> {
+    let key_file = config
+        .private_key
+        .as_ref()
+        .map(|key| secret_file(key.expose()))
+        .transpose()
+        .map_err(|error| SshError::Connect(error.to_string()))?;
+    let known_hosts_file = config
+        .known_hosts
+        .as_deref()
+        .map(secret_file)
+        .transpose()
+        .map_err(|error| SshError::Connect(error.to_string()))?;
+    let mut command = base_tunnel_command(program, config, local_port);
+    configure_authentication(
+        &mut command,
+        config,
+        key_file.as_ref(),
+        known_hosts_file.as_ref(),
+    );
+    command
+        .arg("--")
+        .arg(address.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    Ok(PreparedTunnelCommand {
+        command,
+        key_file,
+        known_hosts_file,
+    })
+}
+
+fn base_tunnel_command(
+    program: &str,
+    config: &SshConfig,
+    local_port: NonZeroU16,
+) -> Command {
+    let mut command = Command::new(program);
+    command
+        .arg("-N")
+        .arg("-D")
+        .arg(format!("127.0.0.1:{local_port}"))
+        .args(["-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes"])
+        .arg("-o")
+        .arg(format!("ConnectTimeout={}", config.connect_timeout.as_secs()))
+        .arg("-p")
+        .arg(config.port.to_string());
+    command
+}
+
+fn configure_authentication(
+    command: &mut Command,
+    config: &SshConfig,
+    key_file: Option<&NamedTempFile>,
+    known_hosts_file: Option<&NamedTempFile>,
+) {
+    match known_hosts_file {
+        Some(file) => {
+            command
+                .args(["-o", "StrictHostKeyChecking=yes", "-o"])
+                .arg(format!("UserKnownHostsFile={}", file.path().display()));
+        }
+        None => {
+            command.args(["-o", "StrictHostKeyChecking=accept-new"]);
+        }
+    }
+    if let Some(key) = key_file {
+        command.arg("-i").arg(key.path());
+    }
+    if let Some(user) = &config.user {
+        command.arg("-l").arg(user);
+    }
+}
+
+async fn wait_for_socks(
+    child: &mut Child,
+    local_port: NonZeroU16,
+    connect_timeout: Duration,
+) -> Result<(), SshError> {
+    let ready_deadline = tokio::time::Instant::now()
+        + connect_timeout.min(Duration::from_secs(5));
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(SshError::Connect(child_error(child, status).await));
+        }
+        if socks5_ready(local_port).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= ready_deadline {
+            let _ = child.kill().await;
+            child.wait().await.map_err(|error| {
+                SshError::Connect(format!(
+                    "SOCKS listener did not become ready and ssh could not be reaped: {error}"
+                ))
+            })?;
+            return Err(SshError::Connect(
+                "SOCKS listener did not become ready".to_string(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -201,6 +251,32 @@ mod tests {
         match result {
             Err(SshError::Connect(msg)) => {
                 assert!(msg.contains("Permission denied"), "{msg}");
+            }
+            other => {
+                panic!("expected Connect error, got {:?}", other.map(|_| ()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_options_precede_end_of_options_and_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = stub(
+            dir.path(),
+            "penultimate=\nlast=\nfor argument\ndo\n  penultimate=$last\n  last=$argument\ndone\nif [ \"$penultimate\" = \"--\" ] && [ \"$last\" = \"203.0.113.5\" ]; then\n  echo 'arguments accepted' >&2\nelse\n  echo 'destination was not last' >&2\nfi\nexit 255",
+        );
+
+        let sut = SocksTunnel::start_with_program(
+            &program,
+            "203.0.113.5".parse().unwrap(),
+            &config(),
+            NonZeroU16::new(47080).unwrap(),
+        )
+        .await;
+
+        match sut {
+            Err(SshError::Connect(detail)) => {
+                assert!(detail.contains("arguments accepted"), "{detail}");
             }
             other => {
                 panic!("expected Connect error, got {:?}", other.map(|_| ()))

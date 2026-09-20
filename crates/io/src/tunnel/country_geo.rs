@@ -64,69 +64,100 @@ async fn response(client: &TunnelClient, url: &str) -> Option<TunnelResponse> {
     client.get(url, &[("User-Agent", BROWSER_UA)]).await.ok()
 }
 
+struct CountryResponses {
+    google: Option<TunnelResponse>,
+    youtube: Option<TunnelResponse>,
+    apple: Option<TunnelResponse>,
+    spotify: Option<TunnelResponse>,
+    netflix: Option<TunnelResponse>,
+    tiktok: Option<TunnelResponse>,
+    bing: Option<TunnelResponse>,
+}
+
+impl CountryResponses {
+    async fn fetch(client: &TunnelClient) -> Self {
+        let (google, youtube, apple, spotify, netflix, tiktok, bing) = tokio::join!(
+            response(client, "https://www.google.com"),
+            response(client, "https://www.youtube.com"),
+            response(client, "https://gspe1-ssl.ls.apple.com/pep/gcc"),
+            response(client, "https://accounts.spotify.com/status"),
+            response(client, FAST_API_URL),
+            response(
+                client,
+                "https://www.tiktok.com/api/v1/web-cookie-privacy/config?appId=1988"
+            ),
+            response(client, "https://www.bing.com/search?q=cats")
+        );
+        Self {
+            google,
+            youtube,
+            apple,
+            spotify,
+            netflix,
+            tiktok,
+            bing,
+        }
+    }
+
+    fn into_votes(self) -> Vec<ServiceCountryVote> {
+        let google = self
+            .google
+            .as_ref()
+            .and_then(|item| google_country(&item.body));
+        let youtube = self
+            .youtube
+            .as_ref()
+            .and_then(|item| youtube_country(&item.body))
+            .or(google);
+        vec![
+            vote("google", google),
+            vote("youtube", youtube),
+            vote(
+                "apple",
+                self.apple.as_ref().and_then(|item| country(&item.body)),
+            ),
+            vote(
+                "spotify",
+                self.spotify
+                    .as_ref()
+                    .and_then(|item| spotify_country(&item.body)),
+            ),
+            vote(
+                "netflix",
+                json_country(self.netflix.as_ref(), "/client/location/country"),
+            ),
+            vote(
+                "tiktok",
+                json_country(self.tiktok.as_ref(), "/body/appProps/region"),
+            ),
+            vote(
+                "bing",
+                self.bing.as_ref().and_then(|item| bing_country(&item.body)),
+            ),
+        ]
+    }
+}
+
+const fn vote(
+    service: &'static str,
+    country: Option<CountryCode>,
+) -> ServiceCountryVote {
+    ServiceCountryVote { service, country }
+}
+
+fn json_country(
+    response: Option<&TunnelResponse>,
+    pointer: &str,
+) -> Option<CountryCode> {
+    response
+        .and_then(|item| json_string(&item.body, pointer))
+        .and_then(|value| country(&value))
+}
+
 pub async fn probe_country_votes(
     client: &TunnelClient,
 ) -> Vec<ServiceCountryVote> {
-    let (google, youtube, apple, spotify, netflix, tiktok, bing) = tokio::join!(
-        response(client, "https://www.google.com"),
-        response(client, "https://www.youtube.com"),
-        response(client, "https://gspe1-ssl.ls.apple.com/pep/gcc"),
-        response(client, "https://accounts.spotify.com/status"),
-        response(client, FAST_API_URL),
-        response(
-            client,
-            "https://www.tiktok.com/api/v1/web-cookie-privacy/config?appId=1988"
-        ),
-        response(client, "https://www.bing.com/search?q=cats")
-    );
-
-    let google = google.as_ref().and_then(|item| google_country(&item.body));
-    let youtube = youtube
-        .as_ref()
-        .and_then(|item| youtube_country(&item.body))
-        .or(google);
-    vec![
-        ServiceCountryVote {
-            service: "google",
-            country: google,
-        },
-        ServiceCountryVote {
-            service: "youtube",
-            country: youtube,
-        },
-        ServiceCountryVote {
-            service: "apple",
-            country: apple.as_ref().and_then(|item| country(&item.body)),
-        },
-        ServiceCountryVote {
-            service: "spotify",
-            country: spotify
-                .as_ref()
-                .and_then(|item| spotify_country(&item.body)),
-        },
-        ServiceCountryVote {
-            service: "netflix",
-            country: netflix
-                .as_ref()
-                .and_then(|item| {
-                    json_string(&item.body, "/client/location/country")
-                })
-                .and_then(|value| country(&value)),
-        },
-        ServiceCountryVote {
-            service: "tiktok",
-            country: tiktok
-                .as_ref()
-                .and_then(|item| {
-                    json_string(&item.body, "/body/appProps/region")
-                })
-                .and_then(|value| country(&value)),
-        },
-        ServiceCountryVote {
-            service: "bing",
-            country: bing.as_ref().and_then(|item| bing_country(&item.body)),
-        },
-    ]
+    CountryResponses::fetch(client).await.into_votes()
 }
 
 async fn captcha_observation(

@@ -168,6 +168,45 @@ pub fn judge_candidate_ptr(ptr: &PtrLookup) -> Verdict {
     }
 }
 
+fn largest_identical_default_certificate_group(
+    probes: &[NeighborProbe],
+    buckets: &[NeighborBucket],
+) -> Option<usize> {
+    probes
+        .iter()
+        .zip(buckets)
+        .filter(|(_, bucket)| **bucket == NeighborBucket::SelfSigned)
+        .filter_map(|(probe, _)| match &probe.https {
+            NeighborHttps::Open {
+                handshake: Some(handshake),
+            } => Some(handshake),
+            NeighborHttps::Closed | NeighborHttps::Open { handshake: None } => {
+                None
+            }
+        })
+        .counts_by(|handshake| {
+            (
+                handshake.cert_cn.clone().unwrap_or_default(),
+                handshake.cert_issuer.clone().unwrap_or_default(),
+            )
+        })
+        .into_values()
+        .max()
+}
+
+fn vpn_ptr_count(probes: &[NeighborProbe]) -> usize {
+    probes
+        .iter()
+        .filter(|probe| {
+            let PtrLookup::Resolved(ptr) = &probe.ptr else {
+                return false;
+            };
+            let ptr = ptr.as_str().to_lowercase();
+            ptr.contains("vpn") || ptr.contains("proxy")
+        })
+        .count()
+}
+
 pub fn judge_neighbor_extremes(probes: &[NeighborProbe]) -> Verdict {
     let buckets: Vec<NeighborBucket> = probes.iter().map(classify).collect();
     let responding = buckets
@@ -184,45 +223,14 @@ pub fn judge_neighbor_extremes(probes: &[NeighborProbe]) -> Verdict {
         warnings.push(format!("{responding} neighbors respond on :443 and none looks like a real site — possible proxy farm"));
     }
 
-    // How many self-signed neighbors share the exact same (CN, issuer) —
-    // `counts_by` groups and counts in one pass, replacing what would
-    // otherwise be a manual `HashMap::entry().or_insert()` accumulator.
-    let identical_counts = probes
-        .iter()
-        .zip(&buckets)
-        .filter(|(_, bucket)| **bucket == NeighborBucket::SelfSigned)
-        .filter_map(|(probe, _)| match &probe.https {
-            NeighborHttps::Open {
-                handshake: Some(handshake),
-            } => Some(handshake),
-            NeighborHttps::Closed | NeighborHttps::Open { handshake: None } => {
-                None
-            }
-        })
-        .counts_by(|h| {
-            (
-                h.cert_cn.clone().unwrap_or_default(),
-                h.cert_issuer.clone().unwrap_or_default(),
-            )
-        });
-    if let Some(&count) = identical_counts.values().max() {
-        if count >= 20 {
-            warnings.push(format!("{count} neighbors share one identical default certificate — one operator holds the /24"));
-        }
+    if let Some(count) =
+        largest_identical_default_certificate_group(probes, &buckets)
+            .filter(|count| *count >= 20)
+    {
+        warnings.push(format!("{count} neighbors share one identical default certificate — one operator holds the /24"));
     }
 
-    let vpn_ptrs = probes
-        .iter()
-        .filter(|p| {
-            let PtrLookup::Resolved(ptr) = &p.ptr else {
-                return false;
-            };
-            {
-                let l = ptr.as_str().to_lowercase();
-                l.contains("vpn") || l.contains("proxy")
-            }
-        })
-        .count();
+    let vpn_ptrs = vpn_ptr_count(probes);
     if vpn_ptrs >= 5 {
         warnings
             .push(format!("{vpn_ptrs} neighbor PTR records mention vpn/proxy"));

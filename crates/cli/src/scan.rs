@@ -3,8 +3,10 @@ use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chip_core::model::PingSweepFacts;
-use chip_core::model::RiskScore;
+use chip_core::model::{
+    CaptchaObservation, PingSweepFacts, PortalOutcome, RiskScore,
+    ServiceCountryVote, ServiceState,
+};
 use chip_core::verdict::ai::judge_ai_endpoints;
 use chip_core::verdict::blocklists::judge_blocklists;
 use chip_core::verdict::geo::judge_geo;
@@ -233,37 +235,24 @@ async fn run_globalping_measurements(
     listener: Option<u16>,
     control_anchor: Option<&Anchor>,
 ) -> Vec<CheckResult> {
-    fn unavailable(
-        error: &impl ToString,
-        listener: Option<u16>,
-    ) -> Vec<CheckResult> {
-        let detail = error.to_string();
-        let mut results =
-            vec![CheckResult::new("latency", Verdict::error(detail.clone()))];
-        if listener.is_some() {
-            results.push(CheckResult::new("reach", Verdict::error(detail)));
-        }
-        results
-    }
-
     let probes = command.probes();
     let locations = match Locations::ru(probes.eyeball(), probes.datacenter()) {
         Ok(locations) => locations,
-        Err(error) => return unavailable(&error, listener),
+        Err(error) => return unavailable_globalping_results(&error, listener),
     };
     let candidate_id = match client
         .create(&MeasurementKind::ping(command.ip()), &locations)
         .await
     {
         Ok(id) => id,
-        Err(error) => return unavailable(&error, listener),
+        Err(error) => return unavailable_globalping_results(&error, listener),
     };
     let candidate = match client
         .poll_until_finished(&candidate_id, GLOBALPING_DEADLINE)
         .await
     {
         Ok(measurement) => measurement,
-        Err(error) => return unavailable(&error, listener),
+        Err(error) => return unavailable_globalping_results(&error, listener),
     };
     let anchors =
         anchor_measurements(client, &candidate_id, city_anchors).await;
@@ -285,6 +274,19 @@ async fn run_globalping_measurements(
             )
             .await,
         );
+    }
+    results
+}
+
+fn unavailable_globalping_results(
+    error: &impl ToString,
+    listener: Option<u16>,
+) -> Vec<CheckResult> {
+    let detail = error.to_string();
+    let mut results =
+        vec![CheckResult::new("latency", Verdict::error(detail.clone()))];
+    if listener.is_some() {
+        results.push(CheckResult::new("reach", Verdict::error(detail)));
     }
     results
 }
@@ -327,87 +329,125 @@ fn tunnel_results(verdict: &Verdict) -> Vec<CheckResult> {
     .collect()
 }
 
+type NamedServiceState = (&'static str, ServiceState);
+type CdnEdgeObservation = (&'static str, Option<CountryCode>);
+
+struct TunnelObservations {
+    fail_services: [NamedServiceState; 4],
+    warn_services: [NamedServiceState; 4],
+    portal: (Vec<PortalOutcome>, Vec<PortalOutcome>),
+    votes: Vec<ServiceCountryVote>,
+    captcha: (CaptchaObservation, CaptchaObservation),
+    edges: Vec<CdnEdgeObservation>,
+    ai: Vec<NamedServiceState>,
+}
+
+impl TunnelObservations {
+    async fn probe(client: &TunnelClient) -> Self {
+        let (
+            chatgpt_web,
+            chatgpt_app,
+            gemini,
+            youtube_premium,
+            netflix,
+            claude,
+            tiktok,
+            notebooklm,
+            portal,
+            votes,
+            captcha,
+            edges,
+            ai,
+        ) = tokio::join!(
+            probe_chatgpt_web(client),
+            probe_chatgpt_app(client),
+            probe_gemini(client),
+            probe_youtube_premium(client),
+            probe_netflix(client),
+            probe_claude(client),
+            probe_tiktok(client),
+            probe_notebooklm(client),
+            probe_portal_endpoints(client),
+            probe_country_votes(client),
+            probe_search_captcha(client),
+            probe_cdn_edges(client),
+            probe_ai_endpoints(client),
+        );
+        Self {
+            fail_services: [
+                ("chatgpt_web", chatgpt_web),
+                ("chatgpt_app", chatgpt_app),
+                ("gemini", gemini),
+                ("youtube_premium", youtube_premium),
+            ],
+            warn_services: [
+                ("netflix", netflix),
+                ("claude", claude),
+                ("tiktok", tiktok),
+                ("notebooklm", notebooklm),
+            ],
+            portal,
+            votes,
+            captcha,
+            edges,
+            ai,
+        }
+    }
+
+    fn into_results(self, expected_country: CountryCode) -> Vec<CheckResult> {
+        let mut results =
+            service_results(self.fail_services, judge_services_fail);
+        results
+            .extend(service_results(self.warn_services, judge_services_warn));
+        results.push(CheckResult::new(
+            "tampering",
+            judge_tampering(&self.portal.0, &self.portal.1),
+        ));
+        results.push(CheckResult::new(
+            "service-geo",
+            judge_service_country(
+                &self.votes,
+                &expected_country,
+                SERVICE_COUNTRY_FAIL_ON,
+            ),
+        ));
+        results.push(CheckResult::new(
+            "service-geo:captcha",
+            judge_search_captcha(&self.captcha.0, &self.captcha.1),
+        ));
+        results.push(CheckResult::new(
+            "service-geo:cdn",
+            judge_cdn_edge(&self.edges),
+        ));
+        results.extend(self.ai.into_iter().map(|(name, state)| {
+            CheckResult::new(
+                format!("ai:{name}"),
+                judge_ai_endpoints(&[(name, state)]),
+            )
+        }));
+        results
+    }
+}
+
+fn service_results<const N: usize>(
+    states: [NamedServiceState; N],
+    judge: fn(&[(&str, ServiceState)]) -> Verdict,
+) -> Vec<CheckResult> {
+    states
+        .into_iter()
+        .map(|(name, state)| {
+            CheckResult::new(format!("service:{name}"), judge(&[(name, state)]))
+        })
+        .collect()
+}
+
 async fn run_tunnel_checks(
     client: &TunnelClient,
     expected_country: &CountryCode,
 ) -> Vec<CheckResult> {
-    let (
-        chatgpt_web,
-        chatgpt_app,
-        gemini,
-        youtube_premium,
-        netflix,
-        claude,
-        tiktok,
-        notebooklm,
-        portal,
-        votes,
-        captcha,
-        edges,
-        ai,
-    ) = tokio::join!(
-        probe_chatgpt_web(client),
-        probe_chatgpt_app(client),
-        probe_gemini(client),
-        probe_youtube_premium(client),
-        probe_netflix(client),
-        probe_claude(client),
-        probe_tiktok(client),
-        probe_notebooklm(client),
-        probe_portal_endpoints(client),
-        probe_country_votes(client),
-        probe_search_captcha(client),
-        probe_cdn_edges(client),
-        probe_ai_endpoints(client),
-    );
-
-    let mut results = Vec::new();
-    for (name, state) in [
-        ("chatgpt_web", chatgpt_web),
-        ("chatgpt_app", chatgpt_app),
-        ("gemini", gemini),
-        ("youtube_premium", youtube_premium),
-    ] {
-        results.push(CheckResult::new(
-            format!("service:{name}"),
-            judge_services_fail(&[(name, state)]),
-        ));
-    }
-    for (name, state) in [
-        ("netflix", netflix),
-        ("claude", claude),
-        ("tiktok", tiktok),
-        ("notebooklm", notebooklm),
-    ] {
-        results.push(CheckResult::new(
-            format!("service:{name}"),
-            judge_services_warn(&[(name, state)]),
-        ));
-    }
-    results.push(CheckResult::new(
-        "tampering",
-        judge_tampering(&portal.0, &portal.1),
-    ));
-    results.push(CheckResult::new(
-        "service-geo",
-        judge_service_country(
-            &votes,
-            expected_country,
-            SERVICE_COUNTRY_FAIL_ON,
-        ),
-    ));
-    results.push(CheckResult::new(
-        "service-geo:captcha",
-        judge_search_captcha(&captcha.0, &captcha.1),
-    ));
-    results.push(CheckResult::new("service-geo:cdn", judge_cdn_edge(&edges)));
-    for (name, state) in ai {
-        results.push(CheckResult::new(
-            format!("ai:{name}"),
-            judge_ai_endpoints(&[(name, state)]),
-        ));
-    }
-    results
+    Box::pin(TunnelObservations::probe(client))
+        .await
+        .into_results(*expected_country)
 }
 
 fn select_anchors(
@@ -491,6 +531,14 @@ struct SshSetup {
 }
 
 impl SshSetup {
+    const fn disconnected(config: SshConfig) -> Self {
+        Self {
+            session: None,
+            config,
+            listener_port: None,
+        }
+    }
+
     async fn stop_listener(&self) -> Option<CheckResult> {
         let port = self.listener_port?;
         let session = self.session.as_ref()?;
@@ -508,6 +556,26 @@ impl SshSetup {
             }
         }
     }
+}
+
+fn skipped_ssh_results() -> Vec<CheckResult> {
+    let mut results = vec![CheckResult::new(
+        "reach",
+        Verdict::ok("skipped by --no-ssh"),
+    )];
+    results.extend(tunnel_results(&Verdict::ok("skipped by --no-ssh")));
+    results.push(CheckResult::new("steal", Verdict::ok("skipped by --no-ssh")));
+    results
+}
+
+fn unavailable_ssh_results(error: &impl std::fmt::Display) -> Vec<CheckResult> {
+    let detail = format!("SSH unavailable: {error}");
+    let mut results =
+        vec![CheckResult::new("ssh", Verdict::error(detail.clone()))];
+    results.push(CheckResult::new("reach", Verdict::error(detail.clone())));
+    results.extend(tunnel_results(&Verdict::error(detail)));
+    results.push(CheckResult::new("steal", Verdict::error("SSH unavailable")));
+    results
 }
 
 async fn run_until_deadline_then_cleanup<T, CleanupOutput>(
@@ -594,54 +662,18 @@ fn ssh_config(command: &ScanCommand) -> SshConfig {
 async fn prepare_ssh(command: &ScanCommand) -> (SshSetup, Vec<CheckResult>) {
     let config = ssh_config(command);
     let ip = command.ip();
-    let mut results = Vec::new();
     if !command.ssh_enabled() {
-        results.push(CheckResult::new(
-            "reach",
-            Verdict::ok("skipped by --no-ssh"),
-        ));
-        results.extend(tunnel_results(&Verdict::ok("skipped by --no-ssh")));
-        results.push(CheckResult::new(
-            "steal",
-            Verdict::ok("skipped by --no-ssh"),
-        ));
-        return (
-            SshSetup {
-                session: None,
-                config,
-                listener_port: None,
-            },
-            results,
-        );
+        return (SshSetup::disconnected(config), skipped_ssh_results());
     }
 
     let session = match SshSession::connect(ip, &config).await {
         Ok(session) => session,
         Err(error) => {
-            let detail = format!("SSH unavailable: {error}");
-            results
-                .push(CheckResult::new("ssh", Verdict::error(detail.clone())));
-            results.push(CheckResult::new(
-                "reach",
-                Verdict::error(detail.clone()),
-            ));
-            results.extend(tunnel_results(&Verdict::error(detail)));
-            results.push(CheckResult::new(
-                "steal",
-                Verdict::error("SSH unavailable"),
-            ));
-            return (
-                SshSetup {
-                    session: None,
-                    config,
-                    listener_port: None,
-                },
-                results,
-            );
+            let results = unavailable_ssh_results(&error);
+            return (SshSetup::disconnected(config), results);
         }
     };
-    let (listener_port, listener_results) = start_listener(&session, ip).await;
-    results.extend(listener_results);
+    let (listener_port, results) = start_listener(&session, ip).await;
     (
         SshSetup {
             session: Some(session),
