@@ -1,4 +1,5 @@
 use chip_core::model::RoutingFacts;
+use ipnet::Ipv4Net;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -22,12 +23,16 @@ impl RipestatClient {
         }
     }
 
-    pub async fn routing_status(&self, prefix: &str) -> Result<RoutingFacts, RipestatError> {
+    pub async fn routing_status(
+        &self,
+        prefix: Ipv4Net,
+    ) -> Result<RoutingFacts, RipestatError> {
         let url = format!(
             "{}/routing-status/data.json?resource={prefix}",
             self.base_url
         );
-        let body: serde_json::Value = self.http.get(&url).send().await?.json().await?;
+        let body: serde_json::Value =
+            self.http.get(&url).send().await?.json().await?;
         let data = &body["data"];
 
         let seeing = data["visibility"]["v4"]["ris_peers_seeing"]
@@ -39,13 +44,14 @@ impl RipestatClient {
 
         let origin_count = data["origins"].as_array().map_or(0, Vec::len);
 
-        Ok(RoutingFacts {
-            ris_peers_seeing: u32::try_from(seeing)
+        RoutingFacts::new(
+            u32::try_from(seeing)
                 .map_err(|_| RipestatError::Shape("value out of range"))?,
-            total_ris_peers: u32::try_from(total)
+            u32::try_from(total)
                 .map_err(|_| RipestatError::Shape("value out of range"))?,
-            origin_count: u32::try_from(origin_count).unwrap_or(u32::MAX),
-        })
+            u32::try_from(origin_count).unwrap_or(u32::MAX),
+        )
+        .map_err(|_| RipestatError::Shape("visibility exceeds total peers"))
     }
 }
 
@@ -71,7 +77,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/routing-status/data.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(ROUTING_STATUS))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(ROUTING_STATUS),
+            )
             .mount(&server)
             .await;
         let client = RipestatClient {
@@ -79,11 +87,14 @@ mod tests {
             base_url: server.uri(),
         };
 
-        let facts = client.routing_status("203.0.113.0/24").await.unwrap();
+        let facts = client
+            .routing_status("203.0.113.0/24".parse().unwrap())
+            .await
+            .unwrap();
 
-        assert_eq!(facts.ris_peers_seeing, 300);
-        assert_eq!(facts.total_ris_peers, 320);
-        assert_eq!(facts.origin_count, 1);
+        assert_eq!(facts.ris_peers_seeing(), 300);
+        assert_eq!(facts.total_ris_peers(), 320);
+        assert_eq!(facts.origin_count(), 1);
     }
 
     #[tokio::test]
@@ -91,7 +102,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/routing-status/data.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": {}})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": {}})),
+            )
             .mount(&server)
             .await;
         let client = RipestatClient {
@@ -99,8 +113,17 @@ mod tests {
             base_url: server.uri(),
         };
 
-        let err = client.routing_status("203.0.113.0/24").await.unwrap_err();
+        let err = client
+            .routing_status("203.0.113.0/24".parse().unwrap())
+            .await
+            .unwrap_err();
 
-        assert!(matches!(err, RipestatError::Shape(_)), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                RipestatError::Shape("visibility.v4.ris_peers_seeing")
+            ),
+            "{err:?}"
+        );
     }
 }

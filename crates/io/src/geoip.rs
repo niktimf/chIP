@@ -1,89 +1,67 @@
 use chip_core::model::{CountryCode, GeoConsensusFacts};
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 pub struct GeoSource {
     pub name: &'static str,
-    pub url: Box<dyn Fn(&str) -> String + Send + Sync>,
-    pub path: &'static [&'static str],
+    pub url: Box<dyn Fn(Ipv4Addr) -> String + Send + Sync>,
+    pub pointer: &'static str,
 }
 
-/// Delegates the two-letter check to `CountryCode::try_from` rather than
+/// Delegates the registry check to `CountryCode::try_from` rather than
 /// re-implementing it: a source's free tier answering with a full name
 /// (`"Germany"`) or anything else that isn't a valid code is exactly the
 /// case that constructor already turns into `Err`, which becomes `None`
 /// here — one no-vote path, not two.
-fn extract(value: &serde_json::Value, path: &[&str]) -> Option<CountryCode> {
-    let mut current = value;
-    for segment in path {
-        current = match segment.parse::<usize>() {
-            Ok(index) => current.get(index)?,
-            Err(_) => current.get(*segment)?,
-        };
-    }
-    CountryCode::try_from(current.as_str()?).ok()
+fn extract(value: &serde_json::Value, pointer: &str) -> Option<CountryCode> {
+    CountryCode::try_from(value.pointer(pointer)?.as_str()?).ok()
 }
 
 fn default_sources() -> Vec<GeoSource> {
     fn s(
         name: &'static str,
-        url: impl Fn(&str) -> String + Send + Sync + 'static,
-        path: &'static [&'static str],
+        url: impl Fn(Ipv4Addr) -> String + Send + Sync + 'static,
+        pointer: &'static str,
     ) -> GeoSource {
         GeoSource {
             name,
             url: Box::new(url),
-            path,
+            pointer,
         }
     }
     vec![
         s(
             "ripe-rdap",
             |ip| format!("https://rdap.db.ripe.net/ip/{ip}"),
-            &["country"],
+            "/country",
         ),
-        s(
-            "ipinfo",
-            |ip| format!("https://ipinfo.io/{ip}/json"),
-            &["country"],
-        ),
+        s("ipinfo", |ip| format!("https://ipinfo.io/{ip}/json"), "/country"),
         s(
             "country.is",
             |ip| format!("https://api.country.is/{ip}"),
-            &["country"],
+            "/country",
         ),
         s(
             "geojs",
             |ip| format!("https://get.geojs.io/v1/ip/country.json?ip={ip}"),
-            &["0", "country"],
+            "/0/country",
         ),
-        s(
-            "ipwho",
-            |ip| format!("https://ipwho.is/{ip}"),
-            &["country_code"],
-        ),
-        s(
-            "ipapi.co",
-            |ip| format!("https://ipapi.co/{ip}/json/"),
-            &["country"],
-        ),
+        s("ipwho", |ip| format!("https://ipwho.is/{ip}"), "/country_code"),
+        s("ipapi.co", |ip| format!("https://ipapi.co/{ip}/json/"), "/country"),
         s(
             "ipquery",
             |ip| format!("https://api.ipquery.io/{ip}"),
-            &["location", "country_code"],
+            "/location/country_code",
         ),
         s(
             "ipbase",
             |ip| format!("https://api.ipbase.com/v2/info?ip={ip}"),
-            &["data", "location", "country", "alpha2"],
+            "/data/location/country/alpha2",
         ),
         // ipapi.is's free tier sometimes returns a full country name here
-        // instead of a code — `extract`'s two-letter check turns that into
+        // instead of a code — `extract`'s registry check turns that into
         // a graceful "no vote" rather than a wrong one.
-        s(
-            "ipapi.is",
-            |ip| format!("https://api.ipapi.is/?q={ip}"),
-            &["country"],
-        ),
+        s("ipapi.is", |ip| format!("https://api.ipapi.is/?q={ip}"), "/country"),
     ]
 }
 
@@ -103,7 +81,11 @@ impl GeoIpClient {
     }
 
     #[cfg(test)]
-    fn with_sources(http: reqwest::Client, timeout: Duration, sources: Vec<GeoSource>) -> Self {
+    const fn with_sources(
+        http: reqwest::Client,
+        timeout: Duration,
+        sources: Vec<GeoSource>,
+    ) -> Self {
         Self {
             http,
             timeout,
@@ -111,23 +93,42 @@ impl GeoIpClient {
         }
     }
 
-    pub async fn consensus(&self, ip: &str) -> GeoConsensusFacts {
-        let mut votes = Vec::with_capacity(self.sources.len());
-        for source in &self.sources {
-            let vote = self.query_one(source, ip).await;
-            votes.push(vote);
+    pub async fn consensus(&self, ip: Ipv4Addr) -> GeoConsensusFacts {
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, source) in self.sources.iter().enumerate() {
+            let http = self.http.clone();
+            let timeout = self.timeout;
+            let url = (source.url)(ip);
+            let pointer = source.pointer;
+            tasks.spawn(async move {
+                let vote = Self::query_one(&http, timeout, &url, pointer).await;
+                (index, vote)
+            });
+        }
+        let mut votes = vec![None; self.sources.len()];
+        while let Some(result) = tasks.join_next().await {
+            if let Ok((index, vote)) = result {
+                votes[index] = vote;
+            }
         }
         GeoConsensusFacts { votes }
     }
 
-    async fn query_one(&self, source: &GeoSource, ip: &str) -> Option<CountryCode> {
-        let url = (source.url)(ip);
-        let response = tokio::time::timeout(self.timeout, self.http.get(&url).send())
+    async fn query_one(
+        http: &reqwest::Client,
+        timeout: Duration,
+        url: &str,
+        pointer: &str,
+    ) -> Option<CountryCode> {
+        let response = tokio::time::timeout(timeout, http.get(url).send())
             .await
             .ok()?
             .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
         let value: serde_json::Value = response.json().await.ok()?;
-        extract(&value, source.path)
+        extract(&value, pointer)
     }
 }
 
@@ -146,14 +147,14 @@ mod tests {
     fn extract_reads_a_plain_top_level_field() {
         let sut = serde_json::json!({"country": "fi"});
 
-        assert_eq!(extract(&sut, &["country"]), Some(cc("FI")));
+        assert_eq!(extract(&sut, "/country"), Some(cc("FI")));
     }
 
     #[test]
     fn extract_walks_into_an_array_index_then_an_object_key() {
         let sut = serde_json::json!([{"country": "de"}]);
 
-        assert_eq!(extract(&sut, &["0", "country"]), Some(cc("DE")));
+        assert_eq!(extract(&sut, "/0/country"), Some(cc("DE")));
     }
 
     #[test]
@@ -161,23 +162,25 @@ mod tests {
         // ipapi.is's free tier answers with a full name, not a 2-letter code.
         let sut = serde_json::json!({"country": "Germany"});
 
-        assert_eq!(extract(&sut, &["country"]), None);
+        assert_eq!(extract(&sut, "/country"), None);
     }
 
     #[test]
     fn extract_returns_none_when_the_path_does_not_exist() {
         let sut = serde_json::json!({"unrelated": "value"});
 
-        assert_eq!(extract(&sut, &["country"]), None);
+        assert_eq!(extract(&sut, "/country"), None);
     }
 
     #[tokio::test]
-    async fn consensus_keeps_going_after_one_source_fails_and_preserves_order() {
+    async fn consensus_keeps_going_after_one_source_fails_and_preserves_order()
+    {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/ok"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"country": "fi"})),
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"country": "fi"})),
             )
             .mount(&server)
             .await;
@@ -191,17 +194,17 @@ mod tests {
                 name: "first",
                 url: {
                     let base = server.uri();
-                    Box::new(move |_ip: &str| format!("{base}/ok"))
+                    Box::new(move |_ip: Ipv4Addr| format!("{base}/ok"))
                 },
-                path: &["country"],
+                pointer: "/country",
             },
             GeoSource {
                 name: "second",
                 url: {
                     let base = server.uri();
-                    Box::new(move |_ip: &str| format!("{base}/broken"))
+                    Box::new(move |_ip: Ipv4Addr| format!("{base}/broken"))
                 },
-                path: &["country"],
+                pointer: "/country",
             },
         ];
         let sut = GeoIpClient::with_sources(
@@ -210,7 +213,7 @@ mod tests {
             sources,
         );
 
-        let facts = sut.consensus("203.0.113.1").await;
+        let facts = sut.consensus("203.0.113.1".parse().unwrap()).await;
 
         assert_eq!(facts.votes, vec![Some(cc("FI")), None]);
     }

@@ -1,17 +1,20 @@
-use chip_core::model::BlockListFacts;
+use chip_core::model::{BlockListFacts, BlockListStatus};
 use ipnet::Ipv4Net;
+use serde::Deserialize;
 use std::net::Ipv4Addr;
 
 const SPAMHAUS_URL: &str = "https://www.spamhaus.org/drop/drop_v4.json";
-const FIREHOL_URL: &str =
-    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset";
+const FIREHOL_URL: &str = "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset";
 
 fn parse_spamhaus(body: &str) -> Vec<Ipv4Net> {
+    #[derive(Deserialize)]
+    struct Entry {
+        cidr: String,
+    }
+
     body.lines()
-        .filter_map(|line| {
-            let value: serde_json::Value = serde_json::from_str(line).ok()?;
-            value["cidr"].as_str()?.parse().ok()
-        })
+        .filter_map(|line| serde_json::from_str::<Entry>(line).ok())
+        .filter_map(|entry| entry.cidr.parse().ok())
         .collect()
 }
 
@@ -24,10 +27,8 @@ fn parse_firehol(body: &str) -> Vec<Ipv4Net> {
 }
 
 pub struct BlockLists {
-    spamhaus: Vec<Ipv4Net>,
-    spamhaus_available: bool,
-    firehol: Vec<Ipv4Net>,
-    firehol_available: bool,
+    spamhaus: Option<Vec<Ipv4Net>>,
+    firehol: Option<Vec<Ipv4Net>>,
 }
 
 impl BlockLists {
@@ -35,31 +36,24 @@ impl BlockLists {
         Self::fetch_from(http, SPAMHAUS_URL, FIREHOL_URL).await
     }
 
-    async fn fetch_from(http: &reqwest::Client, spamhaus_url: &str, firehol_url: &str) -> Self {
-        let (spamhaus, spamhaus_available) = match Self::get_text(http, spamhaus_url).await {
-            Some(body) => {
-                let nets = parse_spamhaus(&body);
-                // A real list is never empty; empty parse means corrupted
-                // response.
-                (nets.clone(), !nets.is_empty())
-            }
-            None => (Vec::new(), false),
-        };
-        let (firehol, firehol_available) = match Self::get_text(http, firehol_url).await {
-            Some(body) => {
-                let nets = parse_firehol(&body);
-                // A real list is never empty; empty parse means corrupted
-                // response.
-                (nets.clone(), !nets.is_empty())
-            }
-            None => (Vec::new(), false),
-        };
-        Self {
-            spamhaus,
-            spamhaus_available,
-            firehol,
-            firehol_available,
-        }
+    async fn fetch_from(
+        http: &reqwest::Client,
+        spamhaus_url: &str,
+        firehol_url: &str,
+    ) -> Self {
+        let (spamhaus, firehol) = tokio::join!(
+            Self::get_text(http, spamhaus_url),
+            Self::get_text(http, firehol_url)
+        );
+        // A real list is never empty; an empty parse means a corrupted
+        // response and is therefore unavailable, not a clean list.
+        let spamhaus = spamhaus
+            .map(|body| parse_spamhaus(&body))
+            .filter(|nets| !nets.is_empty());
+        let firehol = firehol
+            .map(|body| parse_firehol(&body))
+            .filter(|nets| !nets.is_empty());
+        Self { spamhaus, firehol }
     }
 
     async fn get_text(http: &reqwest::Client, url: &str) -> Option<String> {
@@ -69,11 +63,19 @@ impl BlockLists {
     }
 
     pub fn check(&self, ip: Ipv4Addr) -> BlockListFacts {
+        fn status(nets: Option<&[Ipv4Net]>, ip: Ipv4Addr) -> BlockListStatus {
+            match nets {
+                None => BlockListStatus::Unavailable,
+                Some(nets) if nets.iter().any(|net| net.contains(&ip)) => {
+                    BlockListStatus::Listed
+                }
+                Some(_) => BlockListStatus::Clear,
+            }
+        }
+
         BlockListFacts {
-            spamhaus_hit: self.spamhaus.iter().any(|net| net.contains(&ip)),
-            spamhaus_available: self.spamhaus_available,
-            firehol_hit: self.firehol.iter().any(|net| net.contains(&ip)),
-            firehol_available: self.firehol_available,
+            spamhaus: status(self.spamhaus.as_deref(), ip),
+            firehol: status(self.firehol.as_deref(), ip),
         }
     }
 }
@@ -114,12 +116,16 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/spamhaus"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(SPAMHAUS_SAMPLE))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(SPAMHAUS_SAMPLE),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/firehol"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(FIREHOL_SAMPLE))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(FIREHOL_SAMPLE),
+            )
             .mount(&server)
             .await;
 
@@ -132,14 +138,15 @@ mod tests {
         let hit = lists.check(Ipv4Addr::new(203, 0, 113, 5));
         let clean = lists.check(Ipv4Addr::new(8, 8, 8, 8));
 
-        assert!(
-            hit.spamhaus_hit && hit.firehol_hit && hit.spamhaus_available && hit.firehol_available
-        );
-        assert!(!clean.spamhaus_hit && !clean.firehol_hit);
+        assert_eq!(hit.spamhaus, BlockListStatus::Listed);
+        assert_eq!(hit.firehol, BlockListStatus::Listed);
+        assert_eq!(clean.spamhaus, BlockListStatus::Clear);
+        assert_eq!(clean.firehol, BlockListStatus::Clear);
     }
 
     #[tokio::test]
-    async fn fetch_from_marks_a_failed_list_unavailable_without_failing_the_other() {
+    async fn fetch_from_marks_a_failed_list_unavailable_without_failing_the_other()
+     {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/spamhaus"))
@@ -148,7 +155,9 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/firehol"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(FIREHOL_SAMPLE))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(FIREHOL_SAMPLE),
+            )
             .mount(&server)
             .await;
 
@@ -160,8 +169,8 @@ mod tests {
         .await;
         let facts = lists.check(Ipv4Addr::new(192, 0, 2, 1));
 
-        assert!(!facts.spamhaus_available);
-        assert!(facts.firehol_available && facts.firehol_hit);
+        assert_eq!(facts.spamhaus, BlockListStatus::Unavailable);
+        assert_eq!(facts.firehol, BlockListStatus::Listed);
     }
 
     #[tokio::test]
@@ -169,12 +178,17 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/spamhaus"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("<html>error</html>"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<html>error</html>"),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/firehol"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(FIREHOL_SAMPLE))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(FIREHOL_SAMPLE),
+            )
             .mount(&server)
             .await;
 
@@ -186,8 +200,7 @@ mod tests {
         .await;
         let facts = lists.check(Ipv4Addr::new(192, 0, 2, 1));
 
-        assert!(!facts.spamhaus_available);
-        assert!(!facts.spamhaus_hit);
-        assert!(facts.firehol_available);
+        assert_eq!(facts.spamhaus, BlockListStatus::Unavailable);
+        assert_eq!(facts.firehol, BlockListStatus::Listed);
     }
 }

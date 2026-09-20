@@ -1,15 +1,15 @@
-use itertools::Itertools as _;
-use serde::Deserialize;
+use std::net::Ipv4Addr;
 
-#[derive(Debug, Clone, Deserialize)]
+use chip_core::{CityName, CountryCode};
+use itertools::Itertools as _;
+
+#[derive(Debug, Clone)]
 pub struct Anchor {
     pub fqdn: String,
-    pub ip_v4: String,
+    pub ip_v4: Ipv4Addr,
     pub city: String,
-    pub country: String,
+    pub country: CountryCode,
     pub as_v4: u32,
-    pub is_disabled: bool,
-    pub date_decommissioned: Option<String>,
 }
 
 /// Sorted by `fqdn` first so "first wins" is deterministic, then one anchor
@@ -25,8 +25,12 @@ fn pick(mut matched: Vec<&Anchor>, count: usize) -> Vec<Anchor> {
         .collect()
 }
 
-pub fn select_for_city(anchors: &[Anchor], city: &str, count: usize) -> Vec<Anchor> {
-    let needle = city.to_lowercase();
+pub fn select_for_city(
+    anchors: &[Anchor],
+    city: &CityName,
+    count: usize,
+) -> Vec<Anchor> {
+    let needle = city.as_str().to_lowercase();
     let matched: Vec<&Anchor> = anchors
         .iter()
         .filter(|a| a.city.to_lowercase().contains(&needle))
@@ -34,11 +38,13 @@ pub fn select_for_city(anchors: &[Anchor], city: &str, count: usize) -> Vec<Anch
     pick(matched, count)
 }
 
-pub fn select_for_country(anchors: &[Anchor], country: &str, count: usize) -> Vec<Anchor> {
-    let matched: Vec<&Anchor> = anchors
-        .iter()
-        .filter(|a| a.country.eq_ignore_ascii_case(country))
-        .collect();
+pub fn select_for_country(
+    anchors: &[Anchor],
+    country: &CountryCode,
+    count: usize,
+) -> Vec<Anchor> {
+    let matched: Vec<&Anchor> =
+        anchors.iter().filter(|a| a.country == *country).collect();
     pick(matched, count)
 }
 
@@ -49,12 +55,10 @@ mod tests {
     fn anchor(fqdn: &str, city: &str, country: &str, as_v4: u32) -> Anchor {
         Anchor {
             fqdn: fqdn.into(),
-            ip_v4: "192.0.2.1".into(),
+            ip_v4: "192.0.2.1".parse().unwrap(),
             city: city.into(),
-            country: country.into(),
+            country: country.parse().unwrap(),
             as_v4,
-            is_disabled: false,
-            date_decommissioned: None,
         }
     }
 
@@ -64,7 +68,7 @@ mod tests {
             anchor("fi-hel-as1", "Helsinki", "FI", 1),
             anchor("nl-ams-as2", "Amsterdam, Netherlands", "NL", 2),
         ];
-        let picked = select_for_city(&anchors, "helsinki", 3);
+        let picked = select_for_city(&anchors, &"helsinki".parse().unwrap(), 3);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].fqdn, "fi-hel-as1");
     }
@@ -77,7 +81,7 @@ mod tests {
             anchor("fi-hel-as2", "Helsinki", "FI", 2),
             anchor("fi-hel-as3", "Helsinki", "FI", 3),
         ];
-        let picked = select_for_city(&anchors, "helsinki", 2);
+        let picked = select_for_city(&anchors, &"helsinki".parse().unwrap(), 2);
         assert_eq!(
             picked.iter().map(|a| a.as_v4).collect::<Vec<_>>(),
             vec![1, 2]
@@ -87,7 +91,10 @@ mod tests {
     #[test]
     fn select_for_city_excludes_client_probes() {
         let anchors = vec![anchor("fi-hel-as1-client", "Helsinki", "FI", 1)];
-        assert!(select_for_city(&anchors, "helsinki", 3).is_empty());
+        assert!(
+            select_for_city(&anchors, &"helsinki".parse().unwrap(), 3)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -96,8 +103,8 @@ mod tests {
             anchor("fi-hel-as1", "Helsinki", "FI", 1),
             anchor("de-fra-as2", "Frankfurt", "DE", 2),
         ];
-        let picked = select_for_country(&anchors, "fi", 3);
+        let picked = select_for_country(&anchors, &"fi".parse().unwrap(), 3);
         assert_eq!(picked.len(), 1);
-        assert_eq!(picked[0].country, "FI");
+        assert_eq!(picked[0].country.as_str(), "FI");
     }
 }

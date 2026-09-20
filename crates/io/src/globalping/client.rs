@@ -1,5 +1,8 @@
 use super::types::RawMeasurement;
+use crate::credentials::GlobalpingToken;
 use serde::Deserialize;
+use std::net::Ipv4Addr;
+use std::num::NonZeroU16;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -7,67 +10,121 @@ use thiserror::Error;
 pub enum GlobalpingError {
     #[error("globalping request failed: {0}")]
     Http(String),
-    #[error("globalping rate limit exceeded (try again next hour, or set GLOBALPING_TOKEN)")]
+    #[error(
+        "globalping rate limit exceeded (try again next hour, or set GLOBALPING_TOKEN)"
+    )]
     RateLimited,
     #[error("globalping found no suitable probes for this request")]
     NoSuitableProbes,
     #[error("measurement did not finish within the deadline")]
     Timeout,
+    #[error("globalping returned an empty measurement id")]
+    EmptyMeasurementId,
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
 }
 
-pub enum MeasurementKind {
-    Ping {
-        target: String,
-        packets: u8,
-    },
-    Https {
-        target: String,
-        port: u16,
-        path: String,
-    },
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MeasurementId(String);
+
+impl MeasurementId {
+    fn new(value: String) -> Result<Self, GlobalpingError> {
+        if value.is_empty() {
+            Err(GlobalpingError::EmptyMeasurementId)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for MeasurementId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub struct MeasurementKind(MeasurementKindInner);
+
+enum MeasurementKindInner {
+    Ping { target: Ipv4Addr },
+    Https { target: Ipv4Addr, port: NonZeroU16 },
 }
 
 impl MeasurementKind {
-    fn type_target_options(&self) -> (&'static str, &str, serde_json::Value) {
-        match self {
-            MeasurementKind::Ping { target, packets } => (
-                "ping",
-                target.as_str(),
-                serde_json::json!({"packets": packets}),
-            ),
-            MeasurementKind::Https { target, port, path } => (
+    pub const fn ping(target: Ipv4Addr) -> Self {
+        Self(MeasurementKindInner::Ping { target })
+    }
+
+    pub const fn https(target: Ipv4Addr, port: NonZeroU16) -> Self {
+        Self(MeasurementKindInner::Https { target, port })
+    }
+
+    fn type_target_options(&self) -> (&'static str, String, serde_json::Value) {
+        match &self.0 {
+            MeasurementKindInner::Ping { target } => {
+                ("ping", target.to_string(), serde_json::json!({"packets": 10}))
+            }
+            MeasurementKindInner::Https { target, port } => (
                 "http",
-                target.as_str(),
-                serde_json::json!({"protocol": "HTTPS", "port": port, "request": {"path": path, "method": "GET"}}),
+                target.to_string(),
+                serde_json::json!({"protocol": "HTTPS", "port": port.get(), "request": {"path": "/", "method": "GET"}}),
             ),
         }
     }
 }
 
-pub enum Locations {
+pub struct Locations(LocationsInner);
+
+enum LocationsInner {
     Ru {
         eyeball_limit: u8,
         datacenter_limit: u8,
     },
-    Reuse(String),
+    Reuse(MeasurementId),
 }
 
 impl Locations {
+    pub const fn ru(
+        eyeball_limit: u8,
+        datacenter_limit: u8,
+    ) -> Result<Self, InvalidProbeDistribution> {
+        if eyeball_limit == 0 && datacenter_limit == 0 {
+            Err(InvalidProbeDistribution)
+        } else {
+            Ok(Self(LocationsInner::Ru {
+                eyeball_limit,
+                datacenter_limit,
+            }))
+        }
+    }
+
+    pub const fn reuse(id: MeasurementId) -> Self {
+        Self(LocationsInner::Reuse(id))
+    }
+
     fn to_value(&self) -> serde_json::Value {
-        match self {
-            Locations::Ru {
+        match &self.0 {
+            LocationsInner::Ru {
                 eyeball_limit,
                 datacenter_limit,
             } => serde_json::json!([
                 {"country": "RU", "tags": ["eyeball-network"], "limit": eyeball_limit},
                 {"country": "RU", "tags": ["datacenter-network"], "limit": datacenter_limit}
             ]),
-            Locations::Reuse(id) => serde_json::Value::String(id.clone()),
+            LocationsInner::Reuse(id) => {
+                serde_json::Value::String(id.to_string())
+            }
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("eyeball and datacenter probe limits cannot both be zero")]
+pub struct InvalidProbeDistribution;
 
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 pub struct Limits {
@@ -75,14 +132,15 @@ pub struct Limits {
     pub remaining: u32,
 }
 
+#[derive(Clone)]
 pub struct GlobalpingClient {
     http: reqwest::Client,
     base_url: String,
-    token: Option<String>,
+    token: Option<GlobalpingToken>,
 }
 
 impl GlobalpingClient {
-    pub fn new(http: reqwest::Client, token: Option<String>) -> Self {
+    pub fn new(http: reqwest::Client, token: Option<GlobalpingToken>) -> Self {
         Self {
             http,
             base_url: "https://api.globalping.io".to_string(),
@@ -92,7 +150,7 @@ impl GlobalpingClient {
 
     fn request(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.token {
-            Some(t) => req.bearer_auth(t),
+            Some(token) => req.bearer_auth(token.expose()),
             None => req,
         }
     }
@@ -101,7 +159,7 @@ impl GlobalpingClient {
         &self,
         kind: &MeasurementKind,
         locations: &Locations,
-    ) -> Result<String, GlobalpingError> {
+    ) -> Result<MeasurementId, GlobalpingError> {
         #[derive(Deserialize)]
         struct Created {
             id: String,
@@ -117,7 +175,9 @@ impl GlobalpingClient {
             .send()
             .await?;
         match resp.status() {
-            reqwest::StatusCode::TOO_MANY_REQUESTS => return Err(GlobalpingError::RateLimited),
+            reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                return Err(GlobalpingError::RateLimited);
+            }
             reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
                 return Err(GlobalpingError::NoSuitableProbes);
             }
@@ -128,12 +188,12 @@ impl GlobalpingClient {
             }
             _ => {}
         }
-        Ok(resp.json::<Created>().await?.id)
+        MeasurementId::new(resp.json::<Created>().await?.id)
     }
 
     pub async fn poll_until_finished(
         &self,
-        id: &str,
+        id: &MeasurementId,
         deadline: Duration,
     ) -> Result<RawMeasurement, GlobalpingError> {
         let start = tokio::time::Instant::now();
@@ -183,12 +243,32 @@ impl GlobalpingClient {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    // Kept async so call sites match the brief's `.await` usage.
-    #[allow(clippy::unused_async)]
-    async fn client_against(server: &MockServer) -> GlobalpingClient {
+    fn ip(value: &str) -> Ipv4Addr {
+        value.parse().unwrap()
+    }
+
+    fn measurement_id(value: &str) -> MeasurementId {
+        MeasurementId::new(value.to_string()).unwrap()
+    }
+
+    #[test]
+    fn an_empty_measurement_id_is_rejected() {
+        let error = MeasurementId::new(String::new()).unwrap_err();
+
+        assert!(matches!(error, GlobalpingError::EmptyMeasurementId));
+    }
+
+    #[test]
+    fn an_empty_probe_distribution_is_rejected() {
+        let error = Locations::ru(0, 0).err().unwrap();
+
+        assert_eq!(error, InvalidProbeDistribution);
+    }
+
+    fn client_against(server: &MockServer) -> GlobalpingClient {
         GlobalpingClient {
             http: reqwest::Client::new(),
             base_url: server.uri(),
@@ -215,32 +295,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_with_ru_locations_sends_the_expected_body_and_returns_the_id() {
+    async fn create_with_ru_locations_sends_the_expected_body_and_returns_the_id()
+     {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/measurements"))
             .respond_with(
-                ResponseTemplate::new(202).set_body_json(serde_json::json!({"id": "meas-1"})),
+                ResponseTemplate::new(202)
+                    .set_body_json(serde_json::json!({"id": "meas-1"})),
             )
             .mount(&server)
             .await;
-        let client = client_against(&server).await;
+        let client = client_against(&server);
 
         let id = client
             .create(
-                &MeasurementKind::Ping {
-                    target: "192.0.2.1".into(),
-                    packets: 10,
-                },
-                &Locations::Ru {
-                    eyeball_limit: 8,
-                    datacenter_limit: 4,
-                },
+                &MeasurementKind::ping(ip("192.0.2.1")),
+                &Locations::ru(8, 4).unwrap(),
             )
             .await
             .unwrap();
 
-        assert_eq!(id, "meas-1");
+        assert_eq!(id.as_str(), "meas-1");
         let body = received_body(&server).await;
         assert_eq!(body["type"], "ping");
         assert_eq!(body["target"], "192.0.2.1");
@@ -260,24 +336,22 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/measurements"))
             .respond_with(
-                ResponseTemplate::new(202).set_body_json(serde_json::json!({"id": "meas-2"})),
+                ResponseTemplate::new(202)
+                    .set_body_json(serde_json::json!({"id": "meas-2"})),
             )
             .mount(&server)
             .await;
-        let client = client_against(&server).await;
+        let client = client_against(&server);
 
         let id = client
             .create(
-                &MeasurementKind::Ping {
-                    target: "192.0.2.2".into(),
-                    packets: 10,
-                },
-                &Locations::Reuse("meas-1".into()),
+                &MeasurementKind::ping(ip("192.0.2.2")),
+                &Locations::reuse(measurement_id("meas-1")),
             )
             .await
             .unwrap();
 
-        assert_eq!(id, "meas-2");
+        assert_eq!(id.as_str(), "meas-2");
         let body = received_body(&server).await;
         // A bare string, not `{"id": "meas-1"}` — confirmed against the live
         // API during the 2026-09-15 calibration spike.
@@ -290,20 +364,20 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/measurements"))
             .respond_with(
-                ResponseTemplate::new(202).set_body_json(serde_json::json!({"id": "meas-3"})),
+                ResponseTemplate::new(202)
+                    .set_body_json(serde_json::json!({"id": "meas-3"})),
             )
             .mount(&server)
             .await;
-        let client = client_against(&server).await;
+        let client = client_against(&server);
 
         client
             .create(
-                &MeasurementKind::Https {
-                    target: "192.0.2.1".into(),
-                    port: 443,
-                    path: "/".into(),
-                },
-                &Locations::Reuse("meas-1".into()),
+                &MeasurementKind::https(
+                    ip("192.0.2.1"),
+                    NonZeroU16::new(443).unwrap(),
+                ),
+                &Locations::reuse(measurement_id("meas-1")),
             )
             .await
             .unwrap();
@@ -324,15 +398,12 @@ mod tests {
             .respond_with(ResponseTemplate::new(429))
             .mount(&server)
             .await;
-        let client = client_against(&server).await;
+        let client = client_against(&server);
 
         let err = client
             .create(
-                &MeasurementKind::Ping {
-                    target: "192.0.2.1".into(),
-                    packets: 10,
-                },
-                &Locations::Reuse("x".into()),
+                &MeasurementKind::ping(ip("192.0.2.1")),
+                &Locations::reuse(measurement_id("x")),
             )
             .await
             .unwrap_err();
@@ -348,15 +419,12 @@ mod tests {
             .respond_with(ResponseTemplate::new(422))
             .mount(&server)
             .await;
-        let client = client_against(&server).await;
+        let client = client_against(&server);
 
         let err = client
             .create(
-                &MeasurementKind::Ping {
-                    target: "192.0.2.1".into(),
-                    packets: 10,
-                },
-                &Locations::Reuse("x".into()),
+                &MeasurementKind::ping(ip("192.0.2.1")),
+                &Locations::reuse(measurement_id("x")),
             )
             .await
             .unwrap_err();
@@ -365,7 +433,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_until_finished_returns_as_soon_as_status_is_not_in_progress() {
+    async fn poll_until_finished_returns_as_soon_as_status_is_not_in_progress()
+    {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/measurements/meas-1"))
@@ -374,10 +443,13 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        let client = client_against(&server).await;
+        let client = client_against(&server);
 
         let measurement = client
-            .poll_until_finished("meas-1", Duration::from_secs(5))
+            .poll_until_finished(
+                &measurement_id("meas-1"),
+                Duration::from_secs(5),
+            )
             .await
             .unwrap();
 
@@ -385,7 +457,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_until_finished_times_out_on_a_measurement_stuck_in_progress() {
+    async fn poll_until_finished_times_out_on_a_measurement_stuck_in_progress()
+    {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/measurements/meas-1"))
@@ -394,10 +467,13 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        let client = client_against(&server).await;
+        let client = client_against(&server);
 
         let err = client
-            .poll_until_finished("meas-1", Duration::from_millis(50))
+            .poll_until_finished(
+                &measurement_id("meas-1"),
+                Duration::from_millis(50),
+            )
             .await
             .unwrap_err();
 
@@ -414,7 +490,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = client_against(&server).await;
+        let client = client_against(&server);
 
         let limits = client.limits().await.unwrap();
 
@@ -425,5 +501,47 @@ mod tests {
                 remaining: 103
             }
         );
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_request_sends_the_token_as_a_bearer_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/limits"))
+            .and(header("authorization", "Bearer token-value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "rateLimit": {"measurements": {"create": {"limit": 250, "remaining": 103}}}
+            })))
+            .mount(&server)
+            .await;
+        let sut = GlobalpingClient {
+            http: reqwest::Client::new(),
+            base_url: server.uri(),
+            token: Some(
+                GlobalpingToken::try_from("token-value".to_string()).unwrap(),
+            ),
+        };
+
+        let limits = sut.limits().await.unwrap();
+
+        assert_eq!(limits.remaining, 103);
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_does_not_leak_the_bearer_token() {
+        let sut = GlobalpingClient {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:1".into(),
+            token: Some(
+                GlobalpingToken::try_from("SECRET123".to_string()).unwrap(),
+            ),
+        };
+
+        let error = sut.limits().await.unwrap_err();
+        let displayed = error.to_string();
+        let debugged = format!("{error:?}");
+
+        assert!(!displayed.contains("SECRET123"), "{displayed}");
+        assert!(!debugged.contains("SECRET123"), "{debugged}");
     }
 }

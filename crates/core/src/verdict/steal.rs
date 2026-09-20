@@ -10,11 +10,11 @@ const WARN_STEAL_PCT: f64 = 5.0;
 // clamped to u64::MAX; converting to f64 never loses precision within the
 // representable tick range (centuries of uptime).
 pub fn steal_pct(before: &ProcStatSnapshot, after: &ProcStatSnapshot) -> f64 {
-    let total_delta = after.total_ticks.saturating_sub(before.total_ticks);
+    let total_delta = after.total_ticks().saturating_sub(before.total_ticks());
     if total_delta == 0 {
         return 0.0;
     }
-    let steal_delta = after.steal_ticks.saturating_sub(before.steal_ticks);
+    let steal_delta = after.steal_ticks().saturating_sub(before.steal_ticks());
     steal_delta as f64 / total_delta as f64 * 100.0
 }
 
@@ -36,10 +36,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     fn snap(steal: u64, total: u64) -> ProcStatSnapshot {
-        ProcStatSnapshot {
-            steal_ticks: steal,
-            total_ticks: total,
-        }
+        ProcStatSnapshot::new(steal, total).unwrap()
     }
 
     #[test]
@@ -58,10 +55,26 @@ mod tests {
         assert_eq!(steal_pct(&snap(50, 9000), &snap(50, 9000)), 0.0);
     }
 
+    #[rstest::rstest]
+    #[case::below_threshold(4.9, Severity::Ok)]
+    #[case::at_threshold(5.0, Severity::Warn)]
+    #[case::well_above_threshold(20.0, Severity::Warn)]
+    fn steal_warning_threshold_is_inclusive(
+        #[case] value: f64,
+        #[case] expected: Severity,
+    ) {
+        let verdict = judge_steal(value);
+
+        assert_eq!(verdict.severity, expected, "{}", verdict.detail);
+    }
+
     #[test]
-    fn judge_steal_warns_at_or_above_five_percent() {
-        assert_eq!(judge_steal(4.9).severity, Severity::Ok);
-        assert_eq!(judge_steal(5.0).severity, Severity::Warn);
-        assert_eq!(judge_steal(20.0).severity, Severity::Warn);
+    fn steal_ticks_cannot_exceed_total_ticks() {
+        let error = ProcStatSnapshot::new(11, 10).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "steal ticks (11) exceeds total CPU ticks (10)"
+        );
     }
 }

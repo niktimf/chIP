@@ -1,23 +1,34 @@
-use crate::model::{CountryCode, GeoConsensusFacts};
 use crate::Verdict;
+use crate::model::{CountryCode, GeoConsensusFacts};
 
 const MIN_ANSWERS: usize = 5;
 
 #[allow(clippy::cast_precision_loss)]
 pub fn judge_geo(facts: &GeoConsensusFacts, expected: &CountryCode) -> Verdict {
-    let answered: Vec<CountryCode> = facts.votes.iter().flatten().copied().collect();
+    let answered: Vec<CountryCode> =
+        facts.votes.iter().flatten().copied().collect();
     if answered.len() < MIN_ANSWERS {
-        return Verdict::error(format!("only {} of {} geo sources answered (need >= {MIN_ANSWERS})", answered.len(), facts.votes.len()));
+        return Verdict::error(format!(
+            "only {} of {} geo sources answered (need >= {MIN_ANSWERS})",
+            answered.len(),
+            facts.votes.len()
+        ));
     }
-    let russia = CountryCode::try_from("RU").expect("RU is a valid country code");
+    let russia =
+        CountryCode::try_from("RU").expect("RU is a valid country code");
     let matching = answered.iter().filter(|c| *c == expected).count();
     let share = matching as f64 / answered.len() as f64;
     let ru_seen = expected != &russia && answered.contains(&russia);
-    let detail = format!("{matching}/{} geo sources say {expected}", answered.len());
+    let detail =
+        format!("{matching}/{} geo sources say {expected}", answered.len());
     if share < 0.5 {
         Verdict::fail(detail)
     } else if share < 0.8 || ru_seen {
-        Verdict::warn(if ru_seen { format!("{detail} (at least one source sees RU)") } else { detail })
+        Verdict::warn(if ru_seen {
+            format!("{detail} (at least one source sees RU)")
+        } else {
+            detail
+        })
     } else {
         Verdict::ok(detail)
     }
@@ -33,12 +44,20 @@ mod tests {
     }
 
     fn votes(codes: &[Option<&str>]) -> GeoConsensusFacts {
-        GeoConsensusFacts { votes: codes.iter().map(|c| c.map(cc)).collect() }
+        GeoConsensusFacts {
+            votes: codes.iter().map(|c| c.map(cc)).collect(),
+        }
     }
 
     #[test]
     fn unanimous_agreement_is_ok() {
-        let sut = votes(&[Some("FI"), Some("fi"), Some("FI"), Some("FI"), Some("FI")]);
+        let sut = votes(&[
+            Some("FI"),
+            Some("fi"),
+            Some("FI"),
+            Some("FI"),
+            Some("FI"),
+        ]);
 
         let verdict = judge_geo(&sut, &cc("FI"));
 
@@ -47,7 +66,13 @@ mod tests {
 
     #[test]
     fn under_half_agreement_fails() {
-        let sut = votes(&[Some("DE"), Some("DE"), Some("FI"), Some("NL"), Some("US")]);
+        let sut = votes(&[
+            Some("DE"),
+            Some("DE"),
+            Some("FI"),
+            Some("NL"),
+            Some("US"),
+        ]);
 
         assert_eq!(judge_geo(&sut, &cc("FI")).severity, Severity::Fail);
     }
@@ -55,21 +80,43 @@ mod tests {
     #[test]
     fn between_half_and_eighty_percent_warns() {
         // 3/5 = 60%: inside (0.5, 0.8), away from the 80% boundary.
-        let sut = votes(&[Some("FI"), Some("FI"), Some("FI"), Some("DE"), Some("NL")]);
+        let sut = votes(&[
+            Some("FI"),
+            Some("FI"),
+            Some("FI"),
+            Some("DE"),
+            Some("NL"),
+        ]);
 
         assert_eq!(judge_geo(&sut, &cc("FI")).severity, Severity::Warn);
     }
 
     #[test]
     fn anyone_seeing_russia_warns_even_at_full_agreement_otherwise() {
-        let sut = votes(&[Some("FI"), Some("FI"), Some("FI"), Some("FI"), Some("RU")]);
+        let sut = votes(&[
+            Some("FI"),
+            Some("FI"),
+            Some("FI"),
+            Some("FI"),
+            Some("RU"),
+        ]);
 
         assert_eq!(judge_geo(&sut, &cc("FI")).severity, Severity::Warn);
     }
 
     #[test]
     fn fewer_than_five_answers_is_an_error() {
-        let sut = votes(&[Some("FI"), None, None, None, None, None, None, None, None]);
+        let sut = votes(&[
+            Some("FI"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
 
         assert_eq!(judge_geo(&sut, &cc("FI")).severity, Severity::Error);
     }

@@ -13,27 +13,34 @@ fn parse_proc_stat(text: &str) -> Option<ProcStatSnapshot> {
     let fields: Vec<u64> = line
         .split_whitespace()
         .skip(1)
-        .filter_map(|f| f.parse().ok())
-        .collect();
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
     if fields.len() < 8 {
         return None;
     }
-    Some(ProcStatSnapshot {
-        steal_ticks: fields[7],
-        total_ticks: fields.iter().sum(),
-    })
+    ProcStatSnapshot::new(fields[7], fields.iter().sum()).ok()
 }
 
-// The pkill pattern is anchored: the wrapper `sh -c <script>` has the whole
-// script in its argv, so an unanchored pattern would match and kill it.
-// The listener's own cmdline starts with `timeout` (nohup execs it).
 fn listener_start_script(port: u16) -> String {
     format!(
-        "C=/tmp/chip-pf.crt; K=/tmp/chip-pf.key; \
-         [ -f \"$C\" ] || openssl req -x509 -newkey rsa:2048 -keyout \"$K\" -out \"$C\" -days 1 -nodes -subj /CN=chip >/dev/null 2>&1; \
-         (sudo ufw allow {port}/tcp || ufw allow {port}/tcp) >/dev/null 2>&1; \
-         pkill -f '^timeout 600 openssl s_server -accept {port}' 2>/dev/null; \
-         nohup timeout 600 openssl s_server -accept {port} -cert \"$C\" -key \"$K\" -www -quiet >/dev/null 2>&1 & \
+        "D=$(mktemp -d /tmp/chip-pf-{port}.XXXXXX) || {{ echo TEMP_FAILED; exit 0; }}; \
+         trap 'rm -rf -- \"$D\"' EXIT; \
+         C=\"$D/cert.pem\"; K=\"$D/key.pem\"; M=\"$D/ufw-added\"; \
+         openssl req -x509 -newkey rsa:2048 -keyout \"$K\" -out \"$C\" -days 1 -nodes -subj /CN=chip >/dev/null 2>&1 || {{ echo CERT_FAILED; exit 0; }}; \
+         if command -v ufw >/dev/null 2>&1; then \
+           if sudo -n true >/dev/null 2>&1; then U='sudo -n ufw'; else U='ufw'; fi; \
+           $U status 2>/dev/null | grep -Eq '^{port}/tcp[[:space:]]+ALLOW' || \
+             {{ $U allow {port}/tcp >/dev/null 2>&1 && : > \"$M\"; }}; \
+         fi; \
+         nohup sh -c 'D=$1; P=$2; \
+           timeout 600 openssl s_server -accept \"$P\" -cert \"$D/cert.pem\" -key \"$D/key.pem\" -www -quiet; \
+           if [ -f \"$D/ufw-added\" ] && command -v ufw >/dev/null 2>&1; then \
+             if sudo -n true >/dev/null 2>&1; then sudo -n ufw delete allow \"$P/tcp\" >/dev/null 2>&1 || true; \
+             else ufw delete allow \"$P/tcp\" >/dev/null 2>&1 || true; fi; \
+           fi; \
+           rm -rf -- \"$D\"' chip-listener-{port} \"$D\" {port} >/dev/null 2>&1 & \
+         trap - EXIT; \
          sleep 1; \
          ss -ltn 2>/dev/null | grep -q ':{port} ' && echo LISTENING || echo FAILED"
     )
@@ -41,19 +48,47 @@ fn listener_start_script(port: u16) -> String {
 
 fn listener_stop_script(port: u16) -> String {
     format!(
-        "pkill -f '^timeout 600 openssl s_server -accept {port}' 2>/dev/null; \
-         (sudo ufw delete allow {port}/tcp || ufw delete allow {port}/tcp) >/dev/null 2>&1 || true"
+        "pkill -f '^timeout 600 openssl s_server -accept {port}' 2>/dev/null || true; \
+         for D in /tmp/chip-pf-{port}.*; do \
+           [ -L \"$D\" ] && continue; [ -d \"$D\" ] || continue; \
+           [ \"$(stat -c %u \"$D\" 2>/dev/null)\" = \"$(id -u)\" ] || continue; \
+           if [ -f \"$D/ufw-added\" ] && command -v ufw >/dev/null 2>&1; then \
+             if sudo -n true >/dev/null 2>&1; then U='sudo -n ufw'; else U='ufw'; fi; \
+             $U delete allow {port}/tcp >/dev/null 2>&1 || true; \
+           fi; \
+           rm -rf -- \"$D\"; \
+         done"
     )
 }
 
 impl SshSession {
     /// Starts `openssl s_server` on `port` under `timeout 600` (it dies on
     /// its own after 10 minutes even if this process is killed first), after
-    /// generating a throwaway self-signed cert if one is not already there
-    /// from an earlier run this session. Opens the port in `ufw` if present.
-    pub async fn start_listener(&self, port: u16) -> Result<ListenerOutcome, SshError> {
+    /// generating a throwaway self-signed cert in a private temporary
+    /// directory. Opens the port in `ufw` if present; both the files and a
+    /// rule added by this run are removed when the listener exits.
+    pub async fn start_listener(
+        &self,
+        port: u16,
+    ) -> Result<ListenerOutcome, SshError> {
         let timeout = self.command_timeout();
-        if !self.preflight().await.port_443_free && port == 443 {
+        let preflight = self.preflight().await;
+        if !preflight.has_openssl {
+            return Ok(ListenerOutcome::Failed(
+                "openssl is not installed on the candidate".to_string(),
+            ));
+        }
+        let port_free = if port == 443 {
+            preflight.port_443_free
+        } else {
+            self.run_shell(
+                &format!("ss -ltn 2>/dev/null | grep -q ':{port} ' && echo BUSY || echo FREE"),
+                timeout,
+            )
+            .await
+            .is_ok_and(|output| output.trim() == "FREE")
+        };
+        if !port_free {
             return Ok(ListenerOutcome::PortInUse);
         }
         let script = listener_start_script(port);
@@ -73,18 +108,20 @@ impl SshSession {
 
     pub async fn steal_snapshot(&self) -> Result<ProcStatSnapshot, SshError> {
         let timeout = self.command_timeout();
-        let text = self.run("cat /proc/stat", timeout).await?;
-        parse_proc_stat(&text)
-            .ok_or_else(|| SshError::Command("could not parse /proc/stat".to_string()))
+        let text = self.run_command("cat", &["/proc/stat"], timeout).await?;
+        parse_proc_stat(&text).ok_or_else(|| {
+            SshError::Command("could not parse /proc/stat".to_string())
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
 
-    const PROC_STAT_LINE: &str =
-        "cpu  1200 30 450 90111 12 0 34 250 0 0\ncpu0 600 15 225 45055 6 0 17 125 0 0\n";
+    const PROC_STAT_LINE: &str = "cpu  1200 30 450 90111 12 0 34 250 0 0\ncpu0 600 15 225 45055 6 0 17 125 0 0\n";
 
     #[test]
     #[allow(clippy::identity_op)] // zeros mirror the /proc/stat fields
@@ -92,9 +129,9 @@ mod tests {
         let snap = parse_proc_stat(PROC_STAT_LINE).unwrap();
         // fields after "cpu": 1200 30 450 90111 12 0 34 250 0 0 - steal is
         // the 8th (250), total is their sum (92087).
-        assert_eq!(snap.steal_ticks, 250);
+        assert_eq!(snap.steal_ticks(), 250);
         assert_eq!(
-            snap.total_ticks,
+            snap.total_ticks(),
             1200 + 30 + 450 + 90111 + 12 + 0 + 34 + 250 + 0 + 0
         );
     }
@@ -111,10 +148,10 @@ mod tests {
 
     #[cfg(unix)]
     fn write_stub(dir: &std::path::Path, name: &str, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
     }
 
     #[cfg(unix)]
@@ -129,25 +166,56 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn listener_state_dirs(port: u16) -> Vec<std::path::PathBuf> {
+        let prefix = format!("chip-pf-{port}.");
+        std::fs::read_dir("/tmp")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().starts_with(&prefix)
+            })
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn start_script_survives_its_own_pkill_and_reports_listening() {
+    fn listener_uses_private_random_state_and_stop_cleans_it_up() {
         let dir = tempfile::tempdir().unwrap();
-        write_stub(dir.path(), "openssl", "sleep 3");
+        let reservation =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        write_stub(
+            dir.path(),
+            "openssl",
+            "[ \"$1\" = req ] && exit 0\nexec sleep 30",
+        );
         write_stub(dir.path(), "ufw", "exit 0");
         write_stub(dir.path(), "sudo", "exit 1");
         write_stub(
             dir.path(),
             "ss",
-            "echo \"LISTEN 0 128 0.0.0.0:47443 0.0.0.0:*\"",
+            &format!("echo \"LISTEN 0 128 0.0.0.0:{port} 0.0.0.0:*\""),
         );
 
-        let start = run_sh(&listener_start_script(47443), dir.path());
+        let start = run_sh(&listener_start_script(port), dir.path());
         let stdout = String::from_utf8_lossy(&start.stdout).to_string();
-        let stop = run_sh(&listener_stop_script(47443), dir.path());
+        let state_dirs = listener_state_dirs(port);
+        let state_mode = state_dirs.first().and_then(|path| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|metadata| metadata.permissions().mode() & 0o777)
+        });
+
+        let stop = run_sh(&listener_stop_script(port), dir.path());
 
         assert!(start.status.success(), "start: {:?} {stdout}", start.status);
         assert!(stdout.contains("LISTENING"), "stdout: {stdout}");
+        assert_eq!(state_dirs.len(), 1, "state dirs: {state_dirs:?}");
+        assert_eq!(state_mode, Some(0o700));
         assert!(stop.status.success(), "stop: {:?}", stop.status);
+        assert!(listener_state_dirs(port).is_empty());
     }
 
     #[cfg(unix)]

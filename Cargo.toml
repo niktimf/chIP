@@ -11,21 +11,22 @@ repository = "https://github.com/niktimf/chIP"
 
 [workspace.dependencies]
 anyhow = "1"
-backon = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
+country-code-enum = { version = "1", default-features = false }
 ipnet = "2.12"
 itertools = "0.15"
 openssh = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
+regex = "1.13"
+secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-shlex = "2"
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "fs", "net", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "fs", "io-util", "net", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+url = "2.5"
 x509-parser = "0.18"
 chip-core = { path = "crates/core" }
 chip-io = { path = "crates/io" }
@@ -36,10 +37,15 @@ wiremock = "0.6"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cognitive_complexity = "warn"
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
 
 [profile.release]
 lto = "thin"

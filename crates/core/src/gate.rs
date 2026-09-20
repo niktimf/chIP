@@ -3,6 +3,7 @@ use std::collections::HashSet;
 
 /// `--gate`/`--skip-gate` as parsed: which gate ids to force to FAIL when
 /// they land on WARN, and which to neutralize entirely. Skip wins when a
+///
 /// gate id appears in both — an operator who disabled a check did not also
 /// mean to make it stricter.
 #[derive(Debug, Default, Clone)]
@@ -20,8 +21,13 @@ impl GateOverrides {
                 ..result
             };
         }
-        if self.escalate.contains(&result.gate) && result.severity == Severity::Warn {
-            return CheckResult { severity: Severity::Fail, ..result };
+        if self.escalate.contains(&result.gate)
+            && result.severity == Severity::Warn
+        {
+            return CheckResult {
+                severity: Severity::Fail,
+                ..result
+            };
         }
         result
     }
@@ -53,16 +59,37 @@ mod tests {
     fn escalate_turns_warn_into_fail_but_leaves_ok_and_fail_alone() {
         let sut = overrides(&["service:claude"], &[]);
 
-        assert_eq!(sut.apply(CheckResult::new("service:claude", Verdict::warn("blocked"))).severity, Severity::Fail);
-        assert_eq!(sut.apply(CheckResult::new("service:claude", Verdict::ok("available"))).severity, Severity::Ok);
-        assert_eq!(sut.apply(CheckResult::new("service:claude", Verdict::fail("x"))).severity, Severity::Fail);
+        assert_eq!(
+            sut.apply(CheckResult::new(
+                "service:claude",
+                Verdict::warn("blocked")
+            ))
+            .severity,
+            Severity::Fail
+        );
+        assert_eq!(
+            sut.apply(CheckResult::new(
+                "service:claude",
+                Verdict::ok("available")
+            ))
+            .severity,
+            Severity::Ok
+        );
+        assert_eq!(
+            sut.apply(CheckResult::new("service:claude", Verdict::fail("x")))
+                .severity,
+            Severity::Fail
+        );
     }
 
     #[test]
     fn skip_neutralizes_the_result_but_says_so_in_the_detail() {
         let sut = overrides(&[], &["reputation:operator"]);
 
-        let out = sut.apply(CheckResult::new("reputation:operator", Verdict::fail("named Snowd")));
+        let out = sut.apply(CheckResult::new(
+            "reputation:operator",
+            Verdict::fail("named Snowd"),
+        ));
 
         assert_eq!(out.severity, Severity::Ok);
         assert!(out.detail.contains("skipped"), "{}", out.detail);
@@ -73,7 +100,10 @@ mod tests {
     fn skip_wins_over_escalate_for_the_same_gate() {
         let sut = overrides(&["latency"], &["latency"]);
 
-        let out = sut.apply(CheckResult::new("latency", Verdict::warn("p75 over threshold")));
+        let out = sut.apply(CheckResult::new(
+            "latency",
+            Verdict::warn("p75 over threshold"),
+        ));
 
         assert_eq!(out.severity, Severity::Ok);
     }

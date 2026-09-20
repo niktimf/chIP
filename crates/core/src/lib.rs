@@ -2,7 +2,10 @@
 //! beyond what callers pass in — everything here is a function of its inputs.
 
 pub mod model;
-pub use model::{CheckResult, CountryCode, GateId, InvalidCountryCode, Severity, Verdict};
+pub use model::{
+    CheckResult, CityName, CountryCode, GateId, InvalidCountryCode, Severity,
+    Verdict,
+};
 
 pub mod report;
 pub use report::Report;

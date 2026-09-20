@@ -1,5 +1,32 @@
 use super::select::Anchor;
+use serde::Deserialize;
 use thiserror::Error;
+
+#[derive(Deserialize)]
+struct RawAnchor {
+    fqdn: String,
+    ip_v4: String,
+    city: String,
+    country: String,
+    as_v4: u32,
+    is_disabled: bool,
+    date_decommissioned: Option<String>,
+}
+
+impl RawAnchor {
+    fn into_active(self) -> Option<Anchor> {
+        if self.is_disabled || self.date_decommissioned.is_some() {
+            return None;
+        }
+        Some(Anchor {
+            fqdn: self.fqdn,
+            ip_v4: self.ip_v4.parse().ok()?,
+            city: self.city,
+            country: self.country.parse().ok()?,
+            as_v4: self.as_v4,
+        })
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum AtlasError {
@@ -21,14 +48,14 @@ impl AnchorClient {
     }
 
     #[cfg(test)]
-    fn with_base_url(http: reqwest::Client, base_url: String) -> Self {
+    const fn with_base_url(http: reqwest::Client, base_url: String) -> Self {
         Self { http, base_url }
     }
 
     pub async fn anchors(&self) -> Result<Vec<Anchor>, AtlasError> {
         #[derive(serde::Deserialize)]
         struct Page {
-            results: Vec<Anchor>,
+            results: Vec<RawAnchor>,
             next: Option<String>,
         }
         let mut url = format!(
@@ -38,9 +65,9 @@ impl AnchorClient {
         let mut out = Vec::new();
         loop {
             let page: Page = self.http.get(&url).send().await?.json().await?;
-            out.extend(page.results.into_iter().filter(|a| {
-                !a.is_disabled && a.date_decommissioned.is_none() && !a.ip_v4.is_empty()
-            }));
+            out.extend(
+                page.results.into_iter().filter_map(RawAnchor::into_active),
+            );
             match page.next {
                 Some(next) => url = next,
                 None => break,
@@ -82,8 +109,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client =
-            AnchorClient::with_base_url(reqwest::Client::new(), format!("{}/page1", server.uri()));
+        let client = AnchorClient::with_base_url(
+            reqwest::Client::new(),
+            format!("{}/page1", server.uri()),
+        );
         let anchors = client.anchors().await.unwrap();
 
         assert_eq!(

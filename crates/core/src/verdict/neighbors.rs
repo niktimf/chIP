@@ -1,5 +1,5 @@
 use crate::Verdict;
-use crate::model::NeighborProbe;
+use crate::model::{NeighborHttps, NeighborProbe, PtrLookup};
 use itertools::Itertools as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,11 +116,14 @@ const BRANDS: &[&str] = &[
 ];
 
 pub fn classify(probe: &NeighborProbe) -> NeighborBucket {
-    if !probe.tcp_open {
-        return NeighborBucket::Closed;
-    }
-    let Some(h) = &probe.handshake else {
-        return NeighborBucket::NoHandshake;
+    let h = match &probe.https {
+        NeighborHttps::Closed => return NeighborBucket::Closed,
+        NeighborHttps::Open { handshake: None } => {
+            return NeighborBucket::NoHandshake;
+        }
+        NeighborHttps::Open {
+            handshake: Some(handshake),
+        } => handshake,
     };
     let cn = h.cert_cn.as_deref().unwrap_or("");
     let issuer = h.cert_issuer.as_deref().unwrap_or("");
@@ -134,7 +137,8 @@ pub fn classify(probe: &NeighborProbe) -> NeighborBucket {
     let looks_default = (cn.is_empty() && h.cert_san.is_empty())
         || cn.eq_ignore_ascii_case("localhost")
         || cn.eq_ignore_ascii_case("example.com")
-        || (!cn.is_empty() && cn.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        || (!cn.is_empty()
+            && cn.chars().all(|c| c.is_ascii_digit() || c == '.'))
         || cn.to_lowercase().contains("traefik")
         || issuer.to_lowercase().contains("caddy local")
         || issuer.is_empty();
@@ -145,17 +149,22 @@ pub fn classify(probe: &NeighborProbe) -> NeighborBucket {
     }
 }
 
-pub fn judge_candidate_ptr(ptr: Option<&str>) -> Verdict {
+pub fn judge_candidate_ptr(ptr: &PtrLookup) -> Verdict {
     match ptr {
-        Some(p)
+        PtrLookup::Resolved(p)
             if ["vpn", "proxy", "tunnel"]
                 .iter()
-                .any(|k| p.to_lowercase().contains(k)) =>
+                .any(|k| p.as_str().to_lowercase().contains(k)) =>
         {
-            Verdict::warn(format!("candidate's own PTR is self-describing: {p}"))
+            Verdict::warn(format!(
+                "candidate's own PTR is self-describing: {p}"
+            ))
         }
-        Some(p) => Verdict::ok(format!("PTR: {p}")),
-        None => Verdict::ok("no PTR record"),
+        PtrLookup::Resolved(p) => Verdict::ok(format!("PTR: {p}")),
+        PtrLookup::NotFound => Verdict::ok("no PTR record"),
+        PtrLookup::Unavailable(reason) => {
+            Verdict::error(format!("PTR lookup unavailable: {reason}"))
+        }
     }
 }
 
@@ -182,7 +191,14 @@ pub fn judge_neighbor_extremes(probes: &[NeighborProbe]) -> Verdict {
         .iter()
         .zip(&buckets)
         .filter(|(_, bucket)| **bucket == NeighborBucket::SelfSigned)
-        .filter_map(|(probe, _)| probe.handshake.as_ref())
+        .filter_map(|(probe, _)| match &probe.https {
+            NeighborHttps::Open {
+                handshake: Some(handshake),
+            } => Some(handshake),
+            NeighborHttps::Closed | NeighborHttps::Open { handshake: None } => {
+                None
+            }
+        })
         .counts_by(|h| {
             (
                 h.cert_cn.clone().unwrap_or_default(),
@@ -198,14 +214,18 @@ pub fn judge_neighbor_extremes(probes: &[NeighborProbe]) -> Verdict {
     let vpn_ptrs = probes
         .iter()
         .filter(|p| {
-            p.ptr.as_deref().is_some_and(|s| {
-                let l = s.to_lowercase();
+            let PtrLookup::Resolved(ptr) = &p.ptr else {
+                return false;
+            };
+            {
+                let l = ptr.as_str().to_lowercase();
                 l.contains("vpn") || l.contains("proxy")
-            })
+            }
         })
         .count();
     if vpn_ptrs >= 5 {
-        warnings.push(format!("{vpn_ptrs} neighbor PTR records mention vpn/proxy"));
+        warnings
+            .push(format!("{vpn_ptrs} neighbor PTR records mention vpn/proxy"));
     }
 
     if warnings.is_empty() {
@@ -221,34 +241,42 @@ pub fn judge_neighbor_extremes(probes: &[NeighborProbe]) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Severity, TlsHandshakeFacts};
+    use crate::model::{PtrName, Severity, TlsHandshakeFacts};
+
+    fn ptr(name: &str) -> PtrLookup {
+        PtrLookup::Resolved(PtrName::try_from(name).unwrap())
+    }
 
     fn closed(ip: &str) -> NeighborProbe {
         NeighborProbe {
-            ip: ip.into(),
-            ptr: None,
-            tcp_open: false,
-            handshake: None,
+            ip: ip.parse().unwrap(),
+            ptr: PtrLookup::NotFound,
+            https: NeighborHttps::Closed,
         }
     }
     fn no_handshake(ip: &str) -> NeighborProbe {
         NeighborProbe {
-            ip: ip.into(),
-            ptr: None,
-            tcp_open: true,
-            handshake: None,
+            ip: ip.parse().unwrap(),
+            ptr: PtrLookup::NotFound,
+            https: NeighborHttps::Open { handshake: None },
         }
     }
-    fn handshake(ip: &str, cn: &str, issuer: &str, san: &[&str]) -> NeighborProbe {
+    fn handshake(
+        ip: &str,
+        cn: &str,
+        issuer: &str,
+        san: &[&str],
+    ) -> NeighborProbe {
         NeighborProbe {
-            ip: ip.into(),
-            ptr: None,
-            tcp_open: true,
-            handshake: Some(TlsHandshakeFacts {
-                cert_cn: Some(cn.into()),
-                cert_issuer: Some(issuer.into()),
-                cert_san: san.iter().map(ToString::to_string).collect(),
-            }),
+            ip: ip.parse().unwrap(),
+            ptr: PtrLookup::NotFound,
+            https: NeighborHttps::Open {
+                handshake: Some(TlsHandshakeFacts {
+                    cert_cn: Some(cn.into()),
+                    cert_issuer: Some(issuer.into()),
+                    cert_san: san.iter().map(ToString::to_string).collect(),
+                }),
+            },
         }
     }
 
@@ -304,22 +332,35 @@ mod tests {
     #[test]
     fn a_clean_ptr_is_ok() {
         assert_eq!(
-            judge_candidate_ptr(Some("host.example-hoster.net")).severity,
+            judge_candidate_ptr(&ptr("host.example-hoster.net")).severity,
             Severity::Ok
         );
-        assert_eq!(judge_candidate_ptr(None).severity, Severity::Ok);
+        assert_eq!(
+            judge_candidate_ptr(&PtrLookup::NotFound).severity,
+            Severity::Ok
+        );
     }
 
     #[test]
     fn a_self_describing_ptr_warns() {
         assert_eq!(
-            judge_candidate_ptr(Some("vpn123.example-hoster.net")).severity,
+            judge_candidate_ptr(&ptr("vpn123.example-hoster.net")).severity,
             Severity::Warn
         );
         assert_eq!(
-            judge_candidate_ptr(Some("client.proxy-pool.example.net")).severity,
+            judge_candidate_ptr(&ptr("client.proxy-pool.example.net")).severity,
             Severity::Warn
         );
+    }
+
+    #[test]
+    fn an_unavailable_ptr_lookup_is_not_reported_as_no_record() {
+        let verdict = judge_candidate_ptr(&PtrLookup::Unavailable(
+            "dig is not installed".to_string(),
+        ));
+
+        assert_eq!(verdict.severity, Severity::Error);
+        assert!(verdict.detail.contains("dig is not installed"));
     }
 
     #[test]
@@ -336,7 +377,14 @@ mod tests {
     #[test]
     fn twenty_plus_responding_with_zero_real_sites_warns_as_a_proxy_farm() {
         let probes: Vec<NeighborProbe> = (0..22)
-            .map(|i| handshake(&format!("203.0.113.{i}"), "invalid2.invalid", "", &[]))
+            .map(|i| {
+                handshake(
+                    &format!("203.0.113.{i}"),
+                    "invalid2.invalid",
+                    "",
+                    &[],
+                )
+            })
             .collect();
         let v = judge_neighbor_extremes(&probes);
         assert_eq!(v.severity, Severity::Warn, "{}", v.detail);
@@ -358,10 +406,9 @@ mod tests {
     fn five_plus_vpn_labeled_ptrs_among_neighbors_warns() {
         let mut probes: Vec<NeighborProbe> = (0..5)
             .map(|i| NeighborProbe {
-                ip: format!("203.0.113.{i}"),
-                ptr: Some(format!("vpn{i}.example.net")),
-                tcp_open: true,
-                handshake: None,
+                ip: format!("203.0.113.{i}").parse().unwrap(),
+                ptr: ptr(&format!("vpn{i}.example.net")),
+                https: NeighborHttps::Open { handshake: None },
             })
             .collect();
         probes.push(handshake("203.0.113.99", "blog.example.org", "R3", &[]));

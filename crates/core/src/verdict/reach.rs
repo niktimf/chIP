@@ -1,27 +1,32 @@
-use crate::model::{HttpProbeOutcome, ReachFacts};
 use crate::Verdict;
+use crate::model::{HttpProbeOutcome, ReachFacts};
 
 const FAIL_SHARE: f64 = 0.25;
 const MIN_VALID_PROBES: usize = 6;
 
 pub fn judge_reach(facts: &ReachFacts) -> Verdict {
-    let valid = facts.control.iter().filter(|c| **c == HttpProbeOutcome::Ok).count();
+    let valid = facts
+        .probes
+        .iter()
+        .filter(|probe| probe.control == HttpProbeOutcome::Ok)
+        .count();
     if valid < MIN_VALID_PROBES {
         return Verdict::error(format!(
             "only {valid} of {} probes had a working control anchor (need >= {MIN_VALID_PROBES})",
-            facts.control.len()
+            facts.probes.len()
         ));
     }
     let failed = facts
-        .candidate
+        .probes
         .iter()
-        .zip(&facts.control)
-        .filter(|(_, control)| **control == HttpProbeOutcome::Ok)
-        .filter(|(candidate, _)| **candidate == HttpProbeOutcome::Failed)
+        .filter(|probe| probe.control == HttpProbeOutcome::Ok)
+        .filter(|probe| probe.candidate == HttpProbeOutcome::Failed)
         .count();
     #[allow(clippy::cast_precision_loss)]
     let share = failed as f64 / valid as f64;
-    let detail = format!("{failed}/{valid} valid probes could not reach the candidate over HTTPS");
+    let detail = format!(
+        "{failed}/{valid} valid probes could not reach the candidate over HTTPS"
+    );
     if share >= FAIL_SHARE {
         Verdict::fail(detail)
     } else if failed > 0 {
@@ -35,14 +40,19 @@ pub fn judge_reach(facts: &ReachFacts) -> Verdict {
 mod tests {
     use super::*;
     use crate::model::HttpProbeOutcome::{Failed, Ok as HttpOk};
-    use crate::model::Severity;
+    use crate::model::{ReachProbe, Severity};
 
     fn facts(candidate: &[bool], control: &[bool]) -> ReachFacts {
         // true = Ok, false = Failed, for readability in each test.
         ReachFacts {
-            probe_labels: (0..candidate.len()).map(|i| format!("probe{i}")).collect(),
-            candidate: candidate.iter().map(|&ok| if ok { HttpOk } else { Failed }).collect(),
-            control: control.iter().map(|&ok| if ok { HttpOk } else { Failed }).collect(),
+            probes: candidate
+                .iter()
+                .zip(control)
+                .map(|(&candidate_ok, &control_ok)| ReachProbe {
+                    candidate: if candidate_ok { HttpOk } else { Failed },
+                    control: if control_ok { HttpOk } else { Failed },
+                })
+                .collect(),
         }
     }
 
@@ -53,14 +63,20 @@ mod tests {
     }
 
     #[test]
-    fn a_probe_where_the_control_itself_failed_does_not_count_against_the_candidate() {
+    fn a_probe_where_the_control_itself_failed_does_not_count_against_the_candidate()
+     {
         // Control fails on probes 0-1 (excluded); of the remaining 10, candidate fails none.
         let candidate = vec![true; 12];
         let mut control = vec![true; 12];
         control[0] = false;
         control[1] = false;
         let f = facts(&candidate, &control);
-        assert_eq!(judge_reach(&f).severity, Severity::Ok, "{}", judge_reach(&f).detail);
+        assert_eq!(
+            judge_reach(&f).severity,
+            Severity::Ok,
+            "{}",
+            judge_reach(&f).detail
+        );
     }
 
     #[test]
@@ -71,7 +87,12 @@ mod tests {
         candidate[1] = false;
         candidate[2] = false;
         let f = facts(&candidate, &[true; 10]);
-        assert_eq!(judge_reach(&f).severity, Severity::Fail, "{}", judge_reach(&f).detail);
+        assert_eq!(
+            judge_reach(&f).severity,
+            Severity::Fail,
+            "{}",
+            judge_reach(&f).detail
+        );
     }
 
     #[test]
@@ -79,7 +100,12 @@ mod tests {
         let mut candidate = vec![true; 10];
         candidate[0] = false;
         let f = facts(&candidate, &[true; 10]);
-        assert_eq!(judge_reach(&f).severity, Severity::Warn, "{}", judge_reach(&f).detail);
+        assert_eq!(
+            judge_reach(&f).severity,
+            Severity::Warn,
+            "{}",
+            judge_reach(&f).detail
+        );
     }
 
     #[test]
@@ -91,6 +117,11 @@ mod tests {
         control[2] = true;
         control[3] = true;
         let f = facts(&[true; 10], &control);
-        assert_eq!(judge_reach(&f).severity, Severity::Error, "{}", judge_reach(&f).detail);
+        assert_eq!(
+            judge_reach(&f).severity,
+            Severity::Error,
+            "{}",
+            judge_reach(&f).detail
+        );
     }
 }
