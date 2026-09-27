@@ -3,9 +3,10 @@ use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chip_core::ip_lists::RknRegistry;
 use chip_core::model::{
-    CaptchaObservation, PingSweepFacts, PortalOutcome, RiskScore,
-    ServiceCountryVote, ServiceState,
+    CaptchaObservation, PingSweepFacts, PortalOutcome, ReputationFacts,
+    RiskScore, ServiceCountryVote, ServiceState,
 };
 use chip_core::verdict::ai::judge_ai_endpoints;
 use chip_core::verdict::blocklists::judge_blocklists;
@@ -19,17 +20,20 @@ use chip_core::verdict::reach::judge_reach;
 use chip_core::verdict::reputation::{
     judge_reputation, judge_reputation_operator,
 };
+use chip_core::verdict::rkn_registry::judge_rkn_registry;
 use chip_core::verdict::service_geo::{
     judge_cdn_edge, judge_search_captcha, judge_service_country,
 };
 use chip_core::verdict::services::{judge_services_fail, judge_services_warn};
 use chip_core::verdict::steal::{judge_steal, steal_pct};
 use chip_core::verdict::tampering::judge_tampering;
-use chip_core::{CheckResult, CountryCode, Report, Severity, Verdict};
+use chip_core::{
+    CheckResult, CountryCode, GateScope, Report, ScanProfile, Severity, Verdict,
+};
 use chip_io::atlas::{
     Anchor, AnchorClient, select_for_city, select_for_country,
 };
-use chip_io::blocklists::BlockLists;
+use chip_io::blocklists::BlockListsClient;
 use chip_io::geoip::GeoIpClient;
 use chip_io::globalping::{
     GlobalpingClient, Locations, MeasurementId, MeasurementKind,
@@ -38,6 +42,7 @@ use chip_io::globalping::{
 use chip_io::neighbors::{SweepConfig, sweep};
 use chip_io::proxycheck::ProxycheckClient;
 use chip_io::ripestat::RipestatClient;
+use chip_io::rkn_registry::{RknRegistryClient, RknRegistryError};
 use chip_io::ssh::{ListenerOutcome, SocksTunnel, SshConfig, SshSession};
 use chip_io::tunnel::{
     TunnelClient, probe_ai_endpoints, probe_cdn_edges, probe_chatgpt_app,
@@ -79,6 +84,43 @@ pub fn pick_free_port() -> std::io::Result<NonZeroU16> {
     })
 }
 
+fn reputation_results(
+    reputation: Result<ReputationFacts, impl std::fmt::Display>,
+) -> Vec<CheckResult> {
+    let (flags, operator) = reputation.map_or_else(
+        |error| {
+            let detail = error.to_string();
+            (Verdict::error(detail.clone()), Verdict::error(detail))
+        },
+        |facts| {
+            (
+                judge_reputation(
+                    &facts,
+                    RiskScore::new(50).expect("50 is a valid risk score"),
+                ),
+                judge_reputation_operator(&facts),
+            )
+        },
+    );
+    vec![
+        CheckResult::new("reputation", flags),
+        CheckResult::new("reputation:operator", operator),
+    ]
+}
+
+fn rkn_registry_verdict(
+    registry: Result<RknRegistry, RknRegistryError>,
+    ip: Ipv4Addr,
+) -> Verdict {
+    match registry {
+        Ok(registry) => registry.check(ip).map_or_else(
+            |error| Verdict::error(error.to_string()),
+            |facts| judge_rkn_registry(&facts),
+        ),
+        Err(error) => Verdict::error(error.to_string()),
+    }
+}
+
 #[tracing::instrument(
     name = "scan.phase_a",
     level = "info",
@@ -96,44 +138,44 @@ pub async fn run_phase_a(
     );
     let geo_client = GeoIpClient::new(http.clone(), Duration::from_secs(6));
     let ripestat_client = RipestatClient::new(http.clone());
-    let prefix = network_24(ip);
+    let block_lists_client = BlockListsClient::new(http.clone());
+    let registry_client = RknRegistryClient::new(http.clone());
+    let profile = command.profile();
+    let geo = async {
+        match profile.scope("geo") {
+            GateScope::Judged => {
+                let facts = geo_client.consensus(ip).await;
+                CheckResult::new("geo", judge_geo(&facts, command.country()))
+            }
+            GateScope::Skipped(reason) => CheckResult::skipped("geo", reason),
+        }
+    };
 
-    let (reputation, blocklists, geo, provenance) = tokio::join!(
+    let (reputation, block_lists, registry, geo, provenance) = tokio::join!(
         reputation_client.lookup(ip),
-        BlockLists::fetch(http),
-        geo_client.consensus(ip),
-        ripestat_client.routing_status(prefix)
+        block_lists_client.fetch(),
+        registry_client.fetch(),
+        geo,
+        ripestat_client.routing_status(ip)
     );
 
-    let (reputation_flags, reputation_operator) = reputation.map_or_else(
-        |error| {
-            let detail = error.to_string();
-            (Verdict::error(detail.clone()), Verdict::error(detail))
-        },
-        |facts| {
-            (
-                judge_reputation(
-                    &facts,
-                    RiskScore::new(50).expect("50 is a valid risk score"),
-                ),
-                judge_reputation_operator(&facts),
-            )
-        },
-    );
-
-    vec![
-        CheckResult::new("reputation", reputation_flags),
-        CheckResult::new("reputation:operator", reputation_operator),
-        CheckResult::new("blocklists", judge_blocklists(&blocklists.check(ip))),
-        CheckResult::new("geo", judge_geo(&geo, command.country())),
+    let mut results = reputation_results(reputation);
+    results.extend([
+        CheckResult::new(
+            "blocklists",
+            judge_blocklists(&block_lists.check(ip)),
+        ),
+        CheckResult::new("rkn-registry", rkn_registry_verdict(registry, ip)),
         CheckResult::new(
             "provenance",
             provenance.map_or_else(
                 |error| Verdict::error(error.to_string()),
-                |facts| judge_routing(&facts),
+                |routing| judge_routing(&routing),
             ),
         ),
-    ]
+        geo,
+    ]);
+    results
 }
 
 fn manual_anchor(ip: Ipv4Addr, country: CountryCode) -> Anchor {
@@ -236,6 +278,26 @@ async fn reach_measurement(
     }
 }
 
+async fn latency_results(
+    client: &GlobalpingClient,
+    command: &ScanCommand,
+    candidate_id: &MeasurementId,
+    candidate: &chip_io::globalping::RawMeasurement,
+    city_anchors: &[Anchor],
+) -> Vec<CheckResult> {
+    if !command.profile().judges("latency") {
+        return command.profile().skipped(["latency"]);
+    }
+    let anchors = anchor_measurements(client, candidate_id, city_anchors).await;
+    let latency = ping_sweep_facts(candidate, &anchors).map_or_else(
+        |error| Verdict::error(error.to_string()),
+        |facts: PingSweepFacts| {
+            judge_latency(&facts, command.latency_thresholds())
+        },
+    );
+    vec![CheckResult::new("latency", latency)]
+}
+
 async fn run_globalping_measurements(
     client: &GlobalpingClient,
     command: &ScanCommand,
@@ -243,6 +305,10 @@ async fn run_globalping_measurements(
     listener: Option<u16>,
     control_anchor: Option<&Anchor>,
 ) -> Vec<CheckResult> {
+    // Without a listener the candidate ping would only feed the latency gate.
+    if listener.is_none() && !command.profile().judges("latency") {
+        return command.profile().skipped(["latency"]);
+    }
     let probes = command.probes();
     let locations = match Locations::ru(probes.eyeball(), probes.datacenter()) {
         Ok(locations) => locations,
@@ -262,15 +328,14 @@ async fn run_globalping_measurements(
         Ok(measurement) => measurement,
         Err(error) => return unavailable_globalping_results(&error, listener),
     };
-    let anchors =
-        anchor_measurements(client, &candidate_id, city_anchors).await;
-    let latency = ping_sweep_facts(&candidate, &anchors).map_or_else(
-        |error| Verdict::error(error.to_string()),
-        |facts: PingSweepFacts| {
-            judge_latency(&facts, command.latency_thresholds())
-        },
-    );
-    let mut results = vec![CheckResult::new("latency", latency)];
+    let mut results = latency_results(
+        client,
+        command,
+        &candidate_id,
+        &candidate,
+        city_anchors,
+    )
+    .await;
     if let Some(port) = listener {
         results.push(
             reach_measurement(
@@ -458,10 +523,22 @@ fn service_results<const N: usize>(
 async fn run_tunnel_checks(
     client: &TunnelClient,
     expected_country: &CountryCode,
+    profile: ScanProfile,
 ) -> Vec<CheckResult> {
-    Box::pin(TunnelObservations::probe(client))
-        .await
-        .into_results(*expected_country)
+    match profile {
+        ScanProfile::Exit => Box::pin(TunnelObservations::probe(client))
+            .await
+            .into_results(*expected_country),
+        ScanProfile::RuBridge => {
+            let (plain, tls) = probe_portal_endpoints(client).await;
+            let mut results = profile.skipped(TUNNEL_GATES);
+            results.push(CheckResult::new(
+                "tampering",
+                judge_tampering(&plain, &tls),
+            ));
+            results
+        }
+    }
 }
 
 fn select_anchors(
@@ -762,7 +839,12 @@ async fn run_socks_checks(
     let results = match TunnelClient::new(tunnel.local_addr(), REQUEST_TIMEOUT)
     {
         Ok(client) => {
-            Box::pin(run_tunnel_checks(&client, command.country())).await
+            Box::pin(run_tunnel_checks(
+                &client,
+                command.country(),
+                command.profile(),
+            ))
+            .await
         }
         Err(error) => tunnel_results(&Verdict::error(error.to_string())),
     };
@@ -915,11 +997,12 @@ pub async fn run_scan(command: &ScanCommand) -> Report {
     if !should_short_circuit(&results, command.fail_fast()) {
         results.extend(run_phase_b(command, &http).await);
     }
+    let profile = command.profile();
     let overrides = command.gate_overrides();
     let report = Report {
         results: results
             .into_iter()
-            .map(|result| overrides.apply(result))
+            .map(|result| overrides.apply(profile.apply(result)))
             .collect(),
     };
     tracing::debug!(
@@ -970,6 +1053,21 @@ mod tests {
         assert_eq!(sut.results.len(), TUNNEL_GATES.len() + 2);
         assert!(sut.results.iter().all(|result| result.skipped), "{table}");
         assert!(!table.contains("OK "), "{table}");
+    }
+
+    #[test]
+    fn a_bridge_reports_every_tunnel_gate_but_tampering_as_skipped() {
+        let sut = ScanProfile::RuBridge;
+
+        let skipped = sut.skipped(TUNNEL_GATES);
+
+        let gates: Vec<_> =
+            skipped.iter().map(|result| result.gate.as_str()).collect();
+        let expected: Vec<_> = TUNNEL_GATES
+            .into_iter()
+            .filter(|&gate| gate != "tampering")
+            .collect();
+        assert_eq!(gates, expected);
     }
 
     #[test]

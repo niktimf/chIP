@@ -230,7 +230,7 @@ pub fn judge_latency(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AnchorSeries, PingSample};
+    use crate::model::{AnchorSeries, PingSample, Severity};
     use pretty_assertions::assert_eq;
 
     fn samples(rtt: &[f64], loss_pct: f64) -> Vec<Option<PingSample>> {
@@ -327,12 +327,7 @@ mod tests {
 
         let verdict = judge_latency(&sut, &thresholds());
 
-        assert_eq!(
-            verdict.severity,
-            crate::model::Severity::Ok,
-            "{}",
-            verdict.detail
-        );
+        assert_eq!(verdict.severity, Severity::Ok, "{}", verdict.detail);
         assert!(
             verdict.detail.contains("4.9") || verdict.detail.contains("5.0"),
             "{}",
@@ -340,54 +335,46 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_large_median_excess_fails() {
-        let sut =
-            facts(samples(&[80.0; 8], 0.0), vec![anchor("only", &[20.0; 8])]);
-
-        let verdict = judge_latency(&sut, &thresholds());
-
-        assert_eq!(
-            verdict.severity,
-            crate::model::Severity::Fail,
-            "{}",
-            verdict.detail
-        );
-    }
-
-    #[test]
-    fn a_high_p75_with_an_ok_median_warns() {
-        // 8 probes: six near-zero excess, two spikes — median stays low,
-        // p75 (6th of 8 sorted values) does not.
-        let candidate = [20.0, 20.5, 20.2, 20.1, 20.3, 20.0, 60.0, 65.0];
-        let sut =
-            facts(samples(&candidate, 0.0), vec![anchor("only", &[20.0; 8])]);
-
-        let verdict = judge_latency(&sut, &thresholds());
-
-        assert_eq!(
-            verdict.severity,
-            crate::model::Severity::Warn,
-            "{}",
-            verdict.detail
-        );
-    }
-
-    #[test]
-    fn a_loss_delta_over_threshold_fails_even_with_good_rtt() {
-        let sut = facts(
-            samples(&[21.0; 8], 10.0), // 10% vs anchor's 0%
+    #[rstest::rstest]
+    #[case::a_large_median_excess(
+        facts(samples(&[80.0; 8], 0.0), vec![anchor("only", &[20.0; 8])]),
+        Severity::Fail
+    )]
+    // 8 probes: six near-zero excess, two spikes; the median stays low, p75
+    // (6th of 8 sorted values) does not.
+    #[case::a_high_p75_with_an_ok_median(
+        facts(
+            samples(&[20.0, 20.5, 20.2, 20.1, 20.3, 20.0, 60.0, 65.0], 0.0),
             vec![anchor("only", &[20.0; 8])],
-        );
-
+        ),
+        Severity::Warn
+    )]
+    // 10% loss against the anchor's 0%.
+    #[case::a_loss_delta_over_threshold_even_with_good_rtt(
+        facts(samples(&[21.0; 8], 10.0), vec![anchor("only", &[20.0; 8])]),
+        Severity::Fail
+    )]
+    #[case::fewer_than_six_valid_probes_is_not_a_verdict(
+        facts(
+            optional_samples(
+                &[Some(20.0), Some(20.0), None, None, None, None, None, None],
+                0.0,
+            ),
+            vec![anchor("only", &[20.0; 8])],
+        ),
+        Severity::Error
+    )]
+    #[case::no_surviving_anchors(
+        facts(samples(&[20.0], 0.0), vec![]),
+        Severity::Error
+    )]
+    fn excess_and_loss_over_the_anchors_set_the_severity(
+        #[case] sut: PingSweepFacts,
+        #[case] expected: Severity,
+    ) {
         let verdict = judge_latency(&sut, &thresholds());
 
-        assert_eq!(
-            verdict.severity,
-            crate::model::Severity::Fail,
-            "{}",
-            verdict.detail
-        );
+        assert_eq!(verdict.severity, expected, "{}", verdict.detail);
     }
 
     #[test]
@@ -397,33 +384,8 @@ mod tests {
 
         let verdict = judge_latency(&sut, &thresholds());
 
-        assert_eq!(
-            verdict.severity,
-            crate::model::Severity::Warn,
-            "{}",
-            verdict.detail
-        );
+        assert_eq!(verdict.severity, Severity::Warn, "{}", verdict.detail);
         assert!(verdict.detail.contains("city"), "{}", verdict.detail);
-    }
-
-    #[test]
-    fn fewer_than_six_valid_probes_is_an_error_not_a_verdict() {
-        let sut = facts(
-            optional_samples(
-                &[Some(20.0), Some(20.0), None, None, None, None, None, None],
-                0.0,
-            ),
-            vec![anchor("only", &[20.0; 8])],
-        );
-
-        let verdict = judge_latency(&sut, &thresholds());
-
-        assert_eq!(
-            verdict.severity,
-            crate::model::Severity::Error,
-            "{}",
-            verdict.detail
-        );
     }
 
     #[test]
@@ -447,20 +409,6 @@ mod tests {
                 total: 8,
                 required: 6,
             }
-        );
-    }
-
-    #[test]
-    fn no_surviving_anchors_is_an_error() {
-        let sut = facts(samples(&[20.0], 0.0), vec![]);
-
-        let verdict = judge_latency(&sut, &thresholds());
-
-        assert_eq!(
-            verdict.severity,
-            crate::model::Severity::Error,
-            "{}",
-            verdict.detail
         );
     }
 

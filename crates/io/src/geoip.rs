@@ -143,33 +143,36 @@ mod tests {
         code.parse().unwrap()
     }
 
-    #[test]
-    fn extract_reads_a_plain_top_level_field() {
-        let sut = serde_json::json!({"country": "fi"});
+    #[rstest::rstest]
+    #[case::a_plain_top_level_field(
+        serde_json::json!({"country": "fi"}),
+        "/country",
+        Some("FI")
+    )]
+    #[case::an_array_index_then_an_object_key(
+        serde_json::json!([{"country": "de"}]),
+        "/0/country",
+        Some("DE")
+    )]
+    // ipapi.is's free tier answers with a full name, not a 2-letter code.
+    #[case::a_full_country_name_is_no_vote(
+        serde_json::json!({"country": "Germany"}),
+        "/country",
+        None
+    )]
+    #[case::a_missing_path(
+        serde_json::json!({"unrelated": "value"}),
+        "/country",
+        None
+    )]
+    fn extract_reads_the_country_code_at_the_pointer(
+        #[case] sut: serde_json::Value,
+        #[case] pointer: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        let actual = extract(&sut, pointer);
 
-        assert_eq!(extract(&sut, "/country"), Some(cc("FI")));
-    }
-
-    #[test]
-    fn extract_walks_into_an_array_index_then_an_object_key() {
-        let sut = serde_json::json!([{"country": "de"}]);
-
-        assert_eq!(extract(&sut, "/0/country"), Some(cc("DE")));
-    }
-
-    #[test]
-    fn extract_rejects_a_full_country_name_as_no_vote() {
-        // ipapi.is's free tier answers with a full name, not a 2-letter code.
-        let sut = serde_json::json!({"country": "Germany"});
-
-        assert_eq!(extract(&sut, "/country"), None);
-    }
-
-    #[test]
-    fn extract_returns_none_when_the_path_does_not_exist() {
-        let sut = serde_json::json!({"unrelated": "value"});
-
-        assert_eq!(extract(&sut, "/country"), None);
+        assert_eq!(actual, expected.map(cc));
     }
 
     #[tokio::test]

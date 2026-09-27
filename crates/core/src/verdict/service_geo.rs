@@ -114,115 +114,6 @@ mod tests {
     }
 
     #[test]
-    fn everyone_agreeing_is_ok() {
-        let sut = vec![vote("google", Some("FI")), vote("apple", Some("FI"))];
-
-        assert_eq!(
-            judge_service_country(&sut, &cc("FI"), FAIL_SERVICES).severity,
-            Severity::Ok
-        );
-    }
-
-    #[test]
-    fn google_or_youtube_disagreeing_fails() {
-        let sut = vec![vote("google", Some("DE")), vote("apple", Some("FI"))];
-
-        assert_eq!(
-            judge_service_country(&sut, &cc("FI"), FAIL_SERVICES).severity,
-            Severity::Fail
-        );
-    }
-
-    #[test]
-    fn google_or_youtube_seeing_russia_fails_even_when_everyone_else_agrees() {
-        let sut = vec![vote("youtube", Some("RU")), vote("apple", Some("FI"))];
-
-        assert_eq!(
-            judge_service_country(&sut, &cc("FI"), FAIL_SERVICES).severity,
-            Severity::Fail
-        );
-    }
-
-    #[test]
-    fn a_non_gate_service_disagreeing_only_warns() {
-        let sut = vec![vote("google", Some("FI")), vote("spotify", Some("DE"))];
-
-        assert_eq!(
-            judge_service_country(&sut, &cc("FI"), FAIL_SERVICES).severity,
-            Severity::Warn
-        );
-    }
-
-    #[test]
-    fn a_vote_that_did_not_answer_is_silently_skipped() {
-        let sut = vec![vote("google", Some("FI")), vote("apple", None)];
-
-        assert_eq!(
-            judge_service_country(&sut, &cc("FI"), FAIL_SERVICES).severity,
-            Severity::Ok
-        );
-    }
-
-    #[test]
-    fn no_critical_service_answer_is_an_error() {
-        let sut = vec![
-            vote("google", None),
-            vote("youtube", None),
-            vote("apple", Some("FI")),
-        ];
-
-        assert_eq!(
-            judge_service_country(&sut, &cc("FI"), FAIL_SERVICES).severity,
-            Severity::Error
-        );
-    }
-
-    #[test]
-    fn captcha_only_fails_after_it_reproduces_on_retry() {
-        assert_eq!(
-            judge_search_captcha(
-                &CaptchaObservation::Triggered,
-                &CaptchaObservation::Clear
-            )
-            .severity,
-            Severity::Ok
-        );
-        assert_eq!(
-            judge_search_captcha(
-                &CaptchaObservation::Triggered,
-                &CaptchaObservation::Triggered
-            )
-            .severity,
-            Severity::Fail
-        );
-        assert_eq!(
-            judge_search_captcha(
-                &CaptchaObservation::Clear,
-                &CaptchaObservation::Clear
-            )
-            .severity,
-            Severity::Ok
-        );
-    }
-
-    #[test]
-    fn a_cdn_edge_landing_in_russia_fails() {
-        let sut = vec![
-            ("cloudflare", Some(cc("RU"))),
-            ("youtube_ggc", Some(cc("FI"))),
-        ];
-
-        assert_eq!(judge_cdn_edge(&sut).severity, Severity::Fail);
-    }
-
-    #[test]
-    fn cdn_edges_outside_russia_are_ok_regardless_of_which_country() {
-        let sut = vec![("cloudflare", Some(cc("SE"))), ("youtube_ggc", None)];
-
-        assert_eq!(judge_cdn_edge(&sut).severity, Severity::Ok);
-    }
-
-    #[test]
     fn edges_without_a_country_are_named_apart_from_the_ones_with_one() {
         let sut = vec![
             ("cloudflare", Some(cc("FI"))),
@@ -251,10 +142,87 @@ mod tests {
         assert_eq!(verdict.detail, "edges: cloudflare=FI, netflix_oca=LV");
     }
 
-    #[test]
-    fn no_cdn_answers_is_an_error() {
-        let sut = vec![("cloudflare", None), ("youtube_ggc", None)];
+    #[rstest::rstest]
+    #[case::everyone_agreeing(
+        vec![vote("google", Some("FI")), vote("apple", Some("FI"))],
+        Severity::Ok
+    )]
+    #[case::google_or_youtube_disagreeing(
+        vec![vote("google", Some("DE")), vote("apple", Some("FI"))],
+        Severity::Fail
+    )]
+    #[case::google_or_youtube_seeing_russia_while_everyone_else_agrees(
+        vec![vote("youtube", Some("RU")), vote("apple", Some("FI"))],
+        Severity::Fail
+    )]
+    #[case::a_non_gate_service_disagreeing_only_warns(
+        vec![vote("google", Some("FI")), vote("spotify", Some("DE"))],
+        Severity::Warn
+    )]
+    #[case::a_vote_that_did_not_answer_is_silently_skipped(
+        vec![vote("google", Some("FI")), vote("apple", None)],
+        Severity::Ok
+    )]
+    #[case::no_critical_service_answer_is_an_error(
+        vec![
+            vote("google", None),
+            vote("youtube", None),
+            vote("apple", Some("FI")),
+        ],
+        Severity::Error
+    )]
+    fn service_votes_against_the_ordered_country_set_the_severity(
+        #[case] sut: Vec<ServiceCountryVote>,
+        #[case] expected: Severity,
+    ) {
+        let verdict = judge_service_country(&sut, &cc("FI"), FAIL_SERVICES);
 
-        assert_eq!(judge_cdn_edge(&sut).severity, Severity::Error);
+        assert_eq!(verdict.severity, expected, "{}", verdict.detail);
+    }
+
+    #[rstest::rstest]
+    #[case::clear_twice(
+        (CaptchaObservation::Clear, CaptchaObservation::Clear),
+        Severity::Ok
+    )]
+    #[case::gone_on_retry(
+        (CaptchaObservation::Triggered, CaptchaObservation::Clear),
+        Severity::Ok
+    )]
+    #[case::reproduced_on_retry(
+        (CaptchaObservation::Triggered, CaptchaObservation::Triggered),
+        Severity::Fail
+    )]
+    fn captcha_only_fails_after_it_reproduces_on_retry(
+        #[case] sut: (CaptchaObservation, CaptchaObservation),
+        #[case] expected: Severity,
+    ) {
+        let (first, retry) = sut;
+
+        let verdict = judge_search_captcha(&first, &retry);
+
+        assert_eq!(verdict.severity, expected, "{}", verdict.detail);
+    }
+
+    #[rstest::rstest]
+    #[case::an_edge_landing_in_russia(
+        vec![("cloudflare", Some(cc("RU"))), ("youtube_ggc", Some(cc("FI")))],
+        Severity::Fail
+    )]
+    #[case::edges_outside_russia_whatever_the_country(
+        vec![("cloudflare", Some(cc("SE"))), ("youtube_ggc", None)],
+        Severity::Ok
+    )]
+    #[case::no_edge_answered(
+        vec![("cloudflare", None), ("youtube_ggc", None)],
+        Severity::Error
+    )]
+    fn cdn_edges_set_the_severity(
+        #[case] sut: Vec<(&'static str, Option<CountryCode>)>,
+        #[case] expected: Severity,
+    ) {
+        let verdict = judge_cdn_edge(&sut);
+
+        assert_eq!(verdict.severity, expected, "{}", verdict.detail);
     }
 }

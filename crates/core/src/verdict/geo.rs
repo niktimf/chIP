@@ -57,59 +57,35 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unanimous_agreement_is_ok() {
-        let sut = votes(&[
-            Some("FI"),
-            Some("fi"),
-            Some("FI"),
-            Some("FI"),
-            Some("FI"),
-        ]);
-
+    #[rstest::rstest]
+    #[case::unanimous_agreement(
+        votes(&[Some("FI"), Some("fi"), Some("FI"), Some("FI"), Some("FI")]),
+        Severity::Ok
+    )]
+    #[case::under_half_agreement(
+        votes(&[Some("DE"), Some("DE"), Some("FI"), Some("NL"), Some("US")]),
+        Severity::Fail
+    )]
+    // 3/5 = 60%: inside (0.5, 0.8), away from the 80% boundary.
+    #[case::between_half_and_eighty_percent(
+        votes(&[Some("FI"), Some("FI"), Some("FI"), Some("DE"), Some("NL")]),
+        Severity::Warn
+    )]
+    #[case::anyone_seeing_russia_even_at_full_agreement_otherwise(
+        votes(&[Some("FI"), Some("FI"), Some("FI"), Some("FI"), Some("RU")]),
+        Severity::Warn
+    )]
+    #[case::fewer_than_five_answers_is_an_error(
+        votes(&[Some("FI"), None, None, None, None, None, None, None, None]),
+        Severity::Error
+    )]
+    fn the_share_of_sources_naming_the_ordered_country_sets_the_severity(
+        #[case] sut: GeoConsensusFacts,
+        #[case] expected: Severity,
+    ) {
         let verdict = judge_geo(&sut, &cc("FI"));
 
-        assert_eq!(verdict.severity, Severity::Ok, "{}", verdict.detail);
-    }
-
-    #[test]
-    fn under_half_agreement_fails() {
-        let sut = votes(&[
-            Some("DE"),
-            Some("DE"),
-            Some("FI"),
-            Some("NL"),
-            Some("US"),
-        ]);
-
-        assert_eq!(judge_geo(&sut, &cc("FI")).severity, Severity::Fail);
-    }
-
-    #[test]
-    fn between_half_and_eighty_percent_warns() {
-        // 3/5 = 60%: inside (0.5, 0.8), away from the 80% boundary.
-        let sut = votes(&[
-            Some("FI"),
-            Some("FI"),
-            Some("FI"),
-            Some("DE"),
-            Some("NL"),
-        ]);
-
-        assert_eq!(judge_geo(&sut, &cc("FI")).severity, Severity::Warn);
-    }
-
-    #[test]
-    fn anyone_seeing_russia_warns_even_at_full_agreement_otherwise() {
-        let sut = votes(&[
-            Some("FI"),
-            Some("FI"),
-            Some("FI"),
-            Some("FI"),
-            Some("RU"),
-        ]);
-
-        assert_eq!(judge_geo(&sut, &cc("FI")).severity, Severity::Warn);
+        assert_eq!(verdict.severity, expected, "{}", verdict.detail);
     }
 
     #[test]
@@ -147,22 +123,5 @@ mod tests {
         let verdict = judge_geo(&sut, &cc("FI"));
 
         assert_eq!(verdict.detail, "5/5 geo sources say FI");
-    }
-
-    #[test]
-    fn fewer_than_five_answers_is_an_error() {
-        let sut = votes(&[
-            Some("FI"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ]);
-
-        assert_eq!(judge_geo(&sut, &cc("FI")).severity, Severity::Error);
     }
 }

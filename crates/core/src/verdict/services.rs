@@ -311,266 +311,289 @@ pub fn judge_services_warn(states: &[(&str, ServiceState)]) -> Verdict {
 mod tests {
     use super::*;
     use crate::model::Severity;
+    use rstest::rstest;
+
+    const CLOUDFLARE_CHALLENGE: &str =
+        "Checking your browser before accessing... cf-mitigated";
 
     fn url(raw: &str) -> Url {
         Url::parse(raw).unwrap()
     }
 
-    #[test]
-    fn chatgpt_web_names_unsupported_country_case_insensitively() {
-        assert_eq!(
-            classify_chatgpt_web("...Unsupported_Country_Region_Territory..."),
-            ServiceState::Blocked
-        );
-        assert_eq!(classify_chatgpt_web("{}"), ServiceState::Available);
+    #[rstest]
+    #[case::unsupported_country_in_any_case(
+        "...Unsupported_Country_Region_Territory...",
+        ServiceState::Blocked
+    )]
+    #[case::no_marker("{}", ServiceState::Available)]
+    fn chatgpt_web_reads_the_unsupported_country_marker(
+        #[case] sut: &str,
+        #[case] expected: ServiceState,
+    ) {
+        let actual = classify_chatgpt_web(sut);
+
+        assert_eq!(actual, expected);
     }
 
-    #[test]
-    fn chatgpt_app_reads_disallowed_isp_and_been_blocked() {
-        assert_eq!(
-            classify_chatgpt_app(200, "Disallowed ISP detected"),
-            ServiceState::Blocked
-        );
-        assert_eq!(
-            classify_chatgpt_app(200, "you have been blocked"),
-            ServiceState::Blocked
-        );
-        assert_eq!(classify_chatgpt_app(200, "hello"), ServiceState::Available);
+    #[rstest]
+    #[case::disallowed_isp("Disallowed ISP detected", ServiceState::Blocked)]
+    #[case::been_blocked("you have been blocked", ServiceState::Blocked)]
+    #[case::no_marker("hello", ServiceState::Available)]
+    fn chatgpt_app_reads_disallowed_isp_and_been_blocked(
+        #[case] sut: &str,
+        #[case] expected: ServiceState,
+    ) {
+        let actual = classify_chatgpt_app(200, sut);
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
     fn chatgpt_app_treats_a_cloudflare_challenge_as_unproven_not_blocked() {
-        let state = classify_chatgpt_app(
-            403,
-            "Checking your browser before accessing... cf-mitigated",
-        );
-        assert!(matches!(state, ServiceState::Error(_)), "{state:?}");
+        let sut = CLOUDFLARE_CHALLENGE;
+
+        let actual = classify_chatgpt_app(403, sut);
+
+        assert!(matches!(actual, ServiceState::Error(_)), "{actual:?}");
     }
 
-    #[test]
-    fn youtube_premium_reads_its_own_two_markers() {
-        assert_eq!(
-            classify_youtube_premium(
-                "YouTube Premium is not available in your country"
-            ),
-            ServiceState::Blocked
-        );
-        assert_eq!(
-            classify_youtube_premium("Enjoy ad-free videos"),
-            ServiceState::Available
-        );
+    #[rstest]
+    #[case::not_available(
+        "YouTube Premium is not available in your country",
+        ServiceState::Blocked
+    )]
+    #[case::ad_free_offer("Enjoy ad-free videos", ServiceState::Available)]
+    fn youtube_premium_reads_its_own_two_markers(
+        #[case] sut: &str,
+        #[case] expected: ServiceState,
+    ) {
+        let actual = classify_youtube_premium(sut);
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
     fn youtube_premium_unrecognized_body_is_an_error_not_a_verdict() {
-        assert!(matches!(
-            classify_youtube_premium("neither marker present"),
-            ServiceState::Error(_)
-        ));
+        let sut = "neither marker present";
+
+        let actual = classify_youtube_premium(sut);
+
+        assert!(matches!(actual, ServiceState::Error(_)), "{actual:?}");
     }
 
-    #[test]
-    fn gemini_reads_the_embedded_region_code_against_googles_unsupported_list()
-    {
-        // Real body shape (geocheck's `reGeminiRegion`): a config array entry
-        // `,<n>,<n>,200,"<ISO-3166-1 alpha-3>"` embedded in Google's account bar.
-        let blocked_body = r#"...preamble...,7,42,200,"RUS",...trailer..."#;
-        assert_eq!(classify_gemini(200, blocked_body), ServiceState::Blocked);
+    // Real body shape (geocheck's `reGeminiRegion`): a config array entry
+    // `,<n>,<n>,200,"<ISO-3166-1 alpha-3>"` embedded in Google's account bar.
+    #[rstest]
+    #[case::unsupported_region(
+        r#"...,7,42,200,"RUS",..."#,
+        ServiceState::Blocked
+    )]
+    #[case::supported_region(
+        r#"...,7,42,200,"USA",..."#,
+        ServiceState::Available
+    )]
+    // `,200,"ABC"` lacks the `,\d+,\d+,` prefix the real regex requires, so
+    // the later account-bar entry must win.
+    #[case::a_decoy_before_the_real_entry(
+        r#",200,"ABC" junk ,7,42,200,"RUS" tail"#,
+        ServiceState::Blocked
+    )]
+    fn gemini_reads_the_embedded_region_against_googles_unsupported_list(
+        #[case] sut: &str,
+        #[case] expected: ServiceState,
+    ) {
+        let actual = classify_gemini(200, sut);
 
-        let available_body = r#"...preamble...,7,42,200,"USA",...trailer..."#;
-        assert_eq!(
-            classify_gemini(200, available_body),
-            ServiceState::Available
-        );
+        assert_eq!(actual, expected);
     }
 
-    #[test]
-    fn gemini_with_no_readable_region_is_an_error_not_a_verdict() {
-        assert!(matches!(
-            classify_gemini(200, "no region code embedded here"),
-            ServiceState::Error(_)
-        ));
+    #[rstest]
+    #[case::no_region(200, "no region code embedded here")]
+    // With no valid match anywhere the body stays unreadable.
+    #[case::only_a_decoy(200, r#"preamble ,200,"ABC" trailer"#)]
+    #[case::cloudflare_challenge(403, CLOUDFLARE_CHALLENGE)]
+    fn gemini_without_a_readable_region_is_an_error_not_a_verdict(
+        #[case] status: u16,
+        #[case] sut: &str,
+    ) {
+        let actual = classify_gemini(status, sut);
+
+        assert!(matches!(actual, ServiceState::Error(_)), "{actual:?}");
     }
 
-    #[test]
-    fn gemini_skips_a_decoy_200_quote_match_lacking_the_digit_group_prefix() {
-        // "ABC" is shaped like a match (`,200,"ABC"`) but is not preceded by
-        // the `,\d+,\d+,` structural prefix the real regex requires, so it is
-        // a decoy. The real account-bar entry (`,7,42,200,"RUS"`) comes later
-        // in the body and must be the one that wins.
-        let body = r#",200,"ABC" junk ,7,42,200,"RUS" tail"#;
-        assert_eq!(classify_gemini(200, body), ServiceState::Blocked);
+    #[rstest]
+    #[case::unsupported_location(
+        "https://notebooklm.google.com/?location=unsupported",
+        ServiceState::Blocked
+    )]
+    #[case::sign_in_redirect(
+        "https://accounts.google.com/signin",
+        ServiceState::Available
+    )]
+    fn notebooklm_reads_the_redirect_reason_directly(
+        #[case] sut: &str,
+        #[case] expected: ServiceState,
+    ) {
+        let actual = classify_notebooklm(302, &url(sut), "");
+
+        assert_eq!(actual, expected);
     }
 
-    #[test]
-    fn gemini_with_only_an_invalid_looking_match_is_still_an_error() {
-        // The only `,200,"..."`-shaped substring here is missing the digit
-        // group prefix entirely, so there is no valid match anywhere in the
-        // body and this must still fall back to the "could not read" error.
-        let body = r#"preamble ,200,"ABC" trailer"#;
-        assert!(matches!(classify_gemini(200, body), ServiceState::Error(_)));
+    #[rstest]
+    #[case::unexpected_page(200, "https://notebooklm.google.com/weird", "")]
+    #[case::cloudflare_page(
+        503,
+        "https://notebooklm.google.com/",
+        "<title>Just a moment</title>"
+    )]
+    #[case::lookalike_host(
+        302,
+        "https://accounts.google.com.attacker.example/signin",
+        ""
+    )]
+    #[case::reason_in_the_path_instead_of_the_query(
+        302,
+        "https://attacker.example/location=unsupported",
+        ""
+    )]
+    fn notebooklm_does_not_trust_anything_but_the_structured_redirect(
+        #[case] status: u16,
+        #[case] sut: &str,
+        #[case] body: &str,
+    ) {
+        let actual = classify_notebooklm(status, &url(sut), body);
+
+        assert!(matches!(actual, ServiceState::Error(_)), "{actual:?}");
     }
 
-    #[test]
-    fn gemini_treats_a_cloudflare_challenge_as_unproven_not_blocked() {
-        let state = classify_gemini(
-            403,
-            "Checking your browser before accessing... cf-mitigated",
+    #[rstest]
+    #[case::full_catalogue((200, "ok", 200, "ok"), ServiceState::Available)]
+    #[case::originals_only(
+        (404, "not found", 200, "ok"),
+        ServiceState::Restricted
+    )]
+    #[case::nothing(
+        (404, "not found", 404, "not found"),
+        ServiceState::Blocked
+    )]
+    fn netflix_distinguishes_full_catalogue_from_originals_only(
+        #[case] sut: (u16, &str, u16, &str),
+        #[case] expected: ServiceState,
+    ) {
+        let (licensed_status, licensed_body, original_status, original_body) =
+            sut;
+
+        let actual = classify_netflix(
+            licensed_status,
+            licensed_body,
+            original_status,
+            original_body,
         );
-        assert!(matches!(state, ServiceState::Error(_)), "{state:?}");
+
+        assert_eq!(actual, expected);
     }
 
-    #[test]
-    fn notebooklm_reads_the_redirect_reason_directly() {
-        assert_eq!(
-            classify_notebooklm(
-                302,
-                &url("https://notebooklm.google.com/?location=unsupported"),
-                ""
-            ),
-            ServiceState::Blocked
-        );
-        assert_eq!(
-            classify_notebooklm(
-                302,
-                &url("https://accounts.google.com/signin"),
-                ""
-            ),
-            ServiceState::Available
-        );
-        assert!(matches!(
-            classify_notebooklm(
-                200,
-                &url("https://notebooklm.google.com/weird"),
-                ""
-            ),
-            ServiceState::Error(_)
-        ));
-        assert!(matches!(
-            classify_notebooklm(
-                503,
-                &url("https://notebooklm.google.com/"),
-                "<title>Just a moment</title>"
-            ),
-            ServiceState::Error(_)
-        ));
-    }
+    #[rstest]
+    #[case::app_unavailable(
+        "App unavailable in region right now",
+        ServiceState::Blocked
+    )]
+    #[case::not_available_here(
+        "Unfortunately, Claude isn&#39;t available here.",
+        ServiceState::Blocked
+    )]
+    #[case::no_marker("welcome back", ServiceState::Available)]
+    fn claude_reads_the_real_geocheck_region_refusal_markers(
+        #[case] sut: &str,
+        #[case] expected: ServiceState,
+    ) {
+        let actual = classify_claude(200, sut, claude_unavailable_markers());
 
-    #[test]
-    fn notebooklm_does_not_trust_url_text_outside_structured_components() {
-        let lookalike_host = classify_notebooklm(
-            302,
-            &url("https://accounts.google.com.attacker.example/signin"),
-            "",
-        );
-        let path_lookalike = classify_notebooklm(
-            302,
-            &url("https://attacker.example/location=unsupported"),
-            "",
-        );
-
-        assert!(matches!(lookalike_host, ServiceState::Error(_)));
-        assert!(matches!(path_lookalike, ServiceState::Error(_)));
-    }
-
-    #[test]
-    fn netflix_distinguishes_full_catalogue_from_originals_only() {
-        assert_eq!(
-            classify_netflix(200, "ok", 200, "ok"),
-            ServiceState::Available
-        );
-        assert_eq!(
-            classify_netflix(404, "not found", 200, "ok"),
-            ServiceState::Restricted
-        );
-        assert_eq!(
-            classify_netflix(404, "not found", 404, "not found"),
-            ServiceState::Blocked
-        );
-    }
-
-    #[test]
-    fn claude_reads_the_real_geocheck_region_refusal_markers() {
-        let markers = claude_unavailable_markers();
-        assert_eq!(
-            classify_claude(
-                200,
-                "App unavailable in region right now",
-                markers
-            ),
-            ServiceState::Blocked
-        );
-        assert_eq!(
-            classify_claude(
-                200,
-                "Unfortunately, Claude isn&#39;t available here.",
-                markers
-            ),
-            ServiceState::Blocked
-        );
-        assert_eq!(
-            classify_claude(200, "welcome back", markers),
-            ServiceState::Available
-        );
+        assert_eq!(actual, expected);
     }
 
     #[test]
     fn claude_403_without_the_region_page_is_unproven_not_blocked() {
-        let markers = claude_unavailable_markers();
-        let state = classify_claude(403, "generic forbidden", markers);
-        assert!(matches!(state, ServiceState::Error(_)), "{state:?}");
+        let sut = "generic forbidden";
+
+        let actual = classify_claude(403, sut, claude_unavailable_markers());
+
+        assert!(matches!(actual, ServiceState::Error(_)), "{actual:?}");
     }
 
-    #[test]
-    fn tiktok_reads_blocked_by_region() {
-        assert_eq!(
-            classify_tiktok(200, "TikTok is not available in your country"),
-            ServiceState::Blocked
-        );
-        assert_eq!(classify_tiktok(200, "welcome"), ServiceState::Available);
+    #[rstest]
+    #[case::not_available(
+        "TikTok is not available in your country",
+        ServiceState::Blocked
+    )]
+    #[case::no_marker("welcome", ServiceState::Available)]
+    fn tiktok_reads_blocked_by_region(
+        #[case] sut: &str,
+        #[case] expected: ServiceState,
+    ) {
+        let actual = classify_tiktok(200, sut);
+
+        assert_eq!(actual, expected);
     }
 
-    #[test]
-    fn judge_services_fail_fails_on_any_blocked_and_warns_on_any_error() {
-        let all_available = [
+    #[rstest]
+    #[case::all_available(
+        vec![
             ("chatgpt_web", ServiceState::Available),
             ("gemini", ServiceState::Available),
-        ];
-        assert_eq!(judge_services_fail(&all_available).severity, Severity::Ok);
-
-        let one_blocked = [
+        ],
+        Severity::Ok
+    )]
+    #[case::one_blocked(
+        vec![
             ("chatgpt_web", ServiceState::Blocked),
             ("gemini", ServiceState::Available),
-        ];
-        assert_eq!(judge_services_fail(&one_blocked).severity, Severity::Fail);
-
-        let one_errored = [
+        ],
+        Severity::Fail
+    )]
+    #[case::one_inconclusive(
+        vec![
             ("chatgpt_web", ServiceState::Error("challenge".into())),
             ("gemini", ServiceState::Available),
-        ];
-        assert_eq!(judge_services_fail(&one_errored).severity, Severity::Warn);
+        ],
+        Severity::Warn
+    )]
+    #[case::unreachable_is_an_error_not_a_weak_verdict(
+        vec![("gemini", ServiceState::Unavailable("timeout".into()))],
+        Severity::Error
+    )]
+    fn judge_services_fail_fails_on_any_blocked_and_warns_on_any_error(
+        #[case] sut: Vec<(&'static str, ServiceState)>,
+        #[case] expected: Severity,
+    ) {
+        let verdict = judge_services_fail(&sut);
+
+        assert_eq!(verdict.severity, expected, "{}", verdict.detail);
     }
 
-    #[test]
-    fn judge_services_warn_never_fails_only_warns_on_blocked_or_restricted() {
-        let mixed = [
+    #[rstest]
+    #[case::clean(vec![("netflix", ServiceState::Available)], Severity::Ok)]
+    #[case::restricted_and_blocked(
+        vec![
             ("netflix", ServiceState::Restricted),
             ("claude", ServiceState::Blocked),
-        ];
-        assert_eq!(judge_services_warn(&mixed).severity, Severity::Warn);
-        let clean = [("netflix", ServiceState::Available)];
-        assert_eq!(judge_services_warn(&clean).severity, Severity::Ok);
-        let inconclusive =
-            [("claude", ServiceState::Error("challenge".into()))];
-        assert_eq!(judge_services_warn(&inconclusive).severity, Severity::Warn);
-    }
+        ],
+        Severity::Warn
+    )]
+    #[case::inconclusive(
+        vec![("claude", ServiceState::Error("challenge".into()))],
+        Severity::Warn
+    )]
+    #[case::unreachable_is_an_error_not_a_weak_verdict(
+        vec![("claude", ServiceState::Unavailable("timeout".into()))],
+        Severity::Error
+    )]
+    fn judge_services_warn_never_fails_only_warns_on_blocked_or_restricted(
+        #[case] sut: Vec<(&'static str, ServiceState)>,
+        #[case] expected: Severity,
+    ) {
+        let verdict = judge_services_warn(&sut);
 
-    #[test]
-    fn an_unreachable_service_is_an_error_not_a_weak_verdict() {
-        let unavailable =
-            [("gemini", ServiceState::Unavailable("timeout".into()))];
-
-        assert_eq!(judge_services_fail(&unavailable).severity, Severity::Error);
-        assert_eq!(judge_services_warn(&unavailable).severity, Severity::Error);
+        assert_eq!(verdict.severity, expected, "{}", verdict.detail);
     }
 }

@@ -44,22 +44,6 @@ mod tests {
     use crate::model::Severity;
 
     #[test]
-    fn any_altered_https_endpoint_fails() {
-        let https =
-            vec![PortalOutcome::Ok, PortalOutcome::Altered, PortalOutcome::Ok];
-        let http = vec![PortalOutcome::Ok; 3];
-        assert_eq!(judge_tampering(&https, &http).severity, Severity::Fail);
-    }
-
-    #[test]
-    fn an_altered_plain_http_endpoint_fails() {
-        let https = vec![PortalOutcome::Ok];
-        let http = vec![PortalOutcome::Altered];
-
-        assert_eq!(judge_tampering(&https, &http).severity, Severity::Fail);
-    }
-
-    #[test]
     fn plain_http_dead_while_https_is_clean_fails_as_a_hoster_block() {
         let https = vec![PortalOutcome::Ok; 3];
         let http = vec![PortalOutcome::Unreachable; 3];
@@ -68,20 +52,41 @@ mod tests {
         assert!(v.detail.contains("HTTP"), "{}", v.detail);
     }
 
-    #[test]
-    fn a_couple_of_unreachable_https_endpoints_only_warns() {
-        let https = vec![
-            PortalOutcome::Ok,
-            PortalOutcome::Unreachable,
-            PortalOutcome::Ok,
-        ];
-        let http = vec![PortalOutcome::Ok; 3];
-        assert_eq!(judge_tampering(&https, &http).severity, Severity::Warn);
-    }
+    #[rstest::rstest]
+    #[case::everything_clean(
+        (vec![PortalOutcome::Ok; 3], vec![PortalOutcome::Ok; 3]),
+        Severity::Ok
+    )]
+    #[case::any_altered_https_endpoint(
+        (
+            vec![PortalOutcome::Ok, PortalOutcome::Altered, PortalOutcome::Ok],
+            vec![PortalOutcome::Ok; 3],
+        ),
+        Severity::Fail
+    )]
+    #[case::an_altered_plain_http_endpoint(
+        (vec![PortalOutcome::Ok], vec![PortalOutcome::Altered]),
+        Severity::Fail
+    )]
+    #[case::a_couple_of_unreachable_https_endpoints_only_warn(
+        (
+            vec![
+                PortalOutcome::Ok,
+                PortalOutcome::Unreachable,
+                PortalOutcome::Ok,
+            ],
+            vec![PortalOutcome::Ok; 3],
+        ),
+        Severity::Warn
+    )]
+    fn portal_outcomes_set_the_severity(
+        #[case] sut: (Vec<PortalOutcome>, Vec<PortalOutcome>),
+        #[case] expected: Severity,
+    ) {
+        let (https, http) = sut;
 
-    #[test]
-    fn everything_clean_is_ok() {
-        let clean = vec![PortalOutcome::Ok; 3];
-        assert_eq!(judge_tampering(&clean, &clean).severity, Severity::Ok);
+        let verdict = judge_tampering(&https, &http);
+
+        assert_eq!(verdict.severity, expected, "{}", verdict.detail);
     }
 }

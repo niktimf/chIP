@@ -168,38 +168,34 @@ mod tests {
         assert_eq!(sut.overall(), Severity::Ok);
     }
 
-    #[test]
-    fn exit_code_is_zero_when_nothing_failed_or_errored() {
-        let sut = Report {
-            results: vec![
-                cr("geo", Verdict::ok("RU 90%")),
-                cr("neighbors", Verdict::warn("noisy")),
-            ],
-        };
-        assert_eq!(sut.exit_code(), 0);
-    }
+    #[rstest::rstest]
+    #[case::nothing_failed_or_errored(
+        vec![
+            cr("geo", Verdict::ok("RU 90%")),
+            cr("neighbors", Verdict::warn("noisy")),
+        ],
+        0
+    )]
+    #[case::a_failure_wins_over_an_error(
+        vec![
+            cr("reputation", Verdict::fail("vpn")),
+            cr("geo", Verdict::error("no sources answered")),
+        ],
+        1
+    )]
+    #[case::nothing_failed_but_something_could_not_be_judged(
+        vec![cr("latency", Verdict::error("fewer than 6 valid probes"))],
+        2
+    )]
+    fn the_exit_code_follows_the_worst_result(
+        #[case] results: Vec<CheckResult>,
+        #[case] expected: i32,
+    ) {
+        let sut = Report { results };
 
-    #[test]
-    fn exit_code_is_one_when_anything_failed_even_alongside_an_error() {
-        let sut = Report {
-            results: vec![
-                cr("reputation", Verdict::fail("vpn")),
-                cr("geo", Verdict::error("no sources answered")),
-            ],
-        };
-        assert_eq!(sut.exit_code(), 1);
-    }
+        let actual = sut.exit_code();
 
-    #[test]
-    fn exit_code_is_two_when_nothing_failed_but_something_could_not_be_judged()
-    {
-        let sut = Report {
-            results: vec![cr(
-                "latency",
-                Verdict::error("fewer than 6 valid probes"),
-            )],
-        };
-        assert_eq!(sut.exit_code(), 2);
+        assert_eq!(actual, expected);
     }
 
     #[test]

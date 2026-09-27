@@ -55,31 +55,19 @@ mod tests {
         assert_eq!(out, result);
     }
 
-    #[test]
-    fn escalate_turns_warn_into_fail_but_leaves_ok_and_fail_alone() {
+    #[rstest::rstest]
+    #[case::warn_becomes_fail(Verdict::warn("blocked"), Severity::Fail)]
+    #[case::ok_stays_ok(Verdict::ok("available"), Severity::Ok)]
+    #[case::fail_stays_fail(Verdict::fail("x"), Severity::Fail)]
+    fn escalate_turns_warn_into_fail_but_leaves_ok_and_fail_alone(
+        #[case] verdict: Verdict,
+        #[case] expected: Severity,
+    ) {
         let sut = overrides(&["service:claude"], &[]);
 
-        assert_eq!(
-            sut.apply(CheckResult::new(
-                "service:claude",
-                Verdict::warn("blocked")
-            ))
-            .severity,
-            Severity::Fail
-        );
-        assert_eq!(
-            sut.apply(CheckResult::new(
-                "service:claude",
-                Verdict::ok("available")
-            ))
-            .severity,
-            Severity::Ok
-        );
-        assert_eq!(
-            sut.apply(CheckResult::new("service:claude", Verdict::fail("x")))
-                .severity,
-            Severity::Fail
-        );
+        let out = sut.apply(CheckResult::new("service:claude", verdict));
+
+        assert_eq!(out.severity, expected);
     }
 
     #[test]

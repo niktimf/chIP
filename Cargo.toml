@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/core", "crates/io", "crates/cli"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -13,7 +13,7 @@ repository = "https://github.com/niktimf/chIP"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 country-code-enum = { version = "1", default-features = false }
-ipnet = "2.12"
+ipnet = { version = "2.12", features = ["serde"] }
 itertools = "0.15"
 openssh = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }

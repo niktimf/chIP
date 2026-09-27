@@ -25,52 +25,33 @@ pub fn judge_blocklists(facts: &BlockListFacts) -> Verdict {
 mod tests {
     use super::*;
     use crate::model::{BlockListFacts, Severity};
+    use BlockListStatus::{Clear, Listed, Unavailable};
 
-    fn clean() -> BlockListFacts {
-        BlockListFacts {
-            spamhaus: BlockListStatus::Clear,
-            firehol: BlockListStatus::Clear,
-        }
+    const fn facts(
+        spamhaus: BlockListStatus,
+        firehol: BlockListStatus,
+    ) -> BlockListFacts {
+        BlockListFacts { spamhaus, firehol }
     }
 
-    #[test]
-    fn absent_from_both_lists_is_ok() {
-        assert_eq!(judge_blocklists(&clean()).severity, Severity::Ok);
-    }
+    #[rstest::rstest]
+    #[case::absent_from_both_lists(facts(Clear, Clear), Severity::Ok)]
+    #[case::present_on_spamhaus(facts(Listed, Clear), Severity::Fail)]
+    #[case::present_on_firehol(facts(Clear, Listed), Severity::Fail)]
+    #[case::one_list_unavailable_is_judged_on_the_other(
+        facts(Unavailable, Clear),
+        Severity::Ok
+    )]
+    #[case::both_lists_unavailable(
+        facts(Unavailable, Unavailable),
+        Severity::Error
+    )]
+    fn the_lists_set_the_severity(
+        #[case] sut: BlockListFacts,
+        #[case] expected: Severity,
+    ) {
+        let verdict = judge_blocklists(&sut);
 
-    #[test]
-    fn present_on_spamhaus_fails() {
-        let sut = BlockListFacts {
-            spamhaus: BlockListStatus::Listed,
-            ..clean()
-        };
-        assert_eq!(judge_blocklists(&sut).severity, Severity::Fail);
-    }
-
-    #[test]
-    fn present_on_firehol_fails() {
-        let sut = BlockListFacts {
-            firehol: BlockListStatus::Listed,
-            ..clean()
-        };
-        assert_eq!(judge_blocklists(&sut).severity, Severity::Fail);
-    }
-
-    #[test]
-    fn one_list_unavailable_is_judged_on_the_other() {
-        let sut = BlockListFacts {
-            spamhaus: BlockListStatus::Unavailable,
-            ..clean()
-        };
-        assert_eq!(judge_blocklists(&sut).severity, Severity::Ok);
-    }
-
-    #[test]
-    fn both_lists_unavailable_is_an_error() {
-        let sut = BlockListFacts {
-            spamhaus: BlockListStatus::Unavailable,
-            firehol: BlockListStatus::Unavailable,
-        };
-        assert_eq!(judge_blocklists(&sut).severity, Severity::Error);
+        assert_eq!(verdict.severity, expected, "{}", verdict.detail);
     }
 }

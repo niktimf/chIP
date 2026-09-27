@@ -57,13 +57,6 @@ mod tests {
     }
 
     #[test]
-    fn all_reachable_is_ok() {
-        let sut = facts(&[true; 10], &[true; 10]);
-
-        assert_eq!(judge_reach(&sut).severity, Severity::Ok);
-    }
-
-    #[test]
     fn a_probe_where_the_control_itself_failed_does_not_count_against_the_candidate()
      {
         // Control fails on probes 0-1 (excluded); of the remaining 10, candidate fails none.
@@ -79,31 +72,6 @@ mod tests {
     }
 
     #[test]
-    fn thirty_percent_of_valid_probes_failing_fails() {
-        // 10 valid probes, candidate fails 3 of them (30% >= 25% threshold).
-        let mut candidate = vec![true; 10];
-        candidate[0] = false;
-        candidate[1] = false;
-        candidate[2] = false;
-        let sut = facts(&candidate, &[true; 10]);
-
-        let verdict = judge_reach(&sut);
-
-        assert_eq!(verdict.severity, Severity::Fail, "{}", verdict.detail);
-    }
-
-    #[test]
-    fn ten_percent_of_valid_probes_failing_warns() {
-        let mut candidate = vec![true; 10];
-        candidate[0] = false;
-        let sut = facts(&candidate, &[true; 10]);
-
-        let verdict = judge_reach(&sut);
-
-        assert_eq!(verdict.severity, Severity::Warn, "{}", verdict.detail);
-    }
-
-    #[test]
     fn fewer_than_six_valid_probes_is_an_error() {
         // Control fails everywhere except 4 probes — too few to judge.
         let mut control = vec![false; 10];
@@ -116,5 +84,24 @@ mod tests {
         let verdict = judge_reach(&sut);
 
         assert_eq!(verdict.severity, Severity::Error, "{}", verdict.detail);
+    }
+
+    // Ten valid probes; 25% failing is the FAIL threshold, so three failures
+    // (30%) fail and one (10%) only warns.
+    #[rstest::rstest]
+    #[case::all_reachable(0, Severity::Ok)]
+    #[case::ten_percent_failing(1, Severity::Warn)]
+    #[case::thirty_percent_failing(3, Severity::Fail)]
+    fn the_share_of_valid_probes_the_candidate_fails_sets_the_severity(
+        #[case] failed: usize,
+        #[case] expected: Severity,
+    ) {
+        let candidate: Vec<bool> =
+            (0..10).map(|probe| probe >= failed).collect();
+        let sut = facts(&candidate, &[true; 10]);
+
+        let verdict = judge_reach(&sut);
+
+        assert_eq!(verdict.severity, expected, "{}", verdict.detail);
     }
 }

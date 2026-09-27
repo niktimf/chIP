@@ -13,4 +13,9 @@ pub use report::Report;
 pub mod gate;
 pub use gate::GateOverrides;
 
+pub mod ip_lists;
+
+pub mod profile;
+pub use profile::{GateScope, ScanProfile};
+
 pub mod verdict;

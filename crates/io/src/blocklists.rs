@@ -1,118 +1,126 @@
-use chip_core::model::{BlockListFacts, BlockListStatus};
+use chip_core::ip_lists::{BlockLists, FetchedList, NetworkList};
 use ipnet::Ipv4Net;
 use serde::Deserialize;
-use std::net::Ipv4Addr;
+
+use crate::netset;
 
 const SPAMHAUS_URL: &str = "https://www.spamhaus.org/drop/drop_v4.json";
 const FIREHOL_URL: &str = "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset";
 
-fn parse_spamhaus(body: &str) -> Vec<Ipv4Net> {
-    #[derive(Deserialize)]
-    struct Entry {
-        cidr: String,
+/// One line of the Spamhaus DROP export. The trailing metadata line has no
+/// `cidr` and does not parse as an entry.
+#[derive(Deserialize)]
+struct DropEntry {
+    cidr: Ipv4Net,
+}
+
+pub struct BlockListsClient {
+    http: reqwest::Client,
+    spamhaus_url: String,
+    firehol_url: String,
+}
+
+impl BlockListsClient {
+    pub fn new(http: reqwest::Client) -> Self {
+        Self {
+            http,
+            spamhaus_url: SPAMHAUS_URL.to_owned(),
+            firehol_url: FIREHOL_URL.to_owned(),
+        }
     }
 
-    body.lines()
-        .filter_map(|line| serde_json::from_str::<Entry>(line).ok())
-        .filter_map(|entry| entry.cidr.parse().ok())
-        .collect()
-}
-
-fn parse_firehol(body: &str) -> Vec<Ipv4Net> {
-    body.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| line.parse().ok())
-        .collect()
-}
-
-pub struct BlockLists {
-    spamhaus: Option<Vec<Ipv4Net>>,
-    firehol: Option<Vec<Ipv4Net>>,
-}
-
-impl BlockLists {
-    pub async fn fetch(http: &reqwest::Client) -> Self {
-        Self::fetch_from(http, SPAMHAUS_URL, FIREHOL_URL).await
-    }
-
-    async fn fetch_from(
-        http: &reqwest::Client,
-        spamhaus_url: &str,
-        firehol_url: &str,
-    ) -> Self {
+    pub async fn fetch(&self) -> BlockLists {
         let (spamhaus, firehol) = tokio::join!(
-            Self::get_text(http, spamhaus_url),
-            Self::get_text(http, firehol_url)
+            self.fetch_list(&self.spamhaus_url, Self::parse_spamhaus),
+            self.fetch_list(&self.firehol_url, netset::parse)
         );
-        // A real list is never empty; an empty parse means a corrupted
-        // response and is therefore unavailable, not a clean list.
-        let spamhaus = spamhaus
-            .map(|body| parse_spamhaus(&body))
-            .filter(|nets| !nets.is_empty());
-        let firehol = firehol
-            .map(|body| parse_firehol(&body))
-            .filter(|nets| !nets.is_empty());
-        Self { spamhaus, firehol }
+        BlockLists { spamhaus, firehol }
     }
 
-    async fn get_text(http: &reqwest::Client, url: &str) -> Option<String> {
-        let response = http.get(url).send().await.ok()?;
-        response.status().is_success().then_some(())?;
-        response.text().await.ok()
+    /// A failed download and one that parsed to nothing both leave the list
+    /// unavailable rather than clean.
+    async fn fetch_list(
+        &self,
+        url: &str,
+        parse: fn(&str) -> Vec<Ipv4Net>,
+    ) -> FetchedList {
+        self.get_text(url)
+            .await
+            .map_or(FetchedList::Unavailable, |body| {
+                NetworkList::new(parse(&body))
+                    .map_or(FetchedList::Unavailable, FetchedList::Fetched)
+            })
     }
 
-    pub fn check(&self, ip: Ipv4Addr) -> BlockListFacts {
-        fn status(nets: Option<&[Ipv4Net]>, ip: Ipv4Addr) -> BlockListStatus {
-            match nets {
-                None => BlockListStatus::Unavailable,
-                Some(nets) if nets.iter().any(|net| net.contains(&ip)) => {
-                    BlockListStatus::Listed
-                }
-                Some(_) => BlockListStatus::Clear,
-            }
-        }
+    fn parse_spamhaus(body: &str) -> Vec<Ipv4Net> {
+        body.lines()
+            .filter_map(|line| serde_json::from_str::<DropEntry>(line).ok())
+            .map(|entry| entry.cidr)
+            .collect()
+    }
 
-        BlockListFacts {
-            spamhaus: status(self.spamhaus.as_deref(), ip),
-            firehol: status(self.firehol.as_deref(), ip),
-        }
+    async fn get_text(&self, url: &str) -> Result<String, reqwest::Error> {
+        self.http
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    const SPAMHAUS_SAMPLE: &str = "{\"cidr\":\"203.0.113.0/24\",\"sblid\":\"SBL1\",\"rir\":\"ripencc\"}\n{\"cidr\":\"198.51.100.0/24\",\"sblid\":\"SBL2\",\"rir\":\"ripencc\"}\n";
+    /// Shaped like the real export, trailing metadata line included.
+    const SPAMHAUS_SAMPLE: &str = r#"{"cidr":"203.0.113.0/24","sblid":"SBL1","rir":"ripencc"}
+{"cidr":"198.51.100.0/24","sblid":"SBL2","rir":"ripencc"}
+{"type":"metadata","timestamp":1790419442,"records":2}
+"#;
 
-    const FIREHOL_SAMPLE: &str =
-        "# Maintainer : FireHOL\n# comment\n192.0.2.0/24\n\n203.0.113.0/25\n";
-
-    #[test]
-    fn parse_spamhaus_reads_one_cidr_per_json_line() {
-        let nets = parse_spamhaus(SPAMHAUS_SAMPLE);
-        assert_eq!(nets.len(), 2);
-        assert!(nets.contains(&"203.0.113.0/24".parse().unwrap()));
+    fn client(server: &MockServer) -> BlockListsClient {
+        BlockListsClient {
+            http: reqwest::Client::new(),
+            spamhaus_url: format!("{}/spamhaus", server.uri()),
+            firehol_url: format!("{}/firehol", server.uri()),
+        }
     }
 
+    fn fetched_list(cidrs: &[&str]) -> FetchedList {
+        let networks = cidrs.iter().map(|cidr| cidr.parse().unwrap()).collect();
+        FetchedList::Fetched(NetworkList::new(networks).unwrap())
+    }
+
+    /// `FireHOL` level1 mixes networks with bare addresses.
+    const FIREHOL_SAMPLE: &str = "\
+# Maintainer : FireHOL
+192.0.2.0/24
+
+203.0.113.0/25
+198.51.100.7
+";
+
     #[test]
-    fn parse_firehol_skips_comments_and_blank_lines() {
-        let nets = parse_firehol(FIREHOL_SAMPLE);
+    fn spamhaus_entries_are_read_and_the_metadata_line_is_skipped() {
+        let sut = SPAMHAUS_SAMPLE;
+
+        let actual = BlockListsClient::parse_spamhaus(sut);
+
         assert_eq!(
-            nets,
+            actual,
             vec![
-                "192.0.2.0/24".parse().unwrap(),
-                "203.0.113.0/25".parse().unwrap()
+                "203.0.113.0/24".parse::<Ipv4Net>().unwrap(),
+                "198.51.100.0/24".parse().unwrap(),
             ]
         );
     }
 
     #[tokio::test]
-    async fn fetch_from_populates_both_lists_when_both_succeed() {
+    async fn fetch_populates_both_lists_when_both_succeed() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/spamhaus"))
@@ -129,24 +137,26 @@ mod tests {
             .mount(&server)
             .await;
 
-        let sut = BlockLists::fetch_from(
-            &reqwest::Client::new(),
-            &format!("{}/spamhaus", server.uri()),
-            &format!("{}/firehol", server.uri()),
-        )
-        .await;
-        let hit = sut.check(Ipv4Addr::new(203, 0, 113, 5));
-        let clean = sut.check(Ipv4Addr::new(8, 8, 8, 8));
+        let sut = client(&server);
 
-        assert_eq!(hit.spamhaus, BlockListStatus::Listed);
-        assert_eq!(hit.firehol, BlockListStatus::Listed);
-        assert_eq!(clean.spamhaus, BlockListStatus::Clear);
-        assert_eq!(clean.firehol, BlockListStatus::Clear);
+        let actual = sut.fetch().await;
+
+        assert_eq!(
+            actual.spamhaus,
+            fetched_list(&["203.0.113.0/24", "198.51.100.0/24"])
+        );
+        assert_eq!(
+            actual.firehol,
+            fetched_list(&[
+                "192.0.2.0/24",
+                "203.0.113.0/25",
+                "198.51.100.7/32"
+            ])
+        );
     }
 
     #[tokio::test]
-    async fn fetch_from_marks_a_failed_list_unavailable_without_failing_the_other()
-     {
+    async fn fetch_marks_a_failed_list_unavailable_without_failing_the_other() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/spamhaus"))
@@ -161,16 +171,19 @@ mod tests {
             .mount(&server)
             .await;
 
-        let sut = BlockLists::fetch_from(
-            &reqwest::Client::new(),
-            &format!("{}/spamhaus", server.uri()),
-            &format!("{}/firehol", server.uri()),
-        )
-        .await;
-        let facts = sut.check(Ipv4Addr::new(192, 0, 2, 1));
+        let sut = client(&server);
 
-        assert_eq!(facts.spamhaus, BlockListStatus::Unavailable);
-        assert_eq!(facts.firehol, BlockListStatus::Listed);
+        let actual = sut.fetch().await;
+
+        assert_eq!(actual.spamhaus, FetchedList::Unavailable);
+        assert_eq!(
+            actual.firehol,
+            fetched_list(&[
+                "192.0.2.0/24",
+                "203.0.113.0/25",
+                "198.51.100.7/32"
+            ])
+        );
     }
 
     #[tokio::test]
@@ -192,15 +205,18 @@ mod tests {
             .mount(&server)
             .await;
 
-        let sut = BlockLists::fetch_from(
-            &reqwest::Client::new(),
-            &format!("{}/spamhaus", server.uri()),
-            &format!("{}/firehol", server.uri()),
-        )
-        .await;
-        let facts = sut.check(Ipv4Addr::new(192, 0, 2, 1));
+        let sut = client(&server);
 
-        assert_eq!(facts.spamhaus, BlockListStatus::Unavailable);
-        assert_eq!(facts.firehol, BlockListStatus::Listed);
+        let actual = sut.fetch().await;
+
+        assert_eq!(actual.spamhaus, FetchedList::Unavailable);
+        assert_eq!(
+            actual.firehol,
+            fetched_list(&[
+                "192.0.2.0/24",
+                "203.0.113.0/25",
+                "198.51.100.7/32"
+            ])
+        );
     }
 }

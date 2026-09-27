@@ -37,6 +37,8 @@ chip calibrate 192.0.2.10=Helsinki 198.51.100.20=Frankfurt
 The scan covers:
 
 - proxy/VPN/Tor reputation, Spamhaus DROP and FireHOL level 1;
+- the RKN registry export from antifilter.download: the address itself or its
+  subnet listed, and how many addresses of its `/24` are blocked one by one;
 - country consensus across public GeoIP sources and RIPE routing provenance;
 - latency relative to RIPE Atlas anchors and HTTPS reachability from Russia;
 - ChatGPT, Gemini, YouTube Premium, Netflix, Claude, TikTok and NotebookLM;
@@ -46,6 +48,19 @@ The scan covers:
 
 Warnings can be promoted with `--gate <id>`, for example
 `--gate service:claude`. A gate can be ignored with `--skip-gate <id>`.
+
+`rkn-registry` fails when the address is in the registry or inside a subnet
+the registry blocks as a whole. Five or more blocked addresses in the same
+`/24` are a warning, fifty or more a warning that the subnet is close to a
+full block; `--gate rkn-registry` turns either into a failure.
+
+### Russian bridge
+
+With `--country RU` the candidate is vetted as a Russian bridge rather than a
+foreign exit. `geo`, `latency`, `service:*`, `service-geo*` and `ai:*` are
+reported as `SKIP` and their probes are not run. Reputation, block lists, the
+RKN registry, provenance, `reach` from Russian probes, `tampering`, CPU steal
+and the `/24` sweep are judged as for an exit.
 
 ## Requirements
 

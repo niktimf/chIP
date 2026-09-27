@@ -187,7 +187,7 @@ dependencies = [
 
 [[package]]
 name = "chip"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chip-core",
@@ -206,9 +206,10 @@ dependencies = [
 
 [[package]]
 name = "chip-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "country-code-enum",
+ "ipnet",
  "itertools",
  "pretty_assertions",
  "regex",
@@ -220,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "chip-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chip-core",
  "ipnet",
@@ -800,6 +801,9 @@ name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "is_terminal_polyfill"

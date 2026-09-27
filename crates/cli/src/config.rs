@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use chip_core::verdict::latency::LatencyThresholds;
-use chip_core::{CityName, CountryCode, GateId, GateOverrides};
+use chip_core::{CityName, CountryCode, GateId, GateOverrides, ScanProfile};
 use chip_io::credentials::{GlobalpingToken, ProxycheckApiKey, SshPrivateKey};
 use clap::{Args, Parser, Subcommand};
 
@@ -337,6 +337,10 @@ impl ScanCommand {
         &self.country
     }
 
+    pub fn profile(&self) -> ScanProfile {
+        ScanProfile::for_country(&self.country)
+    }
+
     pub const fn city(&self) -> Option<&CityName> {
         self.city.as_ref()
     }
@@ -507,52 +511,31 @@ mod tests {
         assert!(sut.fail_fast());
     }
 
-    #[test]
-    fn invalid_ip_is_rejected_during_parsing() {
-        let error = Cli::try_parse_from([
-            "chip",
-            "scan",
-            "not-an-ip",
-            "--country",
-            "FI",
-        ])
+    #[rstest::rstest]
+    #[case::invalid_ip(
+        &["scan", "not-an-ip", "--country", "FI"],
+        "invalid IPv4 address syntax"
+    )]
+    #[case::unknown_country(
+        &["scan", "203.0.113.1", "--country", "ZZ"],
+        "not a recognized country code"
+    )]
+    #[case::empty_city(
+        &["scan", "203.0.113.1", "--country", "FI", "--city", "   "],
+        "city name must not be empty"
+    )]
+    fn malformed_values_are_rejected_during_parsing(
+        #[case] sut: &[&str],
+        #[case] expected_detail: &str,
+    ) {
+        let error = Cli::try_parse_from(
+            std::iter::once("chip").chain(sut.iter().copied()),
+        )
         .err()
         .expect("input must be rejected");
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-    }
-
-    #[test]
-    fn unknown_country_is_rejected_during_parsing() {
-        let error = Cli::try_parse_from([
-            "chip",
-            "scan",
-            "203.0.113.1",
-            "--country",
-            "ZZ",
-        ])
-        .err()
-        .expect("input must be rejected");
-
-        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-        assert!(error.to_string().contains("not a recognized country code"));
-    }
-
-    #[test]
-    fn an_empty_city_is_rejected_during_parsing() {
-        let error = Cli::try_parse_from([
-            "chip",
-            "scan",
-            "203.0.113.1",
-            "--country",
-            "FI",
-            "--city",
-            "   ",
-        ])
-        .err()
-        .expect("input must be rejected");
-
-        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(error.to_string().contains(expected_detail), "{error}");
     }
 
     #[test]
@@ -578,40 +561,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validation_rejects_a_non_finite_latency_threshold() {
-        let error = scan_command(&[
-            "scan",
-            "203.0.113.1",
-            "--country",
-            "FI",
-            "--max-excess-ms",
-            "NaN",
-        ])
-        .err()
-        .expect("threshold must be rejected");
-
-        assert!(error.to_string().contains("finite and positive"));
-    }
-
-    #[test]
-    fn validation_rejects_a_negative_loss_threshold() {
-        let error = scan_command(&[
-            "scan",
-            "203.0.113.1",
-            "--country",
-            "FI",
-            "--max-loss-pct=-0.1",
-        ])
-        .err()
-        .expect("threshold must be rejected");
-
-        assert!(error.to_string().contains("finite and non-negative"));
-    }
-
-    #[test]
-    fn validation_rejects_an_empty_probe_selection() {
-        let error = scan_command(&[
+    #[rstest::rstest]
+    #[case::non_finite_latency_threshold(
+        &["scan", "203.0.113.1", "--country", "FI", "--max-excess-ms", "NaN"],
+        "finite and positive"
+    )]
+    #[case::negative_loss_threshold(
+        &["scan", "203.0.113.1", "--country", "FI", "--max-loss-pct=-0.1"],
+        "finite and non-negative"
+    )]
+    #[case::empty_probe_selection(
+        &[
             "scan",
             "203.0.113.1",
             "--country",
@@ -620,14 +580,16 @@ mod tests {
             "0",
             "--dc-probes",
             "0",
-        ])
-        .err()
-        .expect("probe selection must be rejected");
+        ],
+        "--eyeball-probes and --dc-probes cannot both be 0"
+    )]
+    fn validation_rejects_values_that_parse_but_break_a_domain_rule(
+        #[case] sut: &[&str],
+        #[case] expected_detail: &str,
+    ) {
+        let error = scan_command(sut).err().expect("input must be rejected");
 
-        assert_eq!(
-            error.to_string(),
-            "--eyeball-probes and --dc-probes cannot both be 0"
-        );
+        assert!(error.to_string().contains(expected_detail), "{error:#}");
     }
 
     #[test]

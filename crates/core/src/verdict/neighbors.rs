@@ -287,77 +287,63 @@ mod tests {
         }
     }
 
-    #[test]
-    fn classify_reads_the_four_buckets() {
-        assert_eq!(classify(&closed("203.0.113.1")), NeighborBucket::Closed);
-        assert_eq!(
-            classify(&no_handshake("203.0.113.2")),
-            NeighborBucket::NoHandshake
-        );
-        assert_eq!(
-            classify(&handshake("203.0.113.3", "invalid2.invalid", "", &[])),
-            NeighborBucket::RealityGoogle
-        );
-        assert_eq!(
-            classify(&handshake(
-                "203.0.113.4",
-                "www.microsoft.com",
-                "DigiCert",
-                &[]
-            )),
-            NeighborBucket::RealityBrand
-        );
-        assert_eq!(
-            classify(&handshake(
-                "203.0.113.5",
-                "blog.example.org",
-                "R3",
-                &["blog.example.org"]
-            )),
-            NeighborBucket::OwnDomain
-        );
-        // example.com is a default-page CN (same as neighbors.sh), not a real site
-        assert_eq!(
-            classify(&handshake(
-                "203.0.113.8",
-                "example.com",
-                "R3",
-                &["example.com"]
-            )),
-            NeighborBucket::SelfSigned
-        );
-        assert_eq!(
-            classify(&handshake("203.0.113.6", "", "", &[])),
-            NeighborBucket::SelfSigned
-        );
-        assert_eq!(
-            classify(&handshake("203.0.113.7", "203.0.113.7", "", &[])),
-            NeighborBucket::SelfSigned
-        );
+    #[rstest::rstest]
+    #[case::closed(closed("203.0.113.1"), NeighborBucket::Closed)]
+    #[case::no_handshake(
+        no_handshake("203.0.113.2"),
+        NeighborBucket::NoHandshake
+    )]
+    #[case::reality_google(
+        handshake("203.0.113.3", "invalid2.invalid", "", &[]),
+        NeighborBucket::RealityGoogle
+    )]
+    #[case::reality_brand(
+        handshake("203.0.113.4", "www.microsoft.com", "DigiCert", &[]),
+        NeighborBucket::RealityBrand
+    )]
+    #[case::own_domain(
+        handshake(
+            "203.0.113.5",
+            "blog.example.org",
+            "R3",
+            &["blog.example.org"]
+        ),
+        NeighborBucket::OwnDomain
+    )]
+    // example.com is a default-page CN (same as neighbors.sh), not a real site
+    #[case::default_page_cn(
+        handshake("203.0.113.8", "example.com", "R3", &["example.com"]),
+        NeighborBucket::SelfSigned
+    )]
+    #[case::empty_cn(
+        handshake("203.0.113.6", "", "", &[]),
+        NeighborBucket::SelfSigned
+    )]
+    #[case::cn_is_the_address(
+        handshake("203.0.113.7", "203.0.113.7", "", &[]),
+        NeighborBucket::SelfSigned
+    )]
+    fn a_neighbor_falls_into_one_bucket(
+        #[case] sut: NeighborProbe,
+        #[case] expected: NeighborBucket,
+    ) {
+        let actual = classify(&sut);
+
+        assert_eq!(actual, expected);
     }
 
-    #[test]
-    fn a_clean_ptr_is_ok() {
-        assert_eq!(
-            judge_candidate_ptr(&ptr("host.example-hoster.net")).severity,
-            Severity::Ok
-        );
-        assert_eq!(
-            judge_candidate_ptr(&PtrLookup::NotFound).severity,
-            Severity::Ok
-        );
-    }
+    #[rstest::rstest]
+    #[case::a_hoster_name(ptr("host.example-hoster.net"), Severity::Ok)]
+    #[case::no_record(PtrLookup::NotFound, Severity::Ok)]
+    #[case::a_vpn_name(ptr("vpn123.example-hoster.net"), Severity::Warn)]
+    #[case::a_proxy_name(ptr("client.proxy-pool.example.net"), Severity::Warn)]
+    fn a_self_describing_ptr_warns_and_any_other_is_ok(
+        #[case] sut: PtrLookup,
+        #[case] expected: Severity,
+    ) {
+        let verdict = judge_candidate_ptr(&sut);
 
-    #[test]
-    fn a_self_describing_ptr_warns() {
-        assert_eq!(
-            judge_candidate_ptr(&ptr("vpn123.example-hoster.net")).severity,
-            Severity::Warn
-        );
-        assert_eq!(
-            judge_candidate_ptr(&ptr("client.proxy-pool.example.net")).severity,
-            Severity::Warn
-        );
+        assert_eq!(verdict.severity, expected, "{}", verdict.detail);
     }
 
     #[test]

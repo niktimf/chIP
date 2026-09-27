@@ -136,14 +136,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_proc_stat_returns_none_for_a_line_with_too_few_fields() {
-        assert!(parse_proc_stat("cpu  1 2 3\n").is_none());
-    }
+    #[rstest::rstest]
+    #[case::too_few_fields("cpu  1 2 3\n")]
+    #[case::no_cpu_line("nonsense\n")]
+    fn parse_proc_stat_returns_none_for_an_unreadable_snapshot(
+        #[case] sut: &str,
+    ) {
+        let actual = parse_proc_stat(sut);
 
-    #[test]
-    fn parse_proc_stat_returns_none_when_there_is_no_cpu_line() {
-        assert!(parse_proc_stat("nonsense\n").is_none());
+        assert!(actual.is_none());
     }
 
     #[cfg(unix)]

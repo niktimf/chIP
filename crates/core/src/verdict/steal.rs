@@ -39,20 +39,29 @@ mod tests {
         ProcStatSnapshot::new(steal, total).unwrap()
     }
 
-    #[test]
-    fn no_steal_ticks_in_the_delta_is_zero_percent() {
-        assert_eq!(steal_pct(&snap(50, 9000), &snap(50, 10000)), 0.0);
-    }
+    #[rstest::rstest]
+    #[case::no_steal_ticks_in_the_delta(
+        (snap(50, 9000), snap(50, 10000)),
+        0.0
+    )]
+    // 1000 ticks elapsed, 100 of them steal.
+    #[case::ten_percent_of_elapsed_ticks(
+        (snap(200, 9000), snap(300, 10000)),
+        10.0
+    )]
+    #[case::no_ticks_elapsed_is_not_a_division_by_zero(
+        (snap(50, 9000), snap(50, 9000)),
+        0.0
+    )]
+    fn steal_is_the_share_of_elapsed_ticks(
+        #[case] sut: (ProcStatSnapshot, ProcStatSnapshot),
+        #[case] expected: f64,
+    ) {
+        let (before, after) = sut;
 
-    #[test]
-    fn ten_percent_of_the_elapsed_ticks_being_steal_is_ten_percent() {
-        // 1000 ticks elapsed, 100 of them steal.
-        assert_eq!(steal_pct(&snap(200, 9000), &snap(300, 10000)), 10.0);
-    }
+        let actual = steal_pct(&before, &after);
 
-    #[test]
-    fn a_total_delta_of_zero_is_zero_percent_not_a_division_by_zero() {
-        assert_eq!(steal_pct(&snap(50, 9000), &snap(50, 9000)), 0.0);
+        assert_eq!(actual, expected);
     }
 
     #[rstest::rstest]

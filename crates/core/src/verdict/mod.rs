@@ -6,6 +6,7 @@ pub mod neighbors;
 pub mod provenance;
 pub mod reach;
 pub mod reputation;
+pub mod rkn_registry;
 pub mod service_geo;
 pub mod services;
 pub mod steal;

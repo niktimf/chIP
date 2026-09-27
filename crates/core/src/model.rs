@@ -1,8 +1,10 @@
 use std::fmt;
 use std::net::Ipv4Addr;
+use std::num::NonZeroU32;
 use std::str::FromStr;
 
 use country_code_enum::CountryCode as RegistryCountryCode;
+use ipnet::Ipv4Net;
 
 /// How serious a single check's outcome is. Ordered least to most severe so
 /// `Vec<CheckResult>::sort()` (descending) puts the worst results first.
@@ -486,6 +488,68 @@ pub struct BlockListFacts {
     pub firehol: BlockListStatus,
 }
 
+/// Where the candidate itself stands in the RKN registry export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RknListing {
+    NotListed,
+    /// The address is in the list of single blocked addresses.
+    Address,
+    /// The address falls inside a network the registry blocks as a whole.
+    Subnet(Ipv4Net),
+}
+
+/// The candidate's entry in the RKN registry plus how many other addresses
+/// of its `/24` and `/16` are blocked one by one.
+///
+/// The candidate itself is never counted as its own neighbor, so a `/24` has
+/// at most 255 of them and a `/16` at most 65 535: exactly what `u8` and
+/// `u16` hold. The `/24` lies inside its `/16`, so it never has more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RknRegistryFacts {
+    listing: RknListing,
+    neighbors_24: u8,
+    neighbors_16: u16,
+}
+
+impl RknRegistryFacts {
+    pub fn new(
+        listing: RknListing,
+        neighbors_24: u8,
+        neighbors_16: u16,
+    ) -> Result<Self, InvalidRknRegistryFacts> {
+        if u16::from(neighbors_24) > neighbors_16 {
+            return Err(InvalidRknRegistryFacts {
+                in_24: neighbors_24,
+                in_16: neighbors_16,
+            });
+        }
+        Ok(Self {
+            listing,
+            neighbors_24,
+            neighbors_16,
+        })
+    }
+
+    pub const fn listing(&self) -> RknListing {
+        self.listing
+    }
+
+    pub const fn neighbors_24(&self) -> u8 {
+        self.neighbors_24
+    }
+
+    pub const fn neighbors_16(&self) -> u16 {
+        self.neighbors_16
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the /24 has {in_24} listed neighbors, but its /16 only {in_16}")]
+pub struct InvalidRknRegistryFacts {
+    in_24: u8,
+    in_16: u16,
+}
+
 /// The outcome of probing one streaming/AI service, as classified by
 /// `verdict::services` from an HTTP status and/or a response body/final URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -566,23 +630,40 @@ pub struct NeighborProbe {
     pub https: NeighborHttps,
 }
 
+/// How the candidate's address is routed, as the RIS peers see it.
+#[derive(Debug, Clone)]
+pub enum Routing {
+    /// An announcement covers the address. The prefix is usually shorter
+    /// than a `/24`: cloud providers announce whole blocks.
+    Announced {
+        prefix: Ipv4Net,
+        facts: RoutingFacts,
+    },
+    /// No announcement covers the address, so no peer can see it.
+    NotAnnounced { total_ris_peers: NonZeroU32 },
+}
+
+/// Visibility of an announced prefix.
+///
+/// The total is never zero: a routing answer without RIS peers carries no
+/// data and is rejected where the response is read.
 #[derive(Debug, Clone)]
 pub struct RoutingFacts {
     ris_peers_seeing: u32,
-    total_ris_peers: u32,
+    total_ris_peers: NonZeroU32,
     origin_count: u32,
 }
 
 impl RoutingFacts {
     pub const fn new(
         ris_peers_seeing: u32,
-        total_ris_peers: u32,
+        total_ris_peers: NonZeroU32,
         origin_count: u32,
     ) -> Result<Self, InvalidRoutingFacts> {
-        if ris_peers_seeing > total_ris_peers {
+        if ris_peers_seeing > total_ris_peers.get() {
             return Err(InvalidRoutingFacts {
                 seeing: ris_peers_seeing,
-                total: total_ris_peers,
+                total: total_ris_peers.get(),
             });
         }
         Ok(Self {
@@ -596,7 +677,7 @@ impl RoutingFacts {
         self.ris_peers_seeing
     }
 
-    pub const fn total_ris_peers(&self) -> u32 {
+    pub const fn total_ris_peers(&self) -> NonZeroU32 {
         self.total_ris_peers
     }
 
@@ -699,12 +780,18 @@ mod tests {
         assert_eq!(sut.label(), "WARN");
     }
 
-    #[test]
-    fn severity_displays_as_uppercase_word() {
-        assert_eq!(Severity::Ok.to_string(), "OK");
-        assert_eq!(Severity::Warn.to_string(), "WARN");
-        assert_eq!(Severity::Error.to_string(), "ERROR");
-        assert_eq!(Severity::Fail.to_string(), "FAIL");
+    #[rstest::rstest]
+    #[case::ok(Severity::Ok, "OK")]
+    #[case::warn(Severity::Warn, "WARN")]
+    #[case::error(Severity::Error, "ERROR")]
+    #[case::fail(Severity::Fail, "FAIL")]
+    fn severity_displays_as_uppercase_word(
+        #[case] sut: Severity,
+        #[case] expected: &str,
+    ) {
+        let actual = sut.to_string();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

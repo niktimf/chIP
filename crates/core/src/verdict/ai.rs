@@ -92,45 +92,6 @@ mod tests {
         &["is not available in your", "unsupported_country"];
 
     #[test]
-    fn a_region_marker_in_the_body_blocks() {
-        assert_eq!(
-            classify_ai_endpoint(
-                403,
-                "This API is not available in your region",
-                MARKERS,
-                &[401]
-            ),
-            ServiceState::Blocked
-        );
-    }
-
-    #[test]
-    fn a_normal_success_is_available_even_with_an_auth_error_body() {
-        assert_eq!(
-            classify_ai_endpoint(401, "invalid api key", MARKERS, &[401]),
-            ServiceState::Available
-        );
-    }
-
-    #[test]
-    fn judge_ai_endpoints_never_fails_only_warns_on_a_block() {
-        let sut = [
-            ("openai", ServiceState::Blocked),
-            ("anthropic", ServiceState::Available),
-        ];
-        let verdict = judge_ai_endpoints(&sut);
-
-        assert_eq!(verdict.severity, Severity::Warn);
-    }
-
-    #[test]
-    fn judge_ai_endpoints_is_ok_when_nothing_is_blocked() {
-        let sut = [("openai", ServiceState::Available)];
-
-        assert_eq!(judge_ai_endpoints(&sut).severity, Severity::Ok);
-    }
-
-    #[test]
     fn an_unrecognized_api_response_is_a_warning() {
         let state = classify_ai_endpoint(500, "server error", MARKERS, &[401]);
 
@@ -141,10 +102,49 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_unreachable_endpoint_is_an_error() {
-        let sut = [("openai", ServiceState::Unavailable("timeout".into()))];
+    #[rstest::rstest]
+    #[case::region_marker_blocks(
+        403,
+        "This API is not available in your region",
+        ServiceState::Blocked
+    )]
+    #[case::auth_error_is_a_normal_success(
+        401,
+        "invalid api key",
+        ServiceState::Available
+    )]
+    fn an_endpoint_is_classified_by_status_and_body(
+        #[case] status: u16,
+        #[case] sut: &str,
+        #[case] expected: ServiceState,
+    ) {
+        let actual = classify_ai_endpoint(status, sut, MARKERS, &[401]);
 
-        assert_eq!(judge_ai_endpoints(&sut).severity, Severity::Error);
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::nothing_blocked(
+        vec![("openai", ServiceState::Available)],
+        Severity::Ok
+    )]
+    #[case::a_block_only_warns_never_fails(
+        vec![
+            ("openai", ServiceState::Blocked),
+            ("anthropic", ServiceState::Available),
+        ],
+        Severity::Warn
+    )]
+    #[case::unreachable_is_an_error(
+        vec![("openai", ServiceState::Unavailable("timeout".into()))],
+        Severity::Error
+    )]
+    fn endpoints_are_judged_by_the_worst_state(
+        #[case] sut: Vec<(&'static str, ServiceState)>,
+        #[case] expected: Severity,
+    ) {
+        let verdict = judge_ai_endpoints(&sut);
+
+        assert_eq!(verdict.severity, expected, "{}", verdict.detail);
     }
 }
