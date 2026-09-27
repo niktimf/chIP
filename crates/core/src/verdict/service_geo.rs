@@ -4,11 +4,10 @@ use crate::model::{CaptchaObservation, CountryCode, ServiceCountryVote};
 pub fn judge_service_country(
     votes: &[ServiceCountryVote],
     expected: &CountryCode,
-    fail_on: &[&str],
 ) -> Verdict {
     let critical_answered = votes
         .iter()
-        .any(|vote| fail_on.contains(&vote.service) && vote.country.is_some());
+        .any(|vote| vote.source.is_critical() && vote.country.is_some());
     if !critical_answered {
         return Verdict::error("neither Google nor YouTube reported a country");
     }
@@ -16,7 +15,7 @@ pub fn judge_service_country(
         CountryCode::try_from("RU").expect("RU is a valid country code");
     let disagreements: Vec<String> = votes
         .iter()
-        .filter_map(|v| v.country.map(|c| (v.service, c)))
+        .filter_map(|v| v.country.map(|c| (v.source, c)))
         .filter(|(_, c)| c != expected)
         .map(|(s, c)| format!("{s}={c}"))
         .collect();
@@ -25,8 +24,12 @@ pub fn judge_service_country(
             "all responding services agree on {expected}"
         ));
     }
+    // `c == russia` matters only when `expected` is RU itself, and the CLI
+    // never gets here in that case: a RuBridge profile skips this gate. The
+    // clause stays so that a direct caller asking about an RU "exit" still
+    // sees a critical RU sighting fail rather than count as agreement.
     let gate_hit = votes.iter().any(|v| {
-        fail_on.contains(&v.service)
+        v.source.is_critical()
             && v.country.is_some_and(|c| c != *expected || c == russia)
     });
     let detail = format!("disagreement: {}", disagreements.join(", "));
@@ -95,20 +98,18 @@ pub fn judge_cdn_edge(edges: &[(&str, Option<CountryCode>)]) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Severity;
-
-    const FAIL_SERVICES: &[&str] = &["google", "youtube"];
+    use crate::model::{ServiceGeoSource, Severity};
 
     fn cc(code: &str) -> CountryCode {
         code.parse().unwrap()
     }
 
     fn vote(
-        service: &'static str,
+        source: ServiceGeoSource,
         country: Option<&str>,
     ) -> ServiceCountryVote {
         ServiceCountryVote {
-            service,
+            source,
             country: country.map(cc),
         }
     }
@@ -144,30 +145,45 @@ mod tests {
 
     #[rstest::rstest]
     #[case::everyone_agreeing(
-        vec![vote("google", Some("FI")), vote("apple", Some("FI"))],
+        vec![
+            vote(ServiceGeoSource::Google, Some("FI")),
+            vote(ServiceGeoSource::Apple, Some("FI")),
+        ],
         Severity::Ok
     )]
     #[case::google_or_youtube_disagreeing(
-        vec![vote("google", Some("DE")), vote("apple", Some("FI"))],
+        vec![
+            vote(ServiceGeoSource::Google, Some("DE")),
+            vote(ServiceGeoSource::Apple, Some("FI")),
+        ],
         Severity::Fail
     )]
     #[case::google_or_youtube_seeing_russia_while_everyone_else_agrees(
-        vec![vote("youtube", Some("RU")), vote("apple", Some("FI"))],
+        vec![
+            vote(ServiceGeoSource::Youtube, Some("RU")),
+            vote(ServiceGeoSource::Apple, Some("FI")),
+        ],
         Severity::Fail
     )]
-    #[case::a_non_gate_service_disagreeing_only_warns(
-        vec![vote("google", Some("FI")), vote("spotify", Some("DE"))],
+    #[case::a_non_critical_service_disagreeing_only_warns(
+        vec![
+            vote(ServiceGeoSource::Google, Some("FI")),
+            vote(ServiceGeoSource::Spotify, Some("DE")),
+        ],
         Severity::Warn
     )]
     #[case::a_vote_that_did_not_answer_is_silently_skipped(
-        vec![vote("google", Some("FI")), vote("apple", None)],
+        vec![
+            vote(ServiceGeoSource::Google, Some("FI")),
+            vote(ServiceGeoSource::Apple, None),
+        ],
         Severity::Ok
     )]
     #[case::no_critical_service_answer_is_an_error(
         vec![
-            vote("google", None),
-            vote("youtube", None),
-            vote("apple", Some("FI")),
+            vote(ServiceGeoSource::Google, None),
+            vote(ServiceGeoSource::Youtube, None),
+            vote(ServiceGeoSource::Apple, Some("FI")),
         ],
         Severity::Error
     )]
@@ -175,7 +191,7 @@ mod tests {
         #[case] sut: Vec<ServiceCountryVote>,
         #[case] expected: Severity,
     ) {
-        let verdict = judge_service_country(&sut, &cc("FI"), FAIL_SERVICES);
+        let verdict = judge_service_country(&sut, &cc("FI"));
 
         assert_eq!(verdict.severity, expected, "{}", verdict.detail);
     }

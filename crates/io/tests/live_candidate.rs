@@ -111,9 +111,9 @@ async fn the_temporary_listener_opens_its_port_and_stopping_closes_it() {
     let sut = SshSession::connect(ip, &config())
         .await
         .expect("the candidate accepts our key");
-    let outcome = sut.start_listener(port.get()).await.expect("ssh answered");
+    let outcome = sut.start_listener(port).await.expect("ssh answered");
     let open_while_running = port_is_open(ip, port);
-    sut.stop_listener(port.get()).await.expect("ssh answered");
+    sut.stop_listener(port).await.expect("ssh answered");
     let open_after_stop = port_is_open(ip, port);
 
     assert_eq!(outcome, ListenerOutcome::Listening);

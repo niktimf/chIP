@@ -209,6 +209,7 @@ name = "chip-core"
 version = "0.2.0"
 dependencies = [
  "country-code-enum",
+ "http",
  "ipnet",
  "itertools",
  "pretty_assertions",
@@ -223,6 +224,7 @@ name = "chip-io"
 version = "0.2.0"
 dependencies = [
  "chip-core",
+ "http",
  "ipnet",
  "itertools",
  "openssh",

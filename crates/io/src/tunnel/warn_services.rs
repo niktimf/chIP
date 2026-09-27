@@ -1,11 +1,15 @@
 use chip_core::model::ServiceState;
 use chip_core::verdict::services::{
-    classify_claude, classify_netflix, classify_notebooklm, classify_tiktok,
-    claude_unavailable_markers,
+    NetflixTitleStatuses, classify_claude, classify_netflix,
+    classify_notebooklm, classify_tiktok, claude_unavailable_markers,
 };
+use http::header::{
+    ACCEPT, ACCEPT_LANGUAGE, UPGRADE_INSECURE_REQUESTS, USER_AGENT,
+};
+use http::{HeaderName, HeaderValue};
 
 use super::client::TunnelClient;
-use super::services::BROWSER_UA;
+use super::services::{ACCEPT_LANGUAGE_EN, BROWSER_HEADERS, BROWSER_UA};
 
 const NETFLIX_LICENSED_TITLE: &str = "70143836";
 const NETFLIX_ORIGINAL_TITLE: &str = "80197526";
@@ -21,16 +25,16 @@ async fn probe_netflix_at(
     let licensed_url = format!("{base_url}/title/{NETFLIX_LICENSED_TITLE}");
     let original_url = format!("{base_url}/title/{NETFLIX_ORIGINAL_TITLE}");
     let (licensed, original) = tokio::join!(
-        client.get(&licensed_url, &[("User-Agent", BROWSER_UA)]),
-        client.get(&original_url, &[("User-Agent", BROWSER_UA)])
+        client.get(&licensed_url, &BROWSER_HEADERS),
+        client.get(&original_url, &BROWSER_HEADERS)
     );
     match (licensed, original) {
-        (Ok(licensed), Ok(original)) => classify_netflix(
-            licensed.status,
-            &licensed.body,
-            original.status,
-            &original.body,
-        ),
+        (Ok(licensed), Ok(original)) => {
+            classify_netflix(NetflixTitleStatuses {
+                licensed: licensed.status,
+                original: original.status,
+            })
+        }
         (Err(error), _) | (_, Err(error)) => unavailable(error),
     }
 }
@@ -44,17 +48,31 @@ async fn probe_claude_at(client: &TunnelClient, url: &str) -> ServiceState {
         .get(
             url,
             &[
-                ("User-Agent", BROWSER_UA),
+                (USER_AGENT, BROWSER_UA),
                 (
-                    "Accept",
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    ACCEPT,
+                    HeaderValue::from_static(
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    ),
                 ),
-                ("Accept-Language", "en-US,en;q=0.9"),
-                ("Sec-Fetch-Dest", "document"),
-                ("Sec-Fetch-Mode", "navigate"),
-                ("Sec-Fetch-Site", "none"),
-                ("Sec-Fetch-User", "?1"),
-                ("Upgrade-Insecure-Requests", "1"),
+                (ACCEPT_LANGUAGE, ACCEPT_LANGUAGE_EN),
+                (
+                    HeaderName::from_static("sec-fetch-dest"),
+                    HeaderValue::from_static("document"),
+                ),
+                (
+                    HeaderName::from_static("sec-fetch-mode"),
+                    HeaderValue::from_static("navigate"),
+                ),
+                (
+                    HeaderName::from_static("sec-fetch-site"),
+                    HeaderValue::from_static("none"),
+                ),
+                (
+                    HeaderName::from_static("sec-fetch-user"),
+                    HeaderValue::from_static("?1"),
+                ),
+                (UPGRADE_INSECURE_REQUESTS, HeaderValue::from_static("1")),
             ],
         )
         .await
@@ -77,12 +95,14 @@ async fn probe_tiktok_at(client: &TunnelClient, url: &str) -> ServiceState {
         .get(
             url,
             &[
-                ("User-Agent", BROWSER_UA),
+                (USER_AGENT, BROWSER_UA),
                 (
-                    "Accept",
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    ACCEPT,
+                    HeaderValue::from_static(
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    ),
                 ),
-                ("Accept-Language", "en-US,en;q=0.9"),
+                (ACCEPT_LANGUAGE, ACCEPT_LANGUAGE_EN),
             ],
         )
         .await
@@ -101,12 +121,14 @@ async fn probe_notebooklm_at(client: &TunnelClient, url: &str) -> ServiceState {
         .get(
             url,
             &[
-                ("User-Agent", BROWSER_UA),
+                (USER_AGENT, BROWSER_UA),
                 (
-                    "Accept",
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    ACCEPT,
+                    HeaderValue::from_static(
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    ),
                 ),
-                ("Accept-Language", "en-US,en;q=0.9"),
+                (ACCEPT_LANGUAGE, ACCEPT_LANGUAGE_EN),
             ],
         )
         .await

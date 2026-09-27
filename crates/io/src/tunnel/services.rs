@@ -3,10 +3,21 @@ use chip_core::verdict::services::{
     classify_chatgpt_app, classify_chatgpt_web, classify_gemini,
     classify_youtube_premium,
 };
+use http::header::{ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
+use http::{HeaderName, HeaderValue};
 
 use super::client::TunnelClient;
 
-pub(super) const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
+pub(super) const BROWSER_UA: HeaderValue = HeaderValue::from_static(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+);
+pub(super) const ACCEPT_LANGUAGE_EN: HeaderValue =
+    HeaderValue::from_static("en-US,en;q=0.9");
+/// The one-header set most browser-imitating probes send. A named `static`
+/// (not an inline slice): `HeaderValue` carries an atomic refcount, so a
+/// borrowed temporary cannot be promoted to `'static`.
+pub(super) static BROWSER_HEADERS: [(HeaderName, HeaderValue); 1] =
+    [(USER_AGENT, BROWSER_UA)];
 
 fn unavailable(error: impl std::fmt::Display) -> ServiceState {
     ServiceState::Unavailable(error.to_string())
@@ -16,7 +27,7 @@ async fn probe_chatgpt_web_at(
     client: &TunnelClient,
     url: &str,
 ) -> ServiceState {
-    match client.get(url, &[("User-Agent", BROWSER_UA)]).await {
+    match client.get(url, &BROWSER_HEADERS).await {
         Ok(response) => classify_chatgpt_web(&response.body),
         Err(error) => unavailable(error),
     }
@@ -34,7 +45,7 @@ async fn probe_chatgpt_app_at(
     client: &TunnelClient,
     url: &str,
 ) -> ServiceState {
-    match client.get(url, &[("User-Agent", BROWSER_UA)]).await {
+    match client.get(url, &BROWSER_HEADERS).await {
         Ok(response) => classify_chatgpt_app(response.status, &response.body),
         Err(error) => unavailable(error),
     }
@@ -52,8 +63,8 @@ async fn probe_youtube_premium_at(
         .get(
             url,
             &[
-                ("User-Agent", BROWSER_UA),
-                ("Accept-Language", "en-US,en;q=0.9"),
+                (USER_AGENT, BROWSER_UA),
+                (ACCEPT_LANGUAGE, ACCEPT_LANGUAGE_EN),
             ],
         )
         .await
@@ -72,12 +83,14 @@ async fn probe_gemini_at(client: &TunnelClient, url: &str) -> ServiceState {
         .get(
             url,
             &[
-                ("User-Agent", BROWSER_UA),
+                (USER_AGENT, BROWSER_UA),
                 (
-                    "Accept",
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    ACCEPT,
+                    HeaderValue::from_static(
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    ),
                 ),
-                ("Accept-Language", "en-US,en;q=0.9"),
+                (ACCEPT_LANGUAGE, ACCEPT_LANGUAGE_EN),
             ],
         )
         .await

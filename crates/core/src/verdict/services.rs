@@ -8,6 +8,7 @@
 
 use crate::Verdict;
 use crate::model::ServiceState;
+use http::StatusCode;
 use regex::regex;
 use url::Url;
 
@@ -23,8 +24,13 @@ pub fn classify_chatgpt_web(body: &str) -> ServiceState {
     }
 }
 
-fn is_cloudflare_challenge(status: u16, body_lower: &str) -> bool {
-    matches!(status, 403 | 429 | 503)
+fn is_cloudflare_challenge(status: StatusCode, body_lower: &str) -> bool {
+    [
+        StatusCode::FORBIDDEN,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ]
+    .contains(&status)
         && [
             "cf_chl_opt",
             "_cf_chl",
@@ -38,7 +44,7 @@ fn is_cloudflare_challenge(status: u16, body_lower: &str) -> bool {
         .any(|marker| body_lower.contains(marker))
 }
 
-pub fn classify_chatgpt_app(status: u16, body: &str) -> ServiceState {
+pub fn classify_chatgpt_app(status: StatusCode, body: &str) -> ServiceState {
     let lower = body.to_lowercase();
     if is_cloudflare_challenge(status, &lower) {
         return ServiceState::Error("Cloudflare challenged the request".into());
@@ -92,14 +98,14 @@ pub const fn gemini_unsupported_regions() -> &'static [&'static str] {
 /// extracts the region Google's own page says it served and checks that
 /// against [`gemini_unsupported_regions`], so there is no `markers`
 /// parameter here (see that function's doc comment).
-pub fn classify_gemini(status: u16, body: &str) -> ServiceState {
+pub fn classify_gemini(status: StatusCode, body: &str) -> ServiceState {
     let lower = body.to_lowercase();
     if is_cloudflare_challenge(status, &lower) {
         return ServiceState::Error(
             "Cloudflare challenged the request, so availability was never tested".into(),
         );
     }
-    if !(200..400).contains(&status) {
+    if !(status.is_success() || status.is_redirection()) {
         return ServiceState::Error(format!("unexpected HTTP {status}"));
     }
     match extract_gemini_region(body) {
@@ -114,7 +120,7 @@ pub fn classify_gemini(status: u16, body: &str) -> ServiceState {
 }
 
 pub fn classify_notebooklm(
-    status: u16,
+    status: StatusCode,
     final_url: &Url,
     body: &str,
 ) -> ServiceState {
@@ -136,20 +142,30 @@ pub fn classify_notebooklm(
     if is_google_signin {
         return ServiceState::Available;
     }
-    if (200..400).contains(&status) {
+    if status.is_success() || status.is_redirection() {
         ServiceState::Error(format!("unexpected destination: {final_url}"))
     } else {
         ServiceState::Error(format!("unexpected HTTP {status}"))
     }
 }
 
-pub const fn classify_netflix(
-    licensed_status: u16,
-    _licensed_body: &str,
-    original_status: u16,
-    _original_body: &str,
-) -> ServiceState {
-    match (licensed_status == 200, original_status == 200) {
+/// HTTP statuses of the two Netflix title probes. Named fields, because the
+/// two probes have the same type and swapping them silently turns
+/// "originals only" into a full catalogue.
+#[derive(Debug, Clone, Copy)]
+pub struct NetflixTitleStatuses {
+    /// A licensed (non-Netflix-produced) title: present only where the full
+    /// catalogue is.
+    pub licensed: StatusCode,
+    /// A Netflix original: present wherever Netflix works at all.
+    pub original: StatusCode,
+}
+
+pub fn classify_netflix(statuses: NetflixTitleStatuses) -> ServiceState {
+    match (
+        statuses.licensed == StatusCode::OK,
+        statuses.original == StatusCode::OK,
+    ) {
         (true, _) => ServiceState::Available,
         (false, true) => ServiceState::Restricted,
         (false, false) => ServiceState::Blocked,
@@ -172,7 +188,7 @@ pub const fn claude_unavailable_markers() -> &'static [&'static str] {
 }
 
 pub fn classify_claude(
-    status: u16,
+    status: StatusCode,
     body: &str,
     markers: &[&str],
 ) -> ServiceState {
@@ -183,19 +199,19 @@ pub fn classify_claude(
     if markers.iter().any(|m| lower.contains(&m.to_lowercase())) {
         return ServiceState::Blocked;
     }
-    if status == 403 {
+    if status == StatusCode::FORBIDDEN {
         return ServiceState::Error(
             "HTTP 403 without the region page, so the cause is unknown".into(),
         );
     }
-    if (200..400).contains(&status) {
+    if status.is_success() || status.is_redirection() {
         ServiceState::Available
     } else {
         ServiceState::Error(format!("unexpected HTTP {status}"))
     }
 }
 
-pub fn classify_tiktok(status: u16, body: &str) -> ServiceState {
+pub fn classify_tiktok(status: StatusCode, body: &str) -> ServiceState {
     if [
         "service is currently unavailable in your region",
         "tiktok is not available in your country",
@@ -206,104 +222,43 @@ pub fn classify_tiktok(status: u16, body: &str) -> ServiceState {
     .any(|marker| contains_ci(body, marker))
     {
         ServiceState::Blocked
-    } else if (200..400).contains(&status) {
+    } else if status.is_success() || status.is_redirection() {
         ServiceState::Available
     } else {
         ServiceState::Error(format!("unexpected HTTP {status}"))
     }
 }
 
-pub fn judge_services_fail(states: &[(&str, ServiceState)]) -> Verdict {
-    let unavailable: Vec<&str> = states
-        .iter()
-        .filter(|(_, state)| matches!(state, ServiceState::Unavailable(_)))
-        .map(|(name, _)| *name)
-        .collect();
-    if !unavailable.is_empty() {
-        return Verdict::error(format!(
-            "unavailable: {}",
-            unavailable.join(", ")
-        ));
+/// Judges one primary service (a `service:*` gate that may FAIL the scan).
+/// The gate id already names the service, so the detail carries only the
+/// state and, for an unjudgeable probe, the reason.
+pub fn judge_service_fail(state: &ServiceState) -> Verdict {
+    match state {
+        ServiceState::Available => Verdict::ok("available"),
+        ServiceState::Restricted => Verdict::warn("restricted"),
+        ServiceState::Blocked => Verdict::fail("blocked"),
+        ServiceState::Error(reason) => {
+            Verdict::warn(format!("could not be judged: {reason}"))
+        }
+        ServiceState::Unavailable(reason) => {
+            Verdict::error(format!("unavailable: {reason}"))
+        }
     }
-    let blocked: Vec<&str> = states
-        .iter()
-        .filter(|(_, s)| *s == ServiceState::Blocked)
-        .map(|(n, _)| *n)
-        .collect();
-    if !blocked.is_empty() {
-        return Verdict::fail(format!("blocked: {}", blocked.join(", ")));
-    }
-    let errored: Vec<&str> = states
-        .iter()
-        .filter(|(_, s)| matches!(s, ServiceState::Error(_)))
-        .map(|(n, _)| *n)
-        .collect();
-    if !errored.is_empty() {
-        return Verdict::warn(format!(
-            "could not be judged (likely a challenge page): {}",
-            errored.join(", ")
-        ));
-    }
-    Verdict::ok(format!(
-        "available: {}",
-        states
-            .iter()
-            .map(|(n, _)| *n)
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))
 }
 
-pub fn judge_services_warn(states: &[(&str, ServiceState)]) -> Verdict {
-    let unavailable: Vec<&str> = states
-        .iter()
-        .filter(|(_, state)| matches!(state, ServiceState::Unavailable(_)))
-        .map(|(name, _)| *name)
-        .collect();
-    if !unavailable.is_empty() {
-        return Verdict::error(format!(
-            "unavailable: {}",
-            unavailable.join(", ")
-        ));
-    }
-    let inconclusive: Vec<&str> = states
-        .iter()
-        .filter(|(_, state)| matches!(state, ServiceState::Error(_)))
-        .map(|(name, _)| *name)
-        .collect();
-    if !inconclusive.is_empty() {
-        return Verdict::warn(format!(
-            "could not be judged: {}",
-            inconclusive.join(", ")
-        ));
-    }
-    let flagged: Vec<String> = states
-        .iter()
-        .filter(|(_, s)| {
-            matches!(s, ServiceState::Blocked | ServiceState::Restricted)
-        })
-        .map(|(n, s)| {
-            format!(
-                "{n} ({})",
-                if matches!(s, ServiceState::Restricted) {
-                    "restricted"
-                } else {
-                    "blocked"
-                }
-            )
-        })
-        .collect();
-    if flagged.is_empty() {
-        Verdict::ok(format!(
-            "clean: {}",
-            states
-                .iter()
-                .map(|(n, _)| *n)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))
-    } else {
-        Verdict::warn(flagged.join(", "))
+/// Judges one secondary service: a block is worth a warning, never a FAIL,
+/// because losing it does not disqualify the exit on its own.
+pub fn judge_service_warn(state: &ServiceState) -> Verdict {
+    match state {
+        ServiceState::Available => Verdict::ok("available"),
+        ServiceState::Restricted => Verdict::warn("restricted"),
+        ServiceState::Blocked => Verdict::warn("blocked"),
+        ServiceState::Error(reason) => {
+            Verdict::warn(format!("could not be judged: {reason}"))
+        }
+        ServiceState::Unavailable(reason) => {
+            Verdict::error(format!("unavailable: {reason}"))
+        }
     }
 }
 
@@ -318,6 +273,10 @@ mod tests {
 
     fn url(raw: &str) -> Url {
         Url::parse(raw).unwrap()
+    }
+
+    fn status(code: u16) -> StatusCode {
+        StatusCode::from_u16(code).unwrap()
     }
 
     #[rstest]
@@ -343,7 +302,7 @@ mod tests {
         #[case] sut: &str,
         #[case] expected: ServiceState,
     ) {
-        let actual = classify_chatgpt_app(200, sut);
+        let actual = classify_chatgpt_app(status(200), sut);
 
         assert_eq!(actual, expected);
     }
@@ -352,7 +311,7 @@ mod tests {
     fn chatgpt_app_treats_a_cloudflare_challenge_as_unproven_not_blocked() {
         let sut = CLOUDFLARE_CHALLENGE;
 
-        let actual = classify_chatgpt_app(403, sut);
+        let actual = classify_chatgpt_app(status(403), sut);
 
         assert!(matches!(actual, ServiceState::Error(_)), "{actual:?}");
     }
@@ -402,7 +361,7 @@ mod tests {
         #[case] sut: &str,
         #[case] expected: ServiceState,
     ) {
-        let actual = classify_gemini(200, sut);
+        let actual = classify_gemini(status(200), sut);
 
         assert_eq!(actual, expected);
     }
@@ -413,10 +372,10 @@ mod tests {
     #[case::only_a_decoy(200, r#"preamble ,200,"ABC" trailer"#)]
     #[case::cloudflare_challenge(403, CLOUDFLARE_CHALLENGE)]
     fn gemini_without_a_readable_region_is_an_error_not_a_verdict(
-        #[case] status: u16,
+        #[case] code: u16,
         #[case] sut: &str,
     ) {
-        let actual = classify_gemini(status, sut);
+        let actual = classify_gemini(status(code), sut);
 
         assert!(matches!(actual, ServiceState::Error(_)), "{actual:?}");
     }
@@ -434,7 +393,7 @@ mod tests {
         #[case] sut: &str,
         #[case] expected: ServiceState,
     ) {
-        let actual = classify_notebooklm(302, &url(sut), "");
+        let actual = classify_notebooklm(status(302), &url(sut), "");
 
         assert_eq!(actual, expected);
     }
@@ -457,38 +416,33 @@ mod tests {
         ""
     )]
     fn notebooklm_does_not_trust_anything_but_the_structured_redirect(
-        #[case] status: u16,
+        #[case] code: u16,
         #[case] sut: &str,
         #[case] body: &str,
     ) {
-        let actual = classify_notebooklm(status, &url(sut), body);
+        let actual = classify_notebooklm(status(code), &url(sut), body);
 
         assert!(matches!(actual, ServiceState::Error(_)), "{actual:?}");
     }
 
     #[rstest]
-    #[case::full_catalogue((200, "ok", 200, "ok"), ServiceState::Available)]
+    #[case::full_catalogue(
+        NetflixTitleStatuses { licensed: status(200), original: status(200) },
+        ServiceState::Available
+    )]
     #[case::originals_only(
-        (404, "not found", 200, "ok"),
+        NetflixTitleStatuses { licensed: status(404), original: status(200) },
         ServiceState::Restricted
     )]
     #[case::nothing(
-        (404, "not found", 404, "not found"),
+        NetflixTitleStatuses { licensed: status(404), original: status(404) },
         ServiceState::Blocked
     )]
     fn netflix_distinguishes_full_catalogue_from_originals_only(
-        #[case] sut: (u16, &str, u16, &str),
+        #[case] sut: NetflixTitleStatuses,
         #[case] expected: ServiceState,
     ) {
-        let (licensed_status, licensed_body, original_status, original_body) =
-            sut;
-
-        let actual = classify_netflix(
-            licensed_status,
-            licensed_body,
-            original_status,
-            original_body,
-        );
+        let actual = classify_netflix(sut);
 
         assert_eq!(actual, expected);
     }
@@ -507,7 +461,8 @@ mod tests {
         #[case] sut: &str,
         #[case] expected: ServiceState,
     ) {
-        let actual = classify_claude(200, sut, claude_unavailable_markers());
+        let actual =
+            classify_claude(status(200), sut, claude_unavailable_markers());
 
         assert_eq!(actual, expected);
     }
@@ -516,7 +471,8 @@ mod tests {
     fn claude_403_without_the_region_page_is_unproven_not_blocked() {
         let sut = "generic forbidden";
 
-        let actual = classify_claude(403, sut, claude_unavailable_markers());
+        let actual =
+            classify_claude(status(403), sut, claude_unavailable_markers());
 
         assert!(matches!(actual, ServiceState::Error(_)), "{actual:?}");
     }
@@ -531,69 +487,63 @@ mod tests {
         #[case] sut: &str,
         #[case] expected: ServiceState,
     ) {
-        let actual = classify_tiktok(200, sut);
+        let actual = classify_tiktok(status(200), sut);
 
         assert_eq!(actual, expected);
     }
 
     #[rstest]
-    #[case::all_available(
-        vec![
-            ("chatgpt_web", ServiceState::Available),
-            ("gemini", ServiceState::Available),
-        ],
-        Severity::Ok
-    )]
-    #[case::one_blocked(
-        vec![
-            ("chatgpt_web", ServiceState::Blocked),
-            ("gemini", ServiceState::Available),
-        ],
-        Severity::Fail
-    )]
-    #[case::one_inconclusive(
-        vec![
-            ("chatgpt_web", ServiceState::Error("challenge".into())),
-            ("gemini", ServiceState::Available),
-        ],
+    #[case::available(ServiceState::Available, Severity::Ok)]
+    #[case::blocked(ServiceState::Blocked, Severity::Fail)]
+    #[case::inconclusive(
+        ServiceState::Error("challenge".into()),
         Severity::Warn
     )]
     #[case::unreachable_is_an_error_not_a_weak_verdict(
-        vec![("gemini", ServiceState::Unavailable("timeout".into()))],
+        ServiceState::Unavailable("timeout".into()),
         Severity::Error
     )]
-    fn judge_services_fail_fails_on_any_blocked_and_warns_on_any_error(
-        #[case] sut: Vec<(&'static str, ServiceState)>,
+    fn judge_service_fail_fails_on_blocked_and_warns_on_an_unjudged_probe(
+        #[case] sut: ServiceState,
         #[case] expected: Severity,
     ) {
-        let verdict = judge_services_fail(&sut);
+        let verdict = judge_service_fail(&sut);
 
         assert_eq!(verdict.severity, expected, "{}", verdict.detail);
     }
 
     #[rstest]
-    #[case::clean(vec![("netflix", ServiceState::Available)], Severity::Ok)]
-    #[case::restricted_and_blocked(
-        vec![
-            ("netflix", ServiceState::Restricted),
-            ("claude", ServiceState::Blocked),
-        ],
-        Severity::Warn
-    )]
+    #[case::available(ServiceState::Available, Severity::Ok)]
+    #[case::restricted(ServiceState::Restricted, Severity::Warn)]
+    #[case::blocked_only_warns(ServiceState::Blocked, Severity::Warn)]
     #[case::inconclusive(
-        vec![("claude", ServiceState::Error("challenge".into()))],
+        ServiceState::Error("challenge".into()),
         Severity::Warn
     )]
     #[case::unreachable_is_an_error_not_a_weak_verdict(
-        vec![("claude", ServiceState::Unavailable("timeout".into()))],
+        ServiceState::Unavailable("timeout".into()),
         Severity::Error
     )]
-    fn judge_services_warn_never_fails_only_warns_on_blocked_or_restricted(
-        #[case] sut: Vec<(&'static str, ServiceState)>,
+    fn judge_service_warn_never_fails_whatever_the_state(
+        #[case] sut: ServiceState,
         #[case] expected: Severity,
     ) {
-        let verdict = judge_services_warn(&sut);
+        let verdict = judge_service_warn(&sut);
 
         assert_eq!(verdict.severity, expected, "{}", verdict.detail);
+    }
+
+    /// The reason a probe could not be judged used to be dropped on the
+    /// floor; the single-service judges carry it into the report row.
+    #[test]
+    fn an_unjudged_probe_carries_its_reason_into_the_detail() {
+        let sut = ServiceState::Error("Cloudflare challenged".into());
+
+        let verdict = judge_service_fail(&sut);
+
+        assert_eq!(
+            verdict.detail,
+            "could not be judged: Cloudflare challenged"
+        );
     }
 }

@@ -13,37 +13,15 @@
 
 use std::process::Command;
 
-/// Every gate a full scan owes a row for. A scan that silently drops one is
-/// the failure this test exists to catch — a missing row reads as "checked
-/// and fine" to whoever runs the rotation.
-const EXPECTED_GATES: [&str; 26] = [
-    "reputation",
-    "reputation:operator",
-    "blocklists",
-    "geo",
-    "provenance",
-    "latency",
-    "reach",
-    "steal",
-    "neighbors",
-    "neighbors-ptr",
-    "tampering",
-    "service-geo",
-    "service-geo:captcha",
-    "service-geo:cdn",
-    "service:chatgpt_web",
-    "service:chatgpt_app",
-    "service:gemini",
-    "service:youtube_premium",
-    "service:netflix",
-    "service:claude",
-    "service:tiktok",
-    "service:notebooklm",
-    "ai:openai",
-    "ai:anthropic",
-    "ai:gemini",
-    "ai:deepseek",
-];
+/// Every gate a full scan owes a row for, straight from the registry that
+/// the scan itself is built on. A scan that silently drops one is the
+/// failure this test exists to catch — a missing row reads as "checked and
+/// fine" to whoever runs the rotation.
+fn expected_gates() -> Vec<&'static str> {
+    chip_core::gate::scan_gates()
+        .map(chip_core::GateId::as_str)
+        .collect()
+}
 
 #[test]
 #[ignore = "needs a live candidate in CHIP_LIVE_IP and Globalping quota"]
@@ -80,7 +58,7 @@ fn a_full_scan_reports_every_gate_and_exits_with_a_pipeline_code() {
         .iter()
         .map(|result| result["gate"].as_str().expect("a gate id"))
         .collect();
-    for gate in EXPECTED_GATES {
+    for gate in expected_gates() {
         assert!(reported.contains(&gate), "no row for {gate}: {reported:?}");
     }
     assert_eq!(

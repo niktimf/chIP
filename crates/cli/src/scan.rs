@@ -3,11 +3,10 @@ use std::num::NonZeroU16;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chip_core::gate;
 use chip_core::ip_lists::RknRegistry;
-use chip_core::model::{
-    PingSweepFacts, ReputationFacts, RiskScore, ServiceState,
-};
-use chip_core::verdict::ai::judge_ai_endpoints;
+use chip_core::model::{PingSweepFacts, ReputationFacts, ServiceState};
+use chip_core::verdict::ai::judge_ai_endpoint;
 use chip_core::verdict::blocklists::judge_blocklists;
 use chip_core::verdict::geo::judge_geo;
 use chip_core::verdict::latency::judge_latency;
@@ -23,11 +22,12 @@ use chip_core::verdict::rkn_registry::judge_rkn_registry;
 use chip_core::verdict::service_geo::{
     judge_cdn_edge, judge_search_captcha, judge_service_country,
 };
-use chip_core::verdict::services::{judge_services_fail, judge_services_warn};
+use chip_core::verdict::services::{judge_service_fail, judge_service_warn};
 use chip_core::verdict::steal::{judge_steal, steal_pct};
 use chip_core::verdict::tampering::judge_tampering;
 use chip_core::{
-    CheckResult, CountryCode, GateScope, Report, ScanProfile, Severity, Verdict,
+    CheckResult, CountryCode, GateId, GateScope, Report, ScanProfile, Severity,
+    Verdict,
 };
 use chip_io::atlas::{
     Anchor, AnchorClient, select_for_city, select_for_country,
@@ -42,7 +42,9 @@ use chip_io::neighbors::{SweepConfig, sweep};
 use chip_io::proxycheck::ProxycheckClient;
 use chip_io::ripestat::RipestatClient;
 use chip_io::rkn_registry::{RknRegistryClient, RknRegistryError};
-use chip_io::ssh::{ListenerOutcome, SocksTunnel, SshConfig, SshSession};
+use chip_io::ssh::{
+    ListenerOutcome, SocksTunnel, SshConfig, SshSession, verify_listener,
+};
 use chip_io::tunnel::{
     TunnelClient, probe_ai_endpoints, probe_cdn_edges, probe_chatgpt_app,
     probe_chatgpt_web, probe_claude, probe_country_votes, probe_gemini,
@@ -55,9 +57,11 @@ use crate::config::ScanCommand;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const GLOBALPING_DEADLINE: Duration = Duration::from_secs(90);
-const SERVICE_COUNTRY_FAIL_ON: &[&str] = &["google", "youtube"];
 
-/// All producers are polled in this scope; the short collector lock is never held across await.
+/// Shared collector for phase B. Every async producer records its rows here
+/// as soon as they are known and returns nothing, so what was measured
+/// survives the phase deadline cancelling whatever is still in flight. The
+/// short lock is never held across an await.
 #[derive(Default)]
 struct ScanProgress(Mutex<Vec<CheckResult>>);
 
@@ -67,13 +71,6 @@ impl ScanProgress {
             .lock()
             .expect("result collector cannot be poisoned")
             .extend(results);
-    }
-
-    async fn record(
-        &self,
-        work: impl std::future::Future<Output = Vec<CheckResult>>,
-    ) {
-        self.add(work.await);
     }
 
     fn finish(self) -> Vec<CheckResult> {
@@ -89,16 +86,15 @@ impl ScanProgress {
         );
         let mut results =
             self.0.lock().expect("result collector cannot be poisoned");
-        for gate in ["latency", "reach", "steal"]
-            .into_iter()
-            .chain(TUNNEL_GATES)
-            .chain(NEIGHBOR_GATES)
-        {
+        for gate in gate::phase_b_gates() {
             if !results.iter().any(|result| result.gate == gate) {
                 results.push(CheckResult::new(gate, Verdict::error(&detail)));
             }
         }
-        results.push(CheckResult::new("scan-deadline", Verdict::error(detail)));
+        results.push(CheckResult::new(
+            gate::SCAN_DEADLINE,
+            Verdict::error(detail),
+        ));
     }
 }
 
@@ -147,19 +143,11 @@ fn reputation_results(
             let detail = error.to_string();
             (Verdict::error(detail.clone()), Verdict::error(detail))
         },
-        |facts| {
-            (
-                judge_reputation(
-                    &facts,
-                    RiskScore::new(50).expect("50 is a valid risk score"),
-                ),
-                judge_reputation_operator(&facts),
-            )
-        },
+        |facts| (judge_reputation(&facts), judge_reputation_operator(&facts)),
     );
     vec![
-        CheckResult::new("reputation", flags),
-        CheckResult::new("reputation:operator", operator),
+        CheckResult::new(gate::REPUTATION, flags),
+        CheckResult::new(gate::REPUTATION_OPERATOR, operator),
     ]
 }
 
@@ -195,39 +183,27 @@ pub async fn run_phase_a(
     let ripestat_client = RipestatClient::new(http.clone());
     let block_lists_client = BlockListsClient::new(http.clone());
     let registry_client = RknRegistryClient::new(http.clone());
-    let profile = command.profile();
-    let geo = async {
-        match profile.scope("geo") {
-            GateScope::Judged => {
-                let verdict = geo_client.consensus(ip).await.map_or_else(
-                    |error| {
-                        Verdict::error(format!("GeoIP task failed: {error}"))
-                    },
-                    |facts| judge_geo(&facts, command.country()),
-                );
-                CheckResult::new("geo", verdict)
-            }
-            GateScope::Skipped(reason) => CheckResult::skipped("geo", reason),
-        }
-    };
 
     let (reputation, block_lists, registry, geo, provenance) = tokio::join!(
         reputation_client.lookup(ip),
         block_lists_client.fetch(),
         registry_client.fetch(),
-        geo,
+        geo_result(&geo_client, command),
         ripestat_client.routing_status(ip)
     );
 
     let mut results = reputation_results(reputation);
     results.extend([
         CheckResult::new(
-            "blocklists",
+            gate::BLOCKLISTS,
             judge_blocklists(&block_lists.check(ip)),
         ),
-        CheckResult::new("rkn-registry", rkn_registry_verdict(registry, ip)),
         CheckResult::new(
-            "provenance",
+            gate::RKN_REGISTRY,
+            rkn_registry_verdict(registry, ip),
+        ),
+        CheckResult::new(
+            gate::PROVENANCE,
             provenance.map_or_else(
                 |error| Verdict::error(error.to_string()),
                 |routing| judge_routing(&routing),
@@ -238,31 +214,54 @@ pub async fn run_phase_a(
     results
 }
 
-fn manual_anchor(ip: Ipv4Addr, country: CountryCode) -> Anchor {
-    Anchor {
-        fqdn: "manual".to_string(),
-        ip_v4: ip,
-        city: String::new(),
-        country,
-        as_v4: 0,
+async fn geo_result(
+    geo_client: &GeoIpClient,
+    command: &ScanCommand,
+) -> CheckResult {
+    match command.profile().scope(gate::GEO) {
+        GateScope::Judged => {
+            let verdict = geo_client.consensus(command.ip()).await.map_or_else(
+                |error| Verdict::error(format!("GeoIP task failed: {error}")),
+                |facts| judge_geo(&facts, command.country()),
+            );
+            CheckResult::new(gate::GEO, verdict)
+        }
+        GateScope::Skipped(reason) => CheckResult::skipped(gate::GEO, reason),
+    }
+}
+
+/// One ping destination of the latency gate: a city anchor from Atlas or the
+/// `--anchor` override. It carries only what the measurement needs, so the
+/// override does not have to fake an Atlas anchor's city and AS metadata.
+struct PingTarget {
+    label: String,
+    ip: Ipv4Addr,
+}
+
+impl From<&Anchor> for PingTarget {
+    fn from(anchor: &Anchor) -> Self {
+        Self {
+            label: anchor.fqdn.clone(),
+            ip: anchor.ip_v4,
+        }
     }
 }
 
 async fn anchor_measurements(
     client: &GlobalpingClient,
     first_measurement_id: &MeasurementId,
-    anchors: &[Anchor],
+    targets: &[PingTarget],
 ) -> Result<
     Vec<(String, chip_io::globalping::RawMeasurement)>,
     tokio::task::JoinError,
 > {
     let client = Arc::new(client.clone());
     let mut tasks = tokio::task::JoinSet::new();
-    for anchor in anchors {
+    for target in targets {
         let client = Arc::clone(&client);
         let sample = first_measurement_id.clone();
-        let label = anchor.fqdn.clone();
-        let target = anchor.ip_v4;
+        let label = target.label.clone();
+        let target = target.ip;
         tasks.spawn(async move {
             let id = client
                 .create(
@@ -288,29 +287,20 @@ async fn anchor_measurements(
     Ok(measurements)
 }
 
-async fn reach_measurement(
+async fn reach_verdict(
     client: &GlobalpingClient,
     first_measurement_id: &MeasurementId,
     candidate: Ipv4Addr,
-    candidate_port: u16,
-    control: Option<&Anchor>,
-) -> CheckResult {
+    candidate_port: NonZeroU16,
+    control: Option<Ipv4Addr>,
+) -> Verdict {
     let Some(control) = control else {
-        return CheckResult::new(
-            "reach",
-            Verdict::error("no HTTPS control anchor available"),
-        );
+        return Verdict::error("no HTTPS control anchor available");
     };
     let locations = Locations::reuse(first_measurement_id.clone());
-    let Some(candidate_port) = NonZeroU16::new(candidate_port) else {
-        return CheckResult::new(
-            "reach",
-            Verdict::error("candidate listener port cannot be zero"),
-        );
-    };
     let candidate_kind = MeasurementKind::https(candidate, candidate_port);
     let control_kind = MeasurementKind::https(
-        control.ip_v4,
+        control,
         NonZeroU16::new(443).expect("443 is non-zero"),
     );
     let (candidate_id, control_id) = tokio::join!(
@@ -320,10 +310,7 @@ async fn reach_measurement(
     let (candidate_id, control_id) = match (candidate_id, control_id) {
         (Ok(candidate_id), Ok(control_id)) => (candidate_id, control_id),
         (Err(error), _) | (_, Err(error)) => {
-            return CheckResult::new(
-                "reach",
-                Verdict::error(error.to_string()),
-            );
+            return Verdict::error(error.to_string());
         }
     };
     let (candidate, control) = tokio::join!(
@@ -331,34 +318,34 @@ async fn reach_measurement(
         client.poll_until_finished(&control_id, GLOBALPING_DEADLINE)
     );
     match (candidate, control) {
-        (Ok(candidate), Ok(control)) => CheckResult::new(
-            "reach",
-            judge_reach(&reach_facts(&candidate, &control)),
-        ),
-        (Err(error), _) | (_, Err(error)) => {
-            CheckResult::new("reach", Verdict::error(error.to_string()))
+        (Ok(candidate), Ok(control)) => {
+            judge_reach(&reach_facts(&candidate, &control))
         }
+        (Err(error), _) | (_, Err(error)) => Verdict::error(error.to_string()),
     }
 }
 
-async fn latency_results(
+async fn record_latency(
     client: &GlobalpingClient,
     command: &ScanCommand,
     candidate_id: &MeasurementId,
     candidate: &chip_io::globalping::RawMeasurement,
-    city_anchors: &[Anchor],
-) -> Vec<CheckResult> {
-    if !command.profile().judges("latency") {
-        return command.profile().skipped(["latency"]);
+    city_targets: &[PingTarget],
+    progress: &ScanProgress,
+) {
+    if !command.profile().judges(gate::LATENCY) {
+        progress.add(command.profile().skipped([gate::LATENCY]));
+        return;
     }
     let anchors =
-        match anchor_measurements(client, candidate_id, city_anchors).await {
+        match anchor_measurements(client, candidate_id, city_targets).await {
             Ok(anchors) => anchors,
             Err(error) => {
-                return vec![CheckResult::new(
-                    "latency",
+                progress.add([CheckResult::new(
+                    gate::LATENCY,
                     Verdict::error(format!("anchor task failed: {error}")),
-                )];
+                )]);
+                return;
             }
         };
     let latency = ping_sweep_facts(candidate, &anchors).map_or_else(
@@ -367,130 +354,96 @@ async fn latency_results(
             judge_latency(&facts, command.latency_thresholds())
         },
     );
-    vec![CheckResult::new("latency", latency)]
+    progress.add([CheckResult::new(gate::LATENCY, latency)]);
 }
 
 async fn run_globalping_measurements(
     client: &GlobalpingClient,
     command: &ScanCommand,
-    city_anchors: &[Anchor],
-    listener: Option<u16>,
-    control_anchor: Option<&Anchor>,
+    city_targets: &[PingTarget],
+    listener: Option<NonZeroU16>,
+    control: Option<Ipv4Addr>,
     progress: &ScanProgress,
-) -> Vec<CheckResult> {
+) {
     // Without a listener the candidate ping would only feed the latency gate.
-    if listener.is_none() && !command.profile().judges("latency") {
-        return command.profile().skipped(["latency"]);
+    if listener.is_none() && !command.profile().judges(gate::LATENCY) {
+        progress.add(command.profile().skipped([gate::LATENCY]));
+        return;
     }
     let probes = command.probes();
     let locations = match Locations::ru(probes.eyeball(), probes.datacenter()) {
         Ok(locations) => locations,
-        Err(error) => return unavailable_globalping_results(&error, listener),
+        Err(error) => {
+            progress.add(unavailable_globalping_results(&error, listener));
+            return;
+        }
     };
     let candidate_id = match client
         .create(&MeasurementKind::ping(command.ip()), &locations)
         .await
     {
         Ok(id) => id,
-        Err(error) => return unavailable_globalping_results(&error, listener),
+        Err(error) => {
+            progress.add(unavailable_globalping_results(&error, listener));
+            return;
+        }
     };
     let candidate = match client
         .poll_until_finished(&candidate_id, GLOBALPING_DEADLINE)
         .await
     {
         Ok(measurement) => measurement,
-        Err(error) => return unavailable_globalping_results(&error, listener),
+        Err(error) => {
+            progress.add(unavailable_globalping_results(&error, listener));
+            return;
+        }
     };
-    progress
-        .record(latency_results(
-            client,
-            command,
-            &candidate_id,
-            &candidate,
-            city_anchors,
-        ))
-        .await;
+    record_latency(
+        client,
+        command,
+        &candidate_id,
+        &candidate,
+        city_targets,
+        progress,
+    )
+    .await;
     if let Some(port) = listener {
-        progress.add([reach_measurement(
-            client,
-            &candidate_id,
-            command.ip(),
-            port,
-            control_anchor,
-        )
-        .await]);
+        let verdict =
+            reach_verdict(client, &candidate_id, command.ip(), port, control)
+                .await;
+        progress.add([CheckResult::new(gate::REACH, verdict)]);
     }
-    Vec::new()
 }
 
 fn unavailable_globalping_results(
     error: &impl ToString,
-    listener: Option<u16>,
+    listener: Option<NonZeroU16>,
 ) -> Vec<CheckResult> {
     let detail = error.to_string();
-    let mut results =
-        vec![CheckResult::new("latency", Verdict::error(detail.clone()))];
+    let mut results = vec![CheckResult::new(
+        gate::LATENCY,
+        Verdict::error(detail.clone()),
+    )];
     if listener.is_some() {
-        results.push(CheckResult::new("reach", Verdict::error(detail)));
+        results.push(CheckResult::new(gate::REACH, Verdict::error(detail)));
     }
     results
 }
 
-async fn verify_listener(ip: Ipv4Addr, port: u16) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|error| error.to_string())?;
-    client
-        .get(format!("https://{ip}:{port}/"))
-        .send()
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-/// Every gate that can only be judged through the SOCKS tunnel, so they are
-/// reported together whether they ran, were skipped, or could not run.
-const TUNNEL_GATES: [&str; 16] = [
-    "service:chatgpt_web",
-    "service:chatgpt_app",
-    "service:gemini",
-    "service:youtube_premium",
-    "service:netflix",
-    "service:claude",
-    "service:tiktok",
-    "service:notebooklm",
-    "tampering",
-    "service-geo",
-    "service-geo:captcha",
-    "service-geo:cdn",
-    "ai:openai",
-    "ai:anthropic",
-    "ai:gemini",
-    "ai:deepseek",
-];
-
-const NEIGHBOR_GATES: [&str; 2] = ["neighbors-ptr", "neighbors"];
-
 fn tunnel_results(verdict: &Verdict) -> Vec<CheckResult> {
-    TUNNEL_GATES
-        .into_iter()
+    gate::tunnel_gates()
         .map(|gate| CheckResult::new(gate, verdict.clone()))
         .collect()
 }
 
 async fn record_service(
     progress: &ScanProgress,
-    name: &str,
+    gate: GateId,
     work: impl std::future::Future<Output = ServiceState>,
-    judge: fn(&[(&str, ServiceState)]) -> Verdict,
+    judge: fn(&ServiceState) -> Verdict,
 ) {
     let state = work.await;
-    progress.add([CheckResult::new(
-        format!("service:{name}"),
-        judge(&[(name, state)]),
-    )]);
+    progress.add([CheckResult::new(gate, judge(&state))]);
 }
 
 async fn record_portal(client: &TunnelClient, progress: &ScanProgress) {
@@ -498,7 +451,7 @@ async fn record_portal(client: &TunnelClient, progress: &ScanProgress) {
         |error| Verdict::error(format!("portal task failed: {error}")),
         |(https, http)| judge_tampering(&https, &http),
     );
-    progress.add([CheckResult::new("tampering", verdict)]);
+    progress.add([CheckResult::new(gate::TAMPERING, verdict)]);
 }
 
 async fn run_tunnel_checks(
@@ -508,7 +461,7 @@ async fn run_tunnel_checks(
     progress: &ScanProgress,
 ) {
     if profile == ScanProfile::RuBridge {
-        progress.add(profile.skipped(TUNNEL_GATES));
+        progress.add(profile.skipped(gate::tunnel_gates()));
         record_portal(client, progress).await;
         return;
     }
@@ -527,27 +480,27 @@ async fn record_primary_services(
     tokio::join!(
         record_service(
             progress,
-            "chatgpt_web",
+            gate::SERVICE_CHATGPT_WEB,
             probe_chatgpt_web(client),
-            judge_services_fail
+            judge_service_fail
         ),
         record_service(
             progress,
-            "chatgpt_app",
+            gate::SERVICE_CHATGPT_APP,
             probe_chatgpt_app(client),
-            judge_services_fail
+            judge_service_fail
         ),
         record_service(
             progress,
-            "gemini",
+            gate::SERVICE_GEMINI,
             probe_gemini(client),
-            judge_services_fail
+            judge_service_fail
         ),
         record_service(
             progress,
-            "youtube_premium",
+            gate::SERVICE_YOUTUBE_PREMIUM,
             probe_youtube_premium(client),
-            judge_services_fail
+            judge_service_fail
         ),
     );
 }
@@ -559,27 +512,27 @@ async fn record_secondary_services(
     tokio::join!(
         record_service(
             progress,
-            "netflix",
+            gate::SERVICE_NETFLIX,
             probe_netflix(client),
-            judge_services_warn
+            judge_service_warn
         ),
         record_service(
             progress,
-            "claude",
+            gate::SERVICE_CLAUDE,
             probe_claude(client),
-            judge_services_warn
+            judge_service_warn
         ),
         record_service(
             progress,
-            "tiktok",
+            gate::SERVICE_TIKTOK,
             probe_tiktok(client),
-            judge_services_warn
+            judge_service_warn
         ),
         record_service(
             progress,
-            "notebooklm",
+            gate::SERVICE_NOTEBOOKLM,
             probe_notebooklm(client),
-            judge_services_warn
+            judge_service_warn
         ),
     );
 }
@@ -593,111 +546,141 @@ async fn record_service_geo(
         async {
             let votes = probe_country_votes(client).await;
             progress.add([CheckResult::new(
-                "service-geo",
-                judge_service_country(&votes, country, SERVICE_COUNTRY_FAIL_ON),
+                gate::SERVICE_GEO,
+                judge_service_country(&votes, country),
             )]);
         },
         async {
-            let (google, bing) = probe_search_captcha(client).await;
+            let (first, retry) = probe_search_captcha(client).await;
             progress.add([CheckResult::new(
-                "service-geo:captcha",
-                judge_search_captcha(&google, &bing),
+                gate::SERVICE_GEO_CAPTCHA,
+                judge_search_captcha(&first, &retry),
             )]);
         },
         async {
             let edges = probe_cdn_edges(client).await;
             progress.add([CheckResult::new(
-                "service-geo:cdn",
+                gate::SERVICE_GEO_CDN,
                 judge_cdn_edge(&edges),
             )]);
         },
         async {
             let states = probe_ai_endpoints(client).await;
-            progress.add(states.into_iter().map(|(name, state)| {
+            progress.add([
                 CheckResult::new(
-                    format!("ai:{name}"),
-                    judge_ai_endpoints(&[(name, state)]),
-                )
-            }));
+                    gate::AI_OPENAI,
+                    judge_ai_endpoint(&states.openai),
+                ),
+                CheckResult::new(
+                    gate::AI_ANTHROPIC,
+                    judge_ai_endpoint(&states.anthropic),
+                ),
+                CheckResult::new(
+                    gate::AI_GEMINI,
+                    judge_ai_endpoint(&states.gemini),
+                ),
+                CheckResult::new(
+                    gate::AI_DEEPSEEK,
+                    judge_ai_endpoint(&states.deepseek),
+                ),
+            ]);
         },
     );
 }
 
-fn select_anchors(
+fn select_targets(
     command: &ScanCommand,
     anchors: &[Anchor],
-) -> (Vec<Anchor>, Vec<Anchor>) {
-    let city = command
-        .city()
-        .map_or_else(Vec::new, |city| select_for_city(anchors, city, 3));
-    let city = if city.is_empty() {
-        select_for_country(anchors, command.country(), 3)
-    } else {
-        city
-    };
-    let city = command
-        .anchor()
-        .map_or(city, |ip| vec![manual_anchor(ip, *command.country())]);
-    let reference = select_for_city(anchors, command.reference_city(), 2);
-    (city, reference)
+) -> (Vec<PingTarget>, Option<Ipv4Addr>) {
+    let city = command.anchor().map_or_else(
+        || {
+            let by_city = command.city().map_or_else(Vec::new, |city| {
+                select_for_city(anchors, city, 3)
+            });
+            let picked = if by_city.is_empty() {
+                select_for_country(anchors, command.country(), 3)
+            } else {
+                by_city
+            };
+            picked.iter().map(PingTarget::from).collect()
+        },
+        |ip| {
+            vec![PingTarget {
+                label: "manual".to_string(),
+                ip,
+            }]
+        },
+    );
+    let control = select_for_city(anchors, command.reference_city(), 2)
+        .first()
+        .map(|anchor| anchor.ip_v4);
+    (city, control)
 }
+
+const LISTENER_PORTS: [NonZeroU16; 2] = [
+    NonZeroU16::new(443).expect("443 is non-zero"),
+    NonZeroU16::new(8443).expect("8443 is non-zero"),
+];
 
 async fn start_listener(
     session: &SshSession,
     ip: Ipv4Addr,
-) -> (Option<u16>, Vec<CheckResult>) {
-    let mut results = Vec::new();
-    for port in [443, 8443] {
+    progress: &ScanProgress,
+) -> Option<NonZeroU16> {
+    for port in LISTENER_PORTS {
         match session.start_listener(port).await {
             Ok(ListenerOutcome::Listening) => {
                 match verify_listener(ip, port).await {
-                    Ok(()) => return (Some(port), results),
+                    Ok(()) => return Some(port),
                     Err(error) => {
                         let _ = session.stop_listener(port).await;
-                        let verdict = Verdict::error(format!(
-                            "temporary TLS listener is not reachable from the runner: {error}"
-                        ));
-                        results.push(CheckResult::new("reach", verdict));
-                        return (None, results);
+                        progress.add([CheckResult::new(
+                            gate::REACH,
+                            Verdict::error(format!(
+                                "temporary TLS listener is not reachable from the runner: {error}"
+                            )),
+                        )]);
+                        return None;
                     }
                 }
             }
             Ok(ListenerOutcome::PortInUse) => {}
             Ok(ListenerOutcome::Failed(detail)) => {
-                results.push(CheckResult::new(
-                    "reach",
+                progress.add([CheckResult::new(
+                    gate::REACH,
                     Verdict::error(format!("listener failed: {detail}")),
-                ));
-                return (None, results);
+                )]);
+                return None;
             }
             Err(error) => {
-                results.push(CheckResult::new("reach", ssh_failure(error)));
-                return (None, results);
+                progress
+                    .add([CheckResult::new(gate::REACH, ssh_failure(error))]);
+                return None;
             }
         }
     }
-    results.push(CheckResult::new(
-        "reach",
+    progress.add([CheckResult::new(
+        gate::REACH,
         Verdict::error("candidate ports 443 and 8443 are already in use"),
-    ));
-    (None, results)
+    )]);
+    None
 }
 
 struct GlobalpingSources {
     client: GlobalpingClient,
-    city_anchors: Vec<Anchor>,
-    reference_anchors: Vec<Anchor>,
+    city_targets: Vec<PingTarget>,
+    control: Option<Ipv4Addr>,
 }
 
 struct GlobalpingSetupError {
-    gate: &'static str,
+    gate: GateId,
     detail: String,
 }
 
 struct SshSetup {
     session: Option<SshSession>,
     config: SshConfig,
-    listener_port: Option<u16>,
+    listener_port: Option<NonZeroU16>,
 }
 
 impl SshSetup {
@@ -714,12 +697,22 @@ impl SshSetup {
         let port = session.listener_port()?;
         match session.stop_listener(port).await {
             Ok(()) => {
-                tracing::debug!(port, "temporary listener stopped");
+                tracing::debug!(
+                    port = port.get(),
+                    "temporary listener stopped"
+                );
                 None
             }
             Err(error) => {
-                tracing::warn!(port, error = %error, "temporary listener cleanup failed");
-                Some(CheckResult::new("listener-cleanup", ssh_failure(error)))
+                tracing::warn!(
+                    port = port.get(),
+                    error = %error,
+                    "temporary listener cleanup failed"
+                );
+                Some(CheckResult::new(
+                    gate::LISTENER_CLEANUP,
+                    ssh_failure(error),
+                ))
             }
         }
     }
@@ -727,9 +720,7 @@ impl SshSetup {
 
 fn skipped_ssh_results() -> Vec<CheckResult> {
     const REASON: &str = "--no-ssh: nothing was measured from the candidate";
-    std::iter::once("reach")
-        .chain(TUNNEL_GATES)
-        .chain(std::iter::once("steal"))
+    gate::ssh_gates()
         .map(|gate| CheckResult::skipped(gate, REASON))
         .collect()
 }
@@ -741,12 +732,13 @@ fn ssh_failure(error: chip_io::ssh::SshError) -> Verdict {
 
 fn unavailable_ssh_results(error: chip_io::ssh::SshError) -> Vec<CheckResult> {
     let detail = format!("SSH unavailable: {:#}", anyhow::Error::new(error));
-    let mut results =
-        vec![CheckResult::new("ssh", Verdict::error(detail.clone()))];
-    results.push(CheckResult::new("reach", Verdict::error(detail.clone())));
-    results.extend(tunnel_results(&Verdict::error(detail)));
-    results.push(CheckResult::new("steal", Verdict::error("SSH unavailable")));
-    results
+    std::iter::once(CheckResult::new(gate::SSH, Verdict::error(detail.clone())))
+        .chain(
+            gate::ssh_gates().map(|gate| {
+                CheckResult::new(gate, Verdict::error(detail.clone()))
+            }),
+        )
+        .collect()
 }
 
 #[tracing::instrument(
@@ -770,7 +762,7 @@ async fn prepare_globalping(
                 < globalping_budget(probes.eyeball(), probes.datacenter()) =>
         {
             return Err(GlobalpingSetupError {
-                gate: "globalping-quota",
+                gate: gate::GLOBALPING_QUOTA,
                 detail: format!(
                     "only {} Globalping tests remain; need approximately {}",
                     limits.remaining,
@@ -780,7 +772,7 @@ async fn prepare_globalping(
         }
         Err(error) => {
             return Err(GlobalpingSetupError {
-                gate: "globalping-quota",
+                gate: gate::GLOBALPING_QUOTA,
                 detail: format!("could not read Globalping quota: {error}"),
             });
         }
@@ -792,14 +784,14 @@ async fn prepare_globalping(
             .anchors()
             .await
             .map_err(|error| GlobalpingSetupError {
-                gate: "latency",
+                gate: gate::LATENCY,
                 detail: format!("could not load RIPE Atlas anchors: {error}"),
             })?;
-    let (city_anchors, reference_anchors) = select_anchors(command, &anchors);
+    let (city_targets, control) = select_targets(command, &anchors);
     Ok(GlobalpingSources {
         client: globalping,
-        city_anchors,
-        reference_anchors,
+        city_targets,
+        control,
     })
 }
 
@@ -823,58 +815,60 @@ fn ssh_config(command: &ScanCommand) -> SshConfig {
 async fn prepare_ssh(
     command: &ScanCommand,
     setup: &mut SshSetup,
-) -> Vec<CheckResult> {
+    progress: &ScanProgress,
+) {
     if !command.ssh_enabled() {
-        return Vec::new();
+        return;
     }
     let session = match SshSession::connect(command.ip(), &setup.config).await {
         Ok(session) => session,
-        Err(error) => return unavailable_ssh_results(error),
+        Err(error) => {
+            progress.add(unavailable_ssh_results(error));
+            return;
+        }
     };
     // Store the owner before any remote listener can be created. The session
     // records a pending port before starting the mutating remote command.
     let session = setup.session.insert(session);
-    let (listener_port, results) = start_listener(session, command.ip()).await;
-    setup.listener_port = listener_port;
-    results
+    setup.listener_port = start_listener(session, command.ip(), progress).await;
 }
 
 async fn run_globalping_branch(
     sources: Result<GlobalpingSources, GlobalpingSetupError>,
     command: &ScanCommand,
-    listener_port: Option<u16>,
+    listener_port: Option<NonZeroU16>,
     progress: &ScanProgress,
-) -> Vec<CheckResult> {
+) {
     match sources {
         Ok(sources) => {
             run_globalping_measurements(
                 &sources.client,
                 command,
-                &sources.city_anchors,
+                &sources.city_targets,
                 listener_port,
-                sources.reference_anchors.first(),
+                sources.control,
                 progress,
             )
-            .await
+            .await;
         }
         Err(error) => {
             let mut results = vec![CheckResult::new(
                 error.gate,
                 Verdict::error(error.detail.clone()),
             )];
-            if error.gate != "latency" {
+            if error.gate != gate::LATENCY {
                 results.push(CheckResult::new(
-                    "latency",
+                    gate::LATENCY,
                     Verdict::error(error.detail.clone()),
                 ));
             }
             if listener_port.is_some() {
                 results.push(CheckResult::new(
-                    "reach",
+                    gate::REACH,
                     Verdict::error(error.detail),
                 ));
             }
-            results
+            progress.add(results);
         }
     }
 }
@@ -883,27 +877,28 @@ async fn run_socks_checks(
     command: &ScanCommand,
     setup: &SshSetup,
     progress: &ScanProgress,
-) -> Vec<CheckResult> {
+) {
     let Some(_session) = &setup.session else {
-        return Vec::new();
+        return;
     };
     let port = match pick_free_port() {
         Ok(port) => port,
         Err(error) => {
-            return tunnel_results(&Verdict::error(format!(
+            progress.add(tunnel_results(&Verdict::error(format!(
                 "could not reserve a local SOCKS port: {error}"
-            )));
+            ))));
+            return;
         }
     };
     let tunnel =
         match SocksTunnel::start(command.ip(), &setup.config, port).await {
             Ok(tunnel) => tunnel,
             Err(error) => {
-                return tunnel_results(&ssh_failure(error));
+                progress.add(tunnel_results(&ssh_failure(error)));
+                return;
             }
         };
-    let results = match TunnelClient::new(tunnel.local_addr(), REQUEST_TIMEOUT)
-    {
+    match TunnelClient::new(tunnel.local_addr(), REQUEST_TIMEOUT) {
         Ok(client) => {
             Box::pin(run_tunnel_checks(
                 &client,
@@ -912,15 +907,15 @@ async fn run_socks_checks(
                 progress,
             ))
             .await;
-            Vec::new()
         }
-        Err(error) => tunnel_results(&Verdict::error(error.to_string())),
-    };
+        Err(error) => {
+            progress.add(tunnel_results(&Verdict::error(error.to_string())));
+        }
+    }
     tunnel.stop().await;
-    results
 }
 
-async fn run_steal_check(session: &SshSession) -> CheckResult {
+async fn run_steal_check(session: &SshSession, progress: &ScanProgress) {
     let verdict = match session.steal_snapshot().await {
         Ok(before) => {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -933,24 +928,21 @@ async fn run_steal_check(session: &SshSession) -> CheckResult {
         }
         Err(error) => ssh_failure(error),
     };
-    CheckResult::new("steal", verdict)
+    progress.add([CheckResult::new(gate::STEAL, verdict)]);
 }
 
 async fn run_ssh_checks(
     command: &ScanCommand,
     setup: &SshSetup,
     progress: &ScanProgress,
-) -> Vec<CheckResult> {
+) {
     let Some(session) = &setup.session else {
-        return Vec::new();
+        return;
     };
     tokio::join!(
-        progress.record(run_socks_checks(command, setup, progress)),
-        async {
-            progress.add([run_steal_check(session).await]);
-        }
+        run_socks_checks(command, setup, progress),
+        run_steal_check(session, progress),
     );
-    Vec::new()
 }
 
 #[tracing::instrument(
@@ -959,25 +951,19 @@ async fn run_ssh_checks(
     skip_all,
     fields(candidate_ip = %command.ip())
 )]
-async fn run_neighbor_checks(command: &ScanCommand) -> Vec<CheckResult> {
+async fn run_neighbor_checks(command: &ScanCommand, progress: &ScanProgress) {
     if !command.neighbors_enabled() {
-        return Vec::new();
+        return;
     }
     let ip = command.ip();
     let probes = match sweep(network_24(ip), &SweepConfig::default()).await {
         Ok(probes) => probes,
         Err(error) => {
-            return NEIGHBOR_GATES
-                .into_iter()
-                .map(|gate| {
-                    CheckResult::new(
-                        gate,
-                        Verdict::error(format!(
-                            "neighbor task failed: {error}"
-                        )),
-                    )
-                })
-                .collect();
+            let detail = format!("neighbor task failed: {error}");
+            progress.add(gate::neighbor_gates().map(|gate| {
+                CheckResult::new(gate, Verdict::error(detail.clone()))
+            }));
+            return;
         }
     };
     let candidate_ptr = probes.iter().find(|probe| probe.ip == ip).map_or_else(
@@ -988,13 +974,13 @@ async fn run_neighbor_checks(command: &ScanCommand) -> Vec<CheckResult> {
         },
         |probe| probe.ptr.clone(),
     );
-    vec![
+    progress.add([
         CheckResult::new(
-            NEIGHBOR_GATES[0],
+            gate::NEIGHBORS_PTR,
             judge_candidate_ptr(&candidate_ptr),
         ),
-        CheckResult::new(NEIGHBOR_GATES[1], judge_neighbor_extremes(&probes)),
-    ]
+        CheckResult::new(gate::NEIGHBORS, judge_neighbor_extremes(&probes)),
+    ]);
 }
 
 #[tracing::instrument(
@@ -1017,7 +1003,7 @@ pub async fn run_phase_b(
         progress.add(skipped_ssh_results());
     }
     if !command.neighbors_enabled() {
-        progress.add(NEIGHBOR_GATES.into_iter().map(|gate| {
+        progress.add(gate::neighbor_gates().map(|gate| {
             CheckResult::skipped(gate, "--no-neighbors: the /24 was not swept")
         }));
     }
@@ -1025,17 +1011,17 @@ pub async fn run_phase_b(
     let work = async {
         let (sources, ()) = tokio::join!(
             prepare_globalping(command, http),
-            progress.record(prepare_ssh(command, &mut ssh)),
+            prepare_ssh(command, &mut ssh, &progress),
         );
         tokio::join!(
-            progress.record(run_globalping_branch(
+            run_globalping_branch(
                 sources,
                 command,
                 ssh.listener_port,
                 &progress
-            )),
-            progress.record(run_ssh_checks(command, &ssh, &progress)),
-            progress.record(run_neighbor_checks(command)),
+            ),
+            run_ssh_checks(command, &ssh, &progress),
+            run_neighbor_checks(command, &progress),
         );
     };
     if tokio::time::timeout_at(deadline, Box::pin(work))
@@ -1069,7 +1055,7 @@ pub async fn run_scan(command: &ScanCommand) -> Report {
         Err(error) => {
             return Report {
                 results: vec![CheckResult::new(
-                    "http-client",
+                    gate::HTTP_CLIENT,
                     Verdict::error(error.to_string()),
                 )],
             };
@@ -1117,7 +1103,7 @@ mod tests {
         #[case] fail_fast: bool,
         #[case] expected: bool,
     ) {
-        let sut = [CheckResult::new("geo", verdict)];
+        let sut = [CheckResult::new(gate::GEO, verdict)];
 
         let actual = should_short_circuit(&sut, fail_fast);
 
@@ -1133,7 +1119,7 @@ mod tests {
         let table = sut.table();
 
         assert_eq!(sut.exit_code(), 0);
-        assert_eq!(sut.results.len(), TUNNEL_GATES.len() + 2);
+        assert_eq!(sut.results.len(), gate::ssh_gates().count());
         assert!(sut.results.iter().all(CheckResult::is_skipped), "{table}");
         assert!(!table.contains("OK "), "{table}");
     }
@@ -1142,13 +1128,13 @@ mod tests {
     fn a_bridge_reports_every_tunnel_gate_but_tampering_as_skipped() {
         let sut = ScanProfile::RuBridge;
 
-        let skipped = sut.skipped(TUNNEL_GATES);
+        let skipped = sut.skipped(gate::tunnel_gates());
 
         let gates: Vec<_> =
             skipped.iter().map(|result| result.gate.as_str()).collect();
-        let expected: Vec<_> = TUNNEL_GATES
-            .into_iter()
-            .filter(|&gate| gate != "tampering")
+        let expected: Vec<_> = gate::tunnel_gates()
+            .filter(|&gate| gate != gate::TAMPERING)
+            .map(GateId::as_str)
             .collect();
         assert_eq!(gates, expected);
     }
@@ -1163,9 +1149,12 @@ mod tests {
         let progress = ScanProgress::default();
         let work = async {
             tokio::join!(
-                progress.record(async {
-                    vec![CheckResult::new("reach", Verdict::fail("blocked"))]
-                }),
+                async {
+                    progress.add([CheckResult::new(
+                        gate::REACH,
+                        Verdict::fail("blocked"),
+                    )]);
+                },
                 std::future::pending::<()>(),
             );
         };
@@ -1183,13 +1172,19 @@ mod tests {
         let reach: Vec<_> = report
             .results
             .iter()
-            .filter(|result| result.gate == "reach")
+            .filter(|result| result.gate == gate::REACH)
             .collect();
         assert_eq!(reach.len(), 1);
         assert_eq!(reach[0].severity(), Severity::Fail);
-        assert!(report.results.iter().any(|result| result.gate == "latency"
-            && result.severity() == Severity::Error));
+        assert!(
+            report
+                .results
+                .iter()
+                .any(|result| result.gate == gate::LATENCY
+                    && result.severity() == Severity::Error)
+        );
     }
+
     #[rstest::rstest]
     #[case::skipped_failure(Verdict::fail("blocked"), true, false)]
     #[case::escalated_warning(Verdict::warn("suspicious"), false, true)]
@@ -1200,14 +1195,14 @@ mod tests {
     ) {
         let mut overrides = chip_core::GateOverrides::default();
         if skip {
-            overrides.skip.insert("reputation".into());
+            overrides.skip.insert(gate::REPUTATION);
         } else {
-            overrides.escalate.insert("reputation".into());
+            overrides.escalate.insert(gate::REPUTATION);
         }
         let results = apply_rules(
             ScanProfile::Exit,
             &overrides,
-            vec![CheckResult::new("reputation", verdict)],
+            vec![CheckResult::new(gate::REPUTATION, verdict)],
         );
         assert_eq!(should_short_circuit(&results, true), expected_stop);
         let report = Report { results };

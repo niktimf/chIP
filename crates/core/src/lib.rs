@@ -3,15 +3,14 @@
 
 pub mod model;
 pub use model::{
-    CheckResult, CityName, CountryCode, GateId, InvalidCountryCode, Severity,
-    Verdict,
+    CheckResult, CityName, CountryCode, InvalidCountryCode, Severity, Verdict,
 };
 
 pub mod report;
 pub use report::Report;
 
 pub mod gate;
-pub use gate::GateOverrides;
+pub use gate::{GateId, GateOverrides};
 
 pub mod ip_lists;
 

@@ -5,7 +5,7 @@ mod portal;
 mod services;
 mod warn_services;
 
-pub use ai::probe_ai_endpoints;
+pub use ai::{AiEndpointStates, probe_ai_endpoints};
 pub use client::{TunnelClient, TunnelError, TunnelResponse};
 pub use country_geo::{
     probe_cdn_edges, probe_country_votes, probe_search_captcha,

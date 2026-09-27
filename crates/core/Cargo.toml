@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 country-code-enum = { workspace = true }
+# Types only (StatusCode), no networking: stays inside the no-network rule.
+http = { workspace = true }
 ipnet = { workspace = true }
 itertools = { workspace = true }
 regex = { workspace = true }

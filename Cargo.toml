@@ -13,6 +13,7 @@ repository = "https://github.com/niktimf/chIP"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 country-code-enum = { version = "1", default-features = false }
+http = "1"
 ipnet = { version = "2.12", features = ["serde"] }
 itertools = "0.15"
 openssh = "0.11"

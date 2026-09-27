@@ -47,7 +47,9 @@ The scan covers:
 - CPU steal, candidate PTR and unusual certificate/PTR patterns in its `/24`.
 
 Warnings can be promoted with `--gate <id>`, for example
-`--gate service:claude`. A gate can be ignored with `--skip-gate <id>`.
+`--gate service:claude`. A gate can be ignored with `--skip-gate <id>`. An
+id the scan does not know (a typo, say) is rejected at startup with exit
+code 2 instead of silently never matching.
 
 `rkn-registry` fails when the address is in the registry or inside a subnet
 the registry blocks as a whole. Five or more blocked addresses in the same

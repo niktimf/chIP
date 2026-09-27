@@ -1,71 +1,102 @@
 use chip_core::model::ServiceState;
 use chip_core::verdict::ai::classify_ai_endpoint;
+use http::header::USER_AGENT;
+use http::{HeaderName, HeaderValue, StatusCode};
 
 use super::client::TunnelClient;
 
-const API_UA: &str = concat!("chip/", env!("CARGO_PKG_VERSION"));
-const OPENAI_REGION_MARKERS: &[&str] = &[
-    "unsupported_country_region_territory",
-    "country, region, or territory not supported",
-];
-const ANTHROPIC_REGION_MARKERS: &[&str] =
-    &["request not allowed", "unsupported_country"];
+const API_UA: HeaderValue = HeaderValue::from_static("curl/8.5.0");
 
-async fn probe_one(
-    client: &TunnelClient,
-    url: &str,
-    headers: &[(&str, &str)],
-    region_markers: &[&str],
-    auth_statuses: &[u16],
-) -> ServiceState {
-    match client.get(url, headers).await {
-        Ok(response) => classify_ai_endpoint(
-            response.status,
-            &response.body,
-            region_markers,
-            auth_statuses,
-        ),
-        Err(error) => ServiceState::Unavailable(error.to_string()),
+/// Named `static`s rather than inline slices in the endpoint table:
+/// `HeaderValue` carries an atomic refcount, so a borrowed temporary cannot
+/// be promoted to `'static`.
+static API_HEADERS: [(HeaderName, HeaderValue); 1] = [(USER_AGENT, API_UA)];
+static ANTHROPIC_HEADERS: [(HeaderName, HeaderValue); 2] = [
+    (USER_AGENT, API_UA),
+    (
+        HeaderName::from_static("anthropic-version"),
+        HeaderValue::from_static("2023-06-01"),
+    ),
+];
+
+/// One AI API as a probe target: where to ask, how to identify, and how to
+/// read the answer.
+struct AiEndpoint {
+    url: &'static str,
+    headers: &'static [(HeaderName, HeaderValue)],
+    /// Body markers that mean a region refusal.
+    region_markers: &'static [&'static str],
+    /// Statuses that mean "reachable, just unauthenticated" for this API.
+    auth_statuses: &'static [StatusCode],
+}
+
+impl AiEndpoint {
+    async fn probe(&self, client: &TunnelClient) -> ServiceState {
+        match client.get(self.url, self.headers).await {
+            Ok(response) => classify_ai_endpoint(
+                response.status,
+                &response.body,
+                self.region_markers,
+                self.auth_statuses,
+            ),
+            Err(error) => ServiceState::Unavailable(error.to_string()),
+        }
     }
 }
 
-pub async fn probe_ai_endpoints(
-    client: &TunnelClient,
-) -> Vec<(&'static str, ServiceState)> {
+static OPENAI: AiEndpoint = AiEndpoint {
+    url: "https://api.openai.com/v1/models",
+    headers: &API_HEADERS,
+    region_markers: &[
+        "unsupported_country_region_territory",
+        "country, region, or territory not supported",
+    ],
+    auth_statuses: &[StatusCode::UNAUTHORIZED],
+};
+
+static ANTHROPIC: AiEndpoint = AiEndpoint {
+    url: "https://api.anthropic.com/v1/models",
+    headers: &ANTHROPIC_HEADERS,
+    region_markers: &["request not allowed", "unsupported_country"],
+    auth_statuses: &[StatusCode::UNAUTHORIZED],
+};
+
+static GEMINI: AiEndpoint = AiEndpoint {
+    url: "https://generativelanguage.googleapis.com/v1beta/models",
+    headers: &API_HEADERS,
+    region_markers: &[],
+    // This API refuses an anonymous caller with 403, not only 401.
+    auth_statuses: &[StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN],
+};
+
+static DEEPSEEK: AiEndpoint = AiEndpoint {
+    url: "https://api.deepseek.com/models",
+    headers: &API_HEADERS,
+    region_markers: &[],
+    auth_statuses: &[StatusCode::UNAUTHORIZED],
+};
+
+/// One field per probed API, so an endpoint cannot be dropped, duplicated,
+/// or attached to another endpoint's gate.
+#[derive(Debug)]
+pub struct AiEndpointStates {
+    pub openai: ServiceState,
+    pub anthropic: ServiceState,
+    pub gemini: ServiceState,
+    pub deepseek: ServiceState,
+}
+
+pub async fn probe_ai_endpoints(client: &TunnelClient) -> AiEndpointStates {
     let (openai, anthropic, gemini, deepseek) = tokio::join!(
-        probe_one(
-            client,
-            "https://api.openai.com/v1/models",
-            &[("User-Agent", API_UA)],
-            OPENAI_REGION_MARKERS,
-            &[401]
-        ),
-        probe_one(
-            client,
-            "https://api.anthropic.com/v1/models",
-            &[("User-Agent", API_UA), ("anthropic-version", "2023-06-01")],
-            ANTHROPIC_REGION_MARKERS,
-            &[401]
-        ),
-        probe_one(
-            client,
-            "https://generativelanguage.googleapis.com/v1beta/models",
-            &[("User-Agent", API_UA)],
-            &[],
-            &[401, 403]
-        ),
-        probe_one(
-            client,
-            "https://api.deepseek.com/models",
-            &[("User-Agent", API_UA)],
-            &[],
-            &[401]
-        )
+        OPENAI.probe(client),
+        ANTHROPIC.probe(client),
+        GEMINI.probe(client),
+        DEEPSEEK.probe(client)
     );
-    vec![
-        ("openai", openai),
-        ("anthropic", anthropic),
-        ("gemini", gemini),
-        ("deepseek", deepseek),
-    ]
+    AiEndpointStates {
+        openai,
+        anthropic,
+        gemini,
+        deepseek,
+    }
 }

@@ -129,9 +129,13 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gate::{
+        BLOCKLISTS, GEO, GateId, LATENCY, NEIGHBORS, REACH, REPUTATION,
+        TAMPERING,
+    };
     use crate::model::{CheckResult, Severity, Verdict};
 
-    fn cr(gate: &str, v: Verdict) -> CheckResult {
+    fn cr(gate: GateId, v: Verdict) -> CheckResult {
         CheckResult::new(gate, v)
     }
 
@@ -139,7 +143,7 @@ mod tests {
     fn a_skipped_gate_is_shown_as_skip_in_both_renderings() {
         let sut = Report {
             results: vec![CheckResult::skipped(
-                "reach",
+                REACH,
                 "ports 443 and 8443 are already in use",
             )],
         };
@@ -159,8 +163,8 @@ mod tests {
     fn a_skipped_gate_does_not_change_the_exit_code_or_the_overall_severity() {
         let sut = Report {
             results: vec![
-                CheckResult::skipped("reach", "ports are already in use"),
-                cr("geo", Verdict::ok("7/7 say FI")),
+                CheckResult::skipped(REACH, "ports are already in use"),
+                cr(GEO, Verdict::ok("7/7 say FI")),
             ],
         };
 
@@ -171,20 +175,20 @@ mod tests {
     #[rstest::rstest]
     #[case::nothing_failed_or_errored(
         vec![
-            cr("geo", Verdict::ok("RU 90%")),
-            cr("neighbors", Verdict::warn("noisy")),
+            cr(GEO, Verdict::ok("RU 90%")),
+            cr(NEIGHBORS, Verdict::warn("noisy")),
         ],
         0
     )]
     #[case::a_failure_wins_over_an_error(
         vec![
-            cr("reputation", Verdict::fail("vpn")),
-            cr("geo", Verdict::error("no sources answered")),
+            cr(REPUTATION, Verdict::fail("vpn")),
+            cr(GEO, Verdict::error("no sources answered")),
         ],
         1
     )]
     #[case::nothing_failed_but_something_could_not_be_judged(
-        vec![cr("latency", Verdict::error("fewer than 6 valid probes"))],
+        vec![cr(LATENCY, Verdict::error("fewer than 6 valid probes"))],
         2
     )]
     fn the_exit_code_follows_the_worst_result(
@@ -202,8 +206,8 @@ mod tests {
     fn overall_is_the_most_severe_result_present() {
         let sut = Report {
             results: vec![
-                cr("a", Verdict::ok("x")),
-                cr("b", Verdict::warn("y")),
+                cr(BLOCKLISTS, Verdict::ok("x")),
+                cr(GEO, Verdict::warn("y")),
             ],
         };
         assert_eq!(sut.overall(), Severity::Warn);
@@ -220,8 +224,8 @@ mod tests {
     fn table_lists_the_worst_result_first() {
         let sut = Report {
             results: vec![
-                cr("geo", Verdict::ok("RU 90%")),
-                cr("reputation", Verdict::fail("vpn flag")),
+                cr(GEO, Verdict::ok("RU 90%")),
+                cr(REPUTATION, Verdict::fail("vpn flag")),
             ],
         };
         let table = sut.table();
@@ -233,11 +237,14 @@ mod tests {
         assert!(table.trim_end().ends_with("OVERALL: FAIL"), "table:\n{table}");
     }
 
+    /// Gate ids are static identifiers from the registry, so hostile input
+    /// can only arrive through the free-text detail; the cell escaping is
+    /// exercised there.
     #[test]
-    fn markdown_neutralizes_markup_and_control_characters_in_cells() {
+    fn markdown_neutralizes_markup_and_control_characters_in_the_detail() {
         let sut = Report {
             results: vec![cr(
-                "tampering|<gate>",
+                TAMPERING,
                 Verdict::warn(
                     "altered: [a|b](https://attacker)\r\n<script>&\\\x1b\u{202e}",
                 ),
@@ -248,7 +255,7 @@ mod tests {
 
         assert!(
             md.contains(
-                r"tampering\|&lt;gate&gt; | altered: \[a\|b\]\(https://attacker\)<br>&lt;script&gt;&amp;\\\u{1b}\u{202e}"
+                r"tampering | altered: \[a\|b\]\(https://attacker\)<br>&lt;script&gt;&amp;\\\u{1b}\u{202e}"
             ),
             "markdown:\n{md}"
         );
@@ -261,7 +268,7 @@ mod tests {
     fn terminal_table_keeps_each_result_on_one_escape_free_line() {
         let sut = Report {
             results: vec![cr(
-                "reputation\nforged-gate",
+                REPUTATION,
                 Verdict::warn("operator\r\nFAIL fake\x1b[31m\u{202e}"),
             )],
         };
@@ -269,7 +276,6 @@ mod tests {
         let table = sut.table();
 
         assert_eq!(table.lines().count(), 2, "table:\n{table}");
-        assert!(table.contains(r"reputation\nforged-gate"), "table:\n{table}");
         assert!(
             table.contains(r"operator\r\nFAIL fake\u{1b}[31m\u{202e}"),
             "table:\n{table}"

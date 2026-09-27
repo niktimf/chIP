@@ -33,8 +33,6 @@ pub enum SshError {
     InvalidSnapshot,
     #[error("a temporary listener is already owned by this session")]
     ListenerAlreadyStarted,
-    #[error("listener port cannot be zero")]
-    InvalidListenerPort,
     #[error("unexpected listener preflight response: {0}")]
     InvalidPreflightResponse(String),
 }
@@ -178,12 +176,11 @@ impl SshSession {
     }
 
     /// Port whose remote startup or listener still needs cleanup.
-    pub fn listener_port(&self) -> Option<u16> {
+    pub fn listener_port(&self) -> Option<NonZeroU16> {
         NonZeroU16::new(
             self.listener_port
                 .load(std::sync::atomic::Ordering::Relaxed),
         )
-        .map(NonZeroU16::get)
     }
 
     pub const fn command_timeout(&self) -> Duration {

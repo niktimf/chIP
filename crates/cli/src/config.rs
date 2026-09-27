@@ -204,13 +204,15 @@ struct ScanArgs {
     #[arg(long, default_value = "300")]
     deadline_secs: NonZeroU64,
     /// Promote a warning to a failure for this gate id, e.g.
-    /// `--gate service:claude`. Repeatable and comma-separated.
+    /// `--gate service:claude`. An id the scan does not know is rejected
+    /// here rather than silently never matching. Repeatable and
+    /// comma-separated.
     #[arg(long = "gate", value_delimiter = ',')]
-    gate: Vec<String>,
+    gate: Vec<GateId>,
     /// Turn this gate off, e.g. `--skip-gate reach`. It is reported as SKIP
     /// and cannot change the exit code. Repeatable and comma-separated.
     #[arg(long = "skip-gate", value_delimiter = ',')]
-    skip_gate: Vec<String>,
+    skip_gate: Vec<GateId>,
     /// Compare latency against this address instead of the RIPE Atlas anchors
     /// picked for the city.
     #[arg(long)]
@@ -316,8 +318,8 @@ impl TryFrom<(ScanArgs, SecretInputs)> for ScanCommand {
             probes,
             deadline: std::time::Duration::from_secs(args.deadline_secs.get()),
             gate_overrides: GateOverrides {
-                escalate: args.gate.into_iter().map(GateId::from).collect(),
-                skip: args.skip_gate.into_iter().map(GateId::from).collect(),
+                escalate: args.gate.into_iter().collect(),
+                skip: args.skip_gate.into_iter().collect(),
             },
             anchor: args.anchor,
             neighbors_enabled: !args.no_neighbors,
@@ -524,6 +526,14 @@ mod tests {
         &["scan", "203.0.113.1", "--country", "FI", "--city", "   "],
         "city name must not be empty"
     )]
+    #[case::misspelled_gate(
+        &["scan", "203.0.113.1", "--country", "FI", "--gate", "service:clade"],
+        "'service:clade' is not a known gate id"
+    )]
+    #[case::misspelled_skip_gate(
+        &["scan", "203.0.113.1", "--country", "FI", "--skip-gate", "raech"],
+        "'raech' is not a known gate id"
+    )]
     fn malformed_values_are_rejected_during_parsing(
         #[case] sut: &[&str],
         #[case] expected_detail: &str,
@@ -556,7 +566,7 @@ mod tests {
             sut.gate_overrides().escalate,
             ["service:claude", "neighbors", "reputation:operator"]
                 .into_iter()
-                .map(GateId::from)
+                .map(|id| id.parse().unwrap())
                 .collect()
         );
     }

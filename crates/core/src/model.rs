@@ -6,6 +6,8 @@ use std::str::FromStr;
 use country_code_enum::CountryCode as RegistryCountryCode;
 use ipnet::Ipv4Net;
 
+use crate::gate::GateId;
+
 /// How serious a single check's outcome is. Ordered least to most severe so
 /// `Vec<CheckResult>::sort()` (descending) puts the worst results first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -69,54 +71,6 @@ impl Verdict {
             severity: Severity::Fail,
             detail: detail.into(),
         }
-    }
-}
-
-/// A gate identifier (`"latency"`, `"service:gemini"`, `"ai:openai"`).
-///
-/// `Report`, `GateOverrides`, and `--gate`/`--skip-gate` all key on it.
-/// Wrapping it, rather than passing a bare `String`,
-/// everywhere, is what stops a judge from ever handing `CheckResult::new`
-/// its two `impl Into<..>` arguments in the wrong order and having it
-/// compile anyway. `From`/`PartialEq<&str>` keep literal construction terse.
-/// `Ord` delegates to the inner `String` so `Report` can
-/// sort same-severity rows by gate id for a stable table.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct GateId(String);
-
-impl GateId {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for GateId {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-
-impl From<String> for GateId {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl fmt::Display for GateId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl PartialEq<str> for GateId {
-    fn eq(&self, other: &str) -> bool {
-        self.0 == other
-    }
-}
-
-impl PartialEq<&str> for GateId {
-    fn eq(&self, other: &&str) -> bool {
-        self.0 == *other
     }
 }
 
@@ -217,17 +171,17 @@ enum CheckOutcome {
 }
 
 impl CheckResult {
-    pub fn new(gate: impl Into<GateId>, verdict: Verdict) -> Self {
+    pub fn new(gate: GateId, verdict: Verdict) -> Self {
         Self {
-            gate: gate.into(),
+            gate,
             detail: verdict.detail,
             outcome: CheckOutcome::Judged(verdict.severity),
         }
     }
 
-    pub fn skipped(gate: impl Into<GateId>, reason: impl Into<String>) -> Self {
+    pub fn skipped(gate: GateId, reason: impl Into<String>) -> Self {
         Self {
-            gate: gate.into(),
+            gate,
             detail: reason.into(),
             outcome: CheckOutcome::Skipped,
         }
@@ -477,14 +431,52 @@ pub struct GeoConsensusFacts {
     pub votes: Vec<Option<CountryCode>>,
 }
 
-/// A country vote from a single streaming service (Google, `YouTube`, Apple,
-/// Bing, Spotify, Netflix, `TikTok`). Used by `verdict::service_geo` to
-///
+/// One country voter behind the `service-geo` gate. A closed set: the
+/// judge's fail-or-warn split keys on the voter, so a voter the judge does
+/// not know cannot be constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceGeoSource {
+    Google,
+    Youtube,
+    Apple,
+    Spotify,
+    Netflix,
+    Tiktok,
+    Bing,
+}
+
+impl ServiceGeoSource {
+    /// Google and `YouTube` alone can fail the gate; every other voter's
+    /// disagreement is only a warning.
+    pub const fn is_critical(self) -> bool {
+        matches!(self, Self::Google | Self::Youtube)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Google => "google",
+            Self::Youtube => "youtube",
+            Self::Apple => "apple",
+            Self::Spotify => "spotify",
+            Self::Netflix => "netflix",
+            Self::Tiktok => "tiktok",
+            Self::Bing => "bing",
+        }
+    }
+}
+
+impl fmt::Display for ServiceGeoSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A country vote from a single service. Used by `verdict::service_geo` to
 /// determine whether the IP's location detection is consistent across major
 /// services.
 #[derive(Debug, Clone)]
 pub struct ServiceCountryVote {
-    pub service: &'static str,
+    pub source: ServiceGeoSource,
     pub country: Option<CountryCode>,
 }
 
@@ -753,6 +745,7 @@ pub struct InvalidProcStatSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gate::{GEO, REACH};
 
     #[test]
     fn severity_orders_least_to_most_severe() {
@@ -777,7 +770,7 @@ mod tests {
     #[test]
     fn a_skipped_check_is_labelled_skip_and_keeps_the_reason_it_carried() {
         let sut = CheckResult::skipped(
-            "reach",
+            REACH,
             "ports 443 and 8443 are already in use",
         );
 
@@ -788,7 +781,7 @@ mod tests {
 
     #[test]
     fn a_judged_check_is_labelled_by_its_severity() {
-        let sut = CheckResult::new("geo", Verdict::warn("50/50 split"));
+        let sut = CheckResult::new(GEO, Verdict::warn("50/50 split"));
 
         assert_eq!(sut.label(), "WARN");
     }

@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use http::{HeaderName, HeaderValue, StatusCode};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -11,7 +12,7 @@ pub enum TunnelError {
 
 #[derive(Debug)]
 pub struct TunnelResponse {
-    pub status: u16,
+    pub status: StatusCode,
     pub final_url: reqwest::Url,
     pub body: String,
 }
@@ -43,14 +44,16 @@ impl TunnelClient {
     pub async fn get(
         &self,
         url: &str,
-        headers: &[(&str, &str)],
+        headers: &[(HeaderName, HeaderValue)],
     ) -> Result<TunnelResponse, TunnelError> {
-        let mut request = self.http.get(url);
-        for (key, value) in headers {
-            request = request.header(*key, *value);
-        }
-        let response = request.send().await?;
-        let status = response.status().as_u16();
+        let response = headers
+            .iter()
+            .fold(self.http.get(url), |request, (name, value)| {
+                request.header(name, value)
+            })
+            .send()
+            .await?;
+        let status = response.status();
         let final_url = response.url().clone();
         let body = response.text().await?;
         Ok(TunnelResponse {
@@ -83,12 +86,15 @@ mod tests {
         let response = sut
             .get(
                 &format!("{}/premium", server.uri()),
-                &[("Accept-Language", "en-US")],
+                &[(
+                    http::header::ACCEPT_LANGUAGE,
+                    HeaderValue::from_static("en-US"),
+                )],
             )
             .await
             .unwrap();
 
-        assert_eq!(response.status, 200);
+        assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body, "Enjoy ad-free videos");
         assert!(response.final_url.path().ends_with("/premium"));
     }
@@ -104,8 +110,14 @@ mod tests {
             .await;
         let sut = TunnelClient::from_client(reqwest::Client::new());
 
-        sut.get(&format!("{}/echo", server.uri()), &[("X-Test", "one")])
-            .await
-            .unwrap();
+        sut.get(
+            &format!("{}/echo", server.uri()),
+            &[(
+                HeaderName::from_static("x-test"),
+                HeaderValue::from_static("one"),
+            )],
+        )
+        .await
+        .unwrap();
     }
 }

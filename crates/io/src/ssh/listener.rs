@@ -1,6 +1,8 @@
 use super::session::{SshError, SshSession};
 use chip_core::model::ProcStatSnapshot;
+use std::net::Ipv4Addr;
 use std::num::NonZeroU16;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListenerOutcome {
@@ -112,13 +114,11 @@ impl SshSession {
     /// rule added by this run are removed when the listener exits.
     pub async fn start_listener(
         &self,
-        port: u16,
+        port: NonZeroU16,
     ) -> Result<ListenerOutcome, SshError> {
         if self.listener_port().is_some() {
             return Err(SshError::ListenerAlreadyStarted);
         }
-        let port =
-            NonZeroU16::new(port).ok_or(SshError::InvalidListenerPort)?;
         match self.listener_readiness(port).await? {
             ListenerReadiness::Ready => {}
             ListenerReadiness::PortInUse => {
@@ -161,12 +161,15 @@ impl SshSession {
         }
     }
 
-    pub async fn stop_listener(&self, port: u16) -> Result<(), SshError> {
+    pub async fn stop_listener(
+        &self,
+        port: NonZeroU16,
+    ) -> Result<(), SshError> {
         let timeout = self.command_timeout();
-        let script = listener_stop_script(port);
+        let script = listener_stop_script(port.get());
         self.run_shell(&script, timeout).await?;
         let _ = self.listener_port.compare_exchange(
-            port,
+            port.get(),
             0,
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
@@ -179,6 +182,26 @@ impl SshSession {
         let text = self.run_command("cat", &["/proc/stat"], timeout).await?;
         parse_proc_stat(&text).ok_or(SshError::InvalidSnapshot)
     }
+}
+
+/// Confirms the temporary listener answers TLS from the runner.
+///
+/// Runs before any Globalping quota is spent on the listener. It serves a
+/// throwaway self-signed certificate, so certificate verification is off on
+/// purpose.
+pub async fn verify_listener(
+    ip: Ipv4Addr,
+    port: NonZeroU16,
+) -> Result<(), reqwest::Error> {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    client
+        .get(format!("https://{ip}:{port}/"))
+        .send()
+        .await
+        .map(drop)
 }
 
 #[cfg(test)]

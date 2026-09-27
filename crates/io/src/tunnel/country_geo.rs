@@ -1,21 +1,41 @@
 use std::time::Duration;
 
-use chip_core::model::{CaptchaObservation, CountryCode, ServiceCountryVote};
+use chip_core::model::{
+    CaptchaObservation, CountryCode, ServiceCountryVote, ServiceGeoSource,
+};
+use http::StatusCode;
+use http::header::{ACCEPT_LANGUAGE, USER_AGENT};
 use regex::regex;
 
 use super::client::{TunnelClient, TunnelResponse};
-use super::services::BROWSER_UA;
+use super::services::{ACCEPT_LANGUAGE_EN, BROWSER_HEADERS, BROWSER_UA};
 
 const FAST_API_URL: &str = "https://api.fast.com/netflix/speedtest/v2?https=true&token=YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm&urlCount=1";
-/// Russian airport codes a CDN edge can carry. The `service-geo:cdn` gate
-/// fails on RU and only on RU, so a missing code here is a gate that stays
-/// silent — the list covers every city with a sizeable edge presence, not
-/// just the capitals.
+
+/// Russian location codes a CDN edge can carry.
 const RU_IATA_CODES: &[&str] = &[
-    "SVO", "DME", "VKO", "MOW", "LED", "KZN", "SVX", "OVB", "KJA", "ROV",
-    "AER", "KHV", "VVO", "UFA", "KUF", "GOJ", "IKT", "MRV", "CEK", "PEE",
-    "VOG", "KRR", "TJM", "OMS", "BAX", "HTA", "YKS", "ARH", "MMK", "KGD",
-    "SCW", "ULY", "NOZ", "TOF", "BQS", "UUD", "ABA", "STW", "ESL", "REN",
+    "AAQ", "ABA", "ACS", "ADH", "AEM", "AER", "AMV", "ARH", "ASF", "BAX",
+    "BCX", "BGN", "BGS", "BKA", "BQG", "BQJ", "BQS", "BTK", "BVJ", "BVV",
+    "BWO", "BZK", "CEE", "CEK", "CKH", "CKL", "CSH", "CSY", "CYX", "CZR",
+    "DEE", "DHG", "DKS", "DLR", "DME", "DPT", "DYR", "EDN", "EGO", "EIE",
+    "EIK", "EKS", "ERG", "ESL", "ETL", "EYA", "EYK", "EZV", "GDX", "GDZ",
+    "GOJ", "GOY", "GRV", "GSV", "GVN", "GYG", "HMA", "HTA", "HTG", "IAA",
+    "IAR", "IGT", "IJK", "IKS", "IKT", "INA", "IRM", "ITU", "IWA", "JOK",
+    "KCK", "KCY", "KDY", "KEJ", "KGD", "KGP", "KHV", "KJA", "KKQ", "KLD",
+    "KLF", "KMW", "KNY", "KPW", "KRO", "KRR", "KSZ", "KUF", "KVK", "KVM",
+    "KVR", "KVX", "KXD", "KXK", "KYZ", "KZN", "LDG", "LED", "LNX", "LPK",
+    "MCX", "MJY", "MJZ", "MMK", "MOW", "MQF", "MQJ", "MRV", "NAL", "NBC",
+    "NEI", "NER", "NFG", "NGK", "NJC", "NLI", "NNM", "NOI", "NOJ", "NOZ",
+    "NSK", "NUX", "NYA", "NYM", "NYR", "NZG", "ODO", "OGZ", "OHH", "OHO",
+    "OKT", "OLZ", "OMS", "ONK", "OSW", "OVB", "OVS", "PEE", "PES", "PEX",
+    "PEZ", "PKC", "PKV", "PVS", "PWE", "PYJ", "REN", "RGK", "RMZ", "ROV",
+    "RYB", "RZH", "SBT", "SCW", "SEK", "SES", "SGC", "SKX", "SLY", "STW",
+    "SUK", "SUY", "SVO", "SVX", "SWT", "SWV", "SYS", "TBW", "TGK", "TGP",
+    "THX", "TJM", "TKM", "TLK", "TLY", "TOF", "TOX", "TQL", "TYA", "TYD",
+    "UCT", "UEN", "UFA", "UHS", "UIK", "UKG", "UKX", "ULK", "ULV", "ULY",
+    "UMS", "URJ", "URS", "USK", "USR", "UTS", "UUA", "UUD", "UUS", "VAQ",
+    "VEO", "VGD", "VHV", "VKO", "VKT", "VKV", "VLU", "VOG", "VOZ", "VRI",
+    "VUS", "VVO", "VYI", "YAE", "YKS", "YMK", "ZIA", "ZIX", "ZKP", "ZZO",
 ];
 
 fn country(raw: &str) -> Option<CountryCode> {
@@ -67,7 +87,7 @@ fn bing_country(body: &str) -> Option<CountryCode> {
 }
 
 async fn response(client: &TunnelClient, url: &str) -> Option<TunnelResponse> {
-    client.get(url, &[("User-Agent", BROWSER_UA)]).await.ok()
+    client.get(url, &BROWSER_HEADERS).await.ok()
 }
 
 struct CountryResponses {
@@ -116,28 +136,28 @@ impl CountryResponses {
             .and_then(|item| youtube_country(&item.body))
             .or(google);
         vec![
-            vote("google", google),
-            vote("youtube", youtube),
+            vote(ServiceGeoSource::Google, google),
+            vote(ServiceGeoSource::Youtube, youtube),
             vote(
-                "apple",
+                ServiceGeoSource::Apple,
                 self.apple.as_ref().and_then(|item| country(&item.body)),
             ),
             vote(
-                "spotify",
+                ServiceGeoSource::Spotify,
                 self.spotify
                     .as_ref()
                     .and_then(|item| spotify_country(&item.body)),
             ),
             vote(
-                "netflix",
+                ServiceGeoSource::Netflix,
                 json_country(self.netflix.as_ref(), "/client/location/country"),
             ),
             vote(
-                "tiktok",
+                ServiceGeoSource::Tiktok,
                 json_country(self.tiktok.as_ref(), "/body/appProps/region"),
             ),
             vote(
-                "bing",
+                ServiceGeoSource::Bing,
                 self.bing.as_ref().and_then(|item| bing_country(&item.body)),
             ),
         ]
@@ -145,10 +165,10 @@ impl CountryResponses {
 }
 
 const fn vote(
-    service: &'static str,
+    source: ServiceGeoSource,
     country: Option<CountryCode>,
 ) -> ServiceCountryVote {
-    ServiceCountryVote { service, country }
+    ServiceCountryVote { source, country }
 }
 
 fn json_country(
@@ -174,15 +194,15 @@ async fn captcha_observation(
         .get(
             url,
             &[
-                ("User-Agent", BROWSER_UA),
-                ("Accept-Language", "en-US,en;q=0.9"),
+                (USER_AGENT, BROWSER_UA),
+                (ACCEPT_LANGUAGE, ACCEPT_LANGUAGE_EN),
             ],
         )
         .await
     {
         Err(error) => CaptchaObservation::Unavailable(error.to_string()),
         Ok(response)
-            if response.status == 429
+            if response.status == StatusCode::TOO_MANY_REQUESTS
                 || regex!(
                     r"(?i)unusual traffic from|is blocked|unaddressed abuse"
                 )
@@ -336,6 +356,13 @@ mod tests {
     // be recognized — the CDN-edge gate fails on RU and nothing else.
     #[case::ufa("UFA", "RU")]
     #[case::novosibirsk("OVB", "RU")]
+    // Missed by the original hand-picked list; caught since the list is
+    // derived from the OurAirports dataset.
+    #[case::voronezh("VOZ", "RU")]
+    #[case::surgut("SGC", "RU")]
+    // The airport is shut for civil traffic, but an edge in the city still
+    // carries its code.
+    #[case::rostov("ROV", "RU")]
     // Seen for real on 2026-09-20: a Finnish address was served by the
     // Kharkiv GGC edge, and the short table read it as "no country".
     #[case::kharkiv("HRK", "UA")]

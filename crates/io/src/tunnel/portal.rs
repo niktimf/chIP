@@ -1,50 +1,51 @@
 use chip_core::model::PortalOutcome;
+use http::StatusCode;
 
 use super::client::TunnelClient;
 
 #[derive(Debug, Clone, Copy)]
 struct PortalEndpoint {
     url: &'static str,
-    expected_status: u16,
+    expected_status: StatusCode,
     expected_body: Option<&'static str>,
 }
 
 const PORTAL_ENDPOINTS: &[PortalEndpoint] = &[
     PortalEndpoint {
         url: "http://connectivitycheck.gstatic.com/generate_204",
-        expected_status: 204,
+        expected_status: StatusCode::NO_CONTENT,
         expected_body: Some(""),
     },
     PortalEndpoint {
         url: "http://cp.cloudflare.com/generate_204",
-        expected_status: 204,
+        expected_status: StatusCode::NO_CONTENT,
         expected_body: Some(""),
     },
     PortalEndpoint {
         url: "http://captive.apple.com/hotspot-detect.html",
-        expected_status: 200,
+        expected_status: StatusCode::OK,
         expected_body: Some(
             "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>",
         ),
     },
     PortalEndpoint {
         url: "http://www.msftconnecttest.com/connecttest.txt",
-        expected_status: 200,
+        expected_status: StatusCode::OK,
         expected_body: Some("Microsoft Connect Test"),
     },
     PortalEndpoint {
         url: "http://detectportal.firefox.com/success.txt",
-        expected_status: 200,
+        expected_status: StatusCode::OK,
         expected_body: Some("success"),
     },
     PortalEndpoint {
         url: "https://connectivitycheck.gstatic.com/generate_204",
-        expected_status: 204,
+        expected_status: StatusCode::NO_CONTENT,
         expected_body: Some(""),
     },
     PortalEndpoint {
         url: "https://cp.cloudflare.com/generate_204",
-        expected_status: 204,
+        expected_status: StatusCode::NO_CONTENT,
         expected_body: Some(""),
     },
 ];
@@ -52,7 +53,7 @@ const PORTAL_ENDPOINTS: &[PortalEndpoint] = &[
 async fn probe_at(
     client: &TunnelClient,
     url: &str,
-    expected_status: u16,
+    expected_status: StatusCode,
     expected_body: Option<&str>,
 ) -> PortalOutcome {
     let Ok(response) = client.get(url, &[]).await else {
@@ -117,11 +118,13 @@ mod tests {
         let client = TunnelClient::from_client(reqwest::Client::new());
 
         assert_eq!(
-            probe_at(&client, &server.uri(), 200, Some("expected")).await,
+            probe_at(&client, &server.uri(), StatusCode::OK, Some("expected"))
+                .await,
             PortalOutcome::Ok
         );
         assert_eq!(
-            probe_at(&client, &server.uri(), 200, Some("different")).await,
+            probe_at(&client, &server.uri(), StatusCode::OK, Some("different"))
+                .await,
             PortalOutcome::Altered
         );
     }

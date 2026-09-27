@@ -1,10 +1,12 @@
 use crate::Verdict;
-use crate::model::{ReputationFacts, RiskScore};
+use crate::model::ReputationFacts;
 
-pub fn judge_reputation(
-    facts: &ReputationFacts,
-    warn_risk: RiskScore,
-) -> Verdict {
+/// proxycheck risk score from which the gate warns. The free tier scores
+/// plain datacenter hosting around 33, so 50 keeps a clean hosting address
+/// below the line while flagging genuinely risky ranges.
+const WARN_RISK: u8 = 50;
+
+pub fn judge_reputation(facts: &ReputationFacts) -> Verdict {
     let flags = [
         facts.vpn.then_some("vpn"),
         facts.proxy.then_some("proxy"),
@@ -31,7 +33,7 @@ pub fn judge_reputation(
     if facts.vpn || facts.proxy || facts.tor || facts.compromised {
         return Verdict::fail(detail);
     }
-    let risk_over = facts.risk.is_some_and(|r| r >= warn_risk);
+    let risk_over = facts.risk.is_some_and(|r| r.value() >= WARN_RISK);
     if facts.anonymous || facts.scraper || risk_over {
         return Verdict::warn(detail);
     }
@@ -53,7 +55,7 @@ pub fn judge_reputation_operator(facts: &ReputationFacts) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Severity;
+    use crate::model::{RiskScore, Severity};
 
     fn risk(value: u8) -> RiskScore {
         RiskScore::new(value).unwrap()
@@ -74,7 +76,7 @@ mod tests {
 
     #[test]
     fn a_clean_hosting_address_at_datacenter_floor_risk_is_ok() {
-        let v = judge_reputation(&clean(), risk(50));
+        let v = judge_reputation(&clean());
         assert_eq!(v.severity, Severity::Ok, "{}", v.detail);
     }
 
@@ -84,7 +86,7 @@ mod tests {
     #[case::tor(ReputationFacts { tor: true, ..clean() })]
     #[case::compromised(ReputationFacts { compromised: true, ..clean() })]
     fn each_hard_flag_fails_on_its_own(#[case] sut: ReputationFacts) {
-        assert_eq!(judge_reputation(&sut, risk(50)).severity, Severity::Fail);
+        assert_eq!(judge_reputation(&sut).severity, Severity::Fail);
     }
 
     /// The operator is judged apart from the detection flags so an operator
@@ -98,7 +100,7 @@ mod tests {
             ..clean()
         };
 
-        assert_eq!(judge_reputation(&sut, risk(50)).severity, Severity::Ok);
+        assert_eq!(judge_reputation(&sut).severity, Severity::Ok);
         let operator = judge_reputation_operator(&sut);
         assert_eq!(operator.severity, Severity::Fail);
         assert_eq!(operator.detail, "named VPN operator: Snowd");
@@ -118,12 +120,12 @@ mod tests {
     #[case::anonymous(ReputationFacts { anonymous: true, ..clean() })]
     #[case::scraper(ReputationFacts { scraper: true, ..clean() })]
     fn each_soft_flag_only_warns(#[case] sut: ReputationFacts) {
-        assert_eq!(judge_reputation(&sut, risk(50)).severity, Severity::Warn);
+        assert_eq!(judge_reputation(&sut).severity, Severity::Warn);
     }
 
     #[rstest::rstest]
-    #[case::at_threshold(50, Severity::Warn)]
-    #[case::below_threshold(49, Severity::Ok)]
+    #[case::at_threshold(WARN_RISK, Severity::Warn)]
+    #[case::below_threshold(WARN_RISK - 1, Severity::Ok)]
     fn risk_threshold_is_inclusive(
         #[case] value: u8,
         #[case] expected: Severity,
@@ -133,7 +135,7 @@ mod tests {
             ..clean()
         };
 
-        let verdict = judge_reputation(&sut, risk(50));
+        let verdict = judge_reputation(&sut);
 
         assert_eq!(verdict.severity, expected, "{}", verdict.detail);
     }
@@ -142,7 +144,7 @@ mod tests {
     fn a_clean_address_says_so_instead_of_an_empty_flag_list() {
         let sut = clean();
 
-        let verdict = judge_reputation(&sut, risk(50));
+        let verdict = judge_reputation(&sut);
 
         assert_eq!(verdict.detail, "risk 33, no flags");
     }
@@ -155,7 +157,7 @@ mod tests {
             ..clean()
         };
 
-        let verdict = judge_reputation(&sut, risk(50));
+        let verdict = judge_reputation(&sut);
 
         assert_eq!(verdict.detail, "risk 33, flags: vpn, anonymous");
     }

@@ -1,4 +1,5 @@
-use crate::model::{CheckResult, CountryCode, GateId};
+use crate::gate::{BridgePolicy, GateId};
+use crate::model::{CheckResult, CountryCode};
 
 /// Which gates a scan judges, chosen by the country the candidate was
 /// ordered in.
@@ -6,7 +7,8 @@ use crate::model::{CheckResult, CountryCode, GateId};
 /// A Russian address is a bridge, not an exit. Its country is known in
 /// advance, foreign services see it as Russian or refuse it, and the RIPE
 /// Atlas anchors the latency gate compares against are abroad, so those gates
-/// are reported as `SKIP` instead of being judged.
+/// are reported as `SKIP` instead of being judged. Which gates that covers
+/// is a per-gate fact of the registry (`gate::GATES`), not a naming rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanProfile {
     Exit,
@@ -33,32 +35,26 @@ impl ScanProfile {
         }
     }
 
-    pub fn scope(self, gate: &str) -> GateScope {
+    pub fn scope(self, gate: GateId) -> GateScope {
         match self {
             Self::Exit => GateScope::Judged,
-            Self::RuBridge => {
-                let foreign_only = matches!(gate, "geo" | "latency")
-                    || gate == "service-geo"
-                    || gate.starts_with("service-geo:")
-                    || gate.starts_with("service:")
-                    || gate.starts_with("ai:");
-                if foreign_only {
+            Self::RuBridge => match gate.bridge() {
+                BridgePolicy::ForeignExitOnly => {
                     GateScope::Skipped(RU_BRIDGE_REASON)
-                } else {
-                    GateScope::Judged
                 }
-            }
+                BridgePolicy::Judged => GateScope::Judged,
+            },
         }
     }
 
-    pub fn judges(self, gate: &str) -> bool {
+    pub fn judges(self, gate: GateId) -> bool {
         self.scope(gate) == GateScope::Judged
     }
 
     /// Turns a result of a gate this profile does not judge into a `SKIP` row
     /// carrying the reason; other results pass through unchanged.
     pub fn apply(self, result: CheckResult) -> CheckResult {
-        match self.scope(result.gate.as_str()) {
+        match self.scope(result.gate) {
             GateScope::Skipped(reason) => {
                 CheckResult::skipped(result.gate, reason)
             }
@@ -68,15 +64,15 @@ impl ScanProfile {
 
     /// A `SKIP` row for each of `gates` this profile does not judge, for gates
     /// whose probes were never started.
-    pub fn skipped<'a>(
+    pub fn skipped(
         self,
-        gates: impl IntoIterator<Item = &'a str>,
+        gates: impl IntoIterator<Item = GateId>,
     ) -> Vec<CheckResult> {
         gates
             .into_iter()
             .filter_map(|gate| match self.scope(gate) {
                 GateScope::Skipped(reason) => {
-                    Some(CheckResult::skipped(GateId::from(gate), reason))
+                    Some(CheckResult::skipped(gate, reason))
                 }
                 GateScope::Judged => None,
             })
@@ -87,7 +83,12 @@ impl ScanProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gate::{LATENCY, SERVICE_NETFLIX, TAMPERING};
     use crate::model::{Severity, Verdict};
+
+    fn gate(id: &str) -> GateId {
+        id.parse().unwrap()
+    }
 
     #[rstest::rstest]
     #[case::russia_in_any_case("ru", ScanProfile::RuBridge)]
@@ -110,10 +111,10 @@ mod tests {
     #[case::service_geo("service-geo")]
     #[case::service_geo_family("service-geo:cdn")]
     #[case::ai("ai:openai")]
-    fn a_bridge_skips_gates_meant_for_a_foreign_exit(#[case] gate: &str) {
+    fn a_bridge_skips_gates_meant_for_a_foreign_exit(#[case] id: &str) {
         let sut = ScanProfile::RuBridge;
 
-        assert!(!sut.judges(gate));
+        assert!(!sut.judges(gate(id)));
     }
 
     #[rstest::rstest]
@@ -125,20 +126,20 @@ mod tests {
     #[case::tampering("tampering")]
     #[case::steal("steal")]
     #[case::neighbors("neighbors")]
-    fn a_bridge_judges_the_remaining_gates(#[case] gate: &str) {
+    fn a_bridge_judges_the_remaining_gates(#[case] id: &str) {
         let sut = ScanProfile::RuBridge;
 
-        assert!(sut.judges(gate));
+        assert!(sut.judges(gate(id)));
     }
 
     #[test]
     fn an_exit_judges_every_gate() {
-        assert!(ScanProfile::Exit.judges("latency"));
+        assert!(ScanProfile::Exit.judges(LATENCY));
     }
 
     #[test]
     fn apply_turns_an_excluded_failure_into_a_skip_with_the_reason() {
-        let result = CheckResult::new("latency", Verdict::error("no anchors"));
+        let result = CheckResult::new(LATENCY, Verdict::error("no anchors"));
 
         let out = ScanProfile::RuBridge.apply(result);
 
@@ -149,8 +150,7 @@ mod tests {
 
     #[test]
     fn skipped_reports_only_the_excluded_gates() {
-        let out =
-            ScanProfile::RuBridge.skipped(["tampering", "service:netflix"]);
+        let out = ScanProfile::RuBridge.skipped([TAMPERING, SERVICE_NETFLIX]);
 
         let gates: Vec<_> =
             out.iter().map(|result| result.gate.as_str()).collect();
