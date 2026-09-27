@@ -66,9 +66,9 @@ impl Report {
     /// `0` no FAIL; `1` at least one FAIL; `2` no FAIL but at least one ERROR.
     /// This order is fixed by the Global Constraints — a FAIL always wins.
     pub fn exit_code(&self) -> i32 {
-        if self.results.iter().any(|r| r.severity == Severity::Fail) {
+        if self.results.iter().any(|r| r.severity() == Severity::Fail) {
             1
-        } else if self.results.iter().any(|r| r.severity == Severity::Error) {
+        } else if self.results.iter().any(|r| r.severity() == Severity::Error) {
             2
         } else {
             0
@@ -78,7 +78,7 @@ impl Report {
     pub fn overall(&self) -> Severity {
         self.results
             .iter()
-            .map(|r| r.severity)
+            .map(CheckResult::severity)
             .max()
             .unwrap_or(Severity::Ok)
     }
@@ -86,8 +86,8 @@ impl Report {
     fn sorted(&self) -> Vec<&CheckResult> {
         let mut rows: Vec<&CheckResult> = self.results.iter().collect();
         rows.sort_by(|a, b| {
-            b.severity
-                .cmp(&a.severity)
+            b.severity()
+                .cmp(&a.severity())
                 .then_with(|| a.gate.cmp(&b.gate))
         });
         rows

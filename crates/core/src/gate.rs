@@ -1,4 +1,4 @@
-use crate::model::{CheckResult, GateId, Severity};
+use crate::model::{CheckResult, GateId};
 use std::collections::HashSet;
 
 /// `--gate`/`--skip-gate` as parsed: which gate ids to force to FAIL when
@@ -15,19 +15,10 @@ pub struct GateOverrides {
 impl GateOverrides {
     pub fn apply(&self, result: CheckResult) -> CheckResult {
         if self.skip.contains(&result.gate) {
-            return CheckResult {
-                severity: Severity::Ok,
-                skipped: true,
-                ..result
-            };
+            return CheckResult::skipped(result.gate, result.detail);
         }
-        if self.escalate.contains(&result.gate)
-            && result.severity == Severity::Warn
-        {
-            return CheckResult {
-                severity: Severity::Fail,
-                ..result
-            };
+        if self.escalate.contains(&result.gate) {
+            return result.escalate_warning();
         }
         result
     }
@@ -67,7 +58,7 @@ mod tests {
 
         let out = sut.apply(CheckResult::new("service:claude", verdict));
 
-        assert_eq!(out.severity, expected);
+        assert_eq!(out.severity(), expected);
     }
 
     #[test]
@@ -79,7 +70,7 @@ mod tests {
             Verdict::fail("named Snowd"),
         ));
 
-        assert_eq!(out.severity, Severity::Ok);
+        assert_eq!(out.severity(), Severity::Ok);
         assert_eq!(out.label(), "SKIP");
         assert_eq!(out.detail, "named Snowd");
     }
@@ -93,6 +84,13 @@ mod tests {
             Verdict::warn("p75 over threshold"),
         ));
 
-        assert_eq!(out.severity, Severity::Ok);
+        assert_eq!(out.severity(), Severity::Ok);
+    }
+    #[test]
+    fn escalation_cannot_turn_a_skipped_check_into_a_failure() {
+        let sut = overrides(&["latency"], &[]);
+        let result = sut.apply(CheckResult::skipped("latency", "disabled"));
+        assert!(result.is_skipped());
+        assert_eq!(result.severity(), Severity::Ok);
     }
 }

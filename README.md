@@ -104,4 +104,17 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
-The project requires Rust 1.85 or newer and is licensed under MIT.
+The project requires Rust 1.88 or newer and is licensed under MIT.
+
+Development uses the toolchain pinned in `rust-toolchain.toml`. CI also checks
+all targets against Rust 1.88.0. Run `sh ci/check.sh` for the local checks;
+install `cargo-deny 0.20.2` and `cargo-machete 0.9.2` first. The dependency
+checks require network access to refresh the advisory database.
+
+`deny.toml` permits the licenses already present in the dependency graph.
+New license types require review. Duplicate crate versions are reported as
+warnings; known vulnerabilities and unknown dependency sources fail CI.
+
+The phase-B deadline covers preparation and measurements. Completed checks
+remain in the report; unfinished gates become errors. Remote listener cleanup
+runs afterward with a separate SSH command timeout (20 seconds by default).

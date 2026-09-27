@@ -71,7 +71,7 @@ fn median(xs: &[f64]) -> f64 {
     let mut sorted: Vec<f64> = xs.to_vec();
     sorted.sort_by(f64::total_cmp);
     let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         f64::midpoint(sorted[mid - 1], sorted[mid])
     } else {
         sorted[mid]

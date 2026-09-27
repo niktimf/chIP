@@ -145,7 +145,7 @@ fn first_nonempty_line(text: &str) -> Option<&str> {
 pub async fn sweep(
     network: Ipv4Net,
     config: &SweepConfig,
-) -> Vec<NeighborProbe> {
+) -> Result<Vec<NeighborProbe>, tokio::task::JoinError> {
     let semaphore = Arc::new(Semaphore::new(config.concurrency.get()));
     let mut tasks = tokio::task::JoinSet::new();
     for ip in network.hosts() {
@@ -170,14 +170,13 @@ pub async fn sweep(
         });
     }
 
-    let mut probes = Vec::new();
-    while let Some(result) = tasks.join_next().await {
-        if let Ok(Some(probe)) = result {
-            probes.push(probe);
-        }
-    }
+    let mut probes: Vec<_> = crate::tasks::collect(tasks)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
     probes.sort_by_key(|probe| probe.ip);
-    probes
+    Ok(probes)
 }
 
 #[cfg(test)]

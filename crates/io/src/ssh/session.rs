@@ -11,11 +11,41 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum SshError {
     #[error("ssh connect failed: {0}")]
-    Connect(String),
+    Connect(#[source] openssh::Error),
     #[error("ssh command failed: {0}")]
-    Command(String),
+    Command(#[source] openssh::Error),
+    #[error("{operation}: {source}")]
+    Io {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("ssh process exited with {status}: {output}")]
+    Exit {
+        status: std::process::ExitStatus,
+        output: String,
+    },
     #[error("ssh command timed out")]
     Timeout,
+    #[error("SOCKS listener did not become ready")]
+    SocksNotReady,
+    #[error("could not parse /proc/stat")]
+    InvalidSnapshot,
+    #[error("a temporary listener is already owned by this session")]
+    ListenerAlreadyStarted,
+    #[error("listener port cannot be zero")]
+    InvalidListenerPort,
+    #[error("unexpected listener preflight response: {0}")]
+    InvalidPreflightResponse(String),
+}
+
+impl SshError {
+    pub(super) const fn io(
+        operation: &'static str,
+        source: std::io::Error,
+    ) -> Self {
+        Self::Io { operation, source }
+    }
 }
 
 pub(super) fn secret_file(content: &str) -> std::io::Result<NamedTempFile> {
@@ -41,17 +71,11 @@ pub struct SshConfig {
     pub command_timeout: Duration,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Preflight {
-    pub has_openssl: bool,
-    pub port_443_free: bool,
-    pub can_sudo: bool,
-}
-
 #[derive(Debug)]
 pub struct SshSession {
     session: Session,
     default_timeout: Duration,
+    pub(super) listener_port: std::sync::atomic::AtomicU16,
     _key_file: Option<NamedTempFile>,
     _known_hosts_file: Option<NamedTempFile>,
 }
@@ -66,13 +90,13 @@ impl SshSession {
             .as_ref()
             .map(|key| secret_file(key.expose()))
             .transpose()
-            .map_err(|e| SshError::Connect(e.to_string()))?;
+            .map_err(|e| SshError::io("prepare SSH credentials", e))?;
         let known_hosts_file = config
             .known_hosts
             .as_deref()
             .map(secret_file)
             .transpose()
-            .map_err(|e| SshError::Connect(e.to_string()))?;
+            .map_err(|e| SshError::io("prepare SSH credentials", e))?;
         let mut builder = SessionBuilder::default();
         if let Some(user) = &config.user {
             builder.user(user.clone());
@@ -96,10 +120,11 @@ impl SshSession {
         let session = builder
             .connect(address.to_string())
             .await
-            .map_err(|e| SshError::Connect(error_detail(&e)))?;
+            .map_err(SshError::Connect)?;
         Ok(Self {
             session,
             default_timeout: config.command_timeout,
+            listener_port: std::sync::atomic::AtomicU16::new(0),
             _key_file: key_file,
             _known_hosts_file: known_hosts_file,
         })
@@ -130,14 +155,12 @@ impl SshSession {
     }
 
     async fn collect(
-        fut: impl std::future::Future<
-            Output = Result<std::process::Output, openssh::Error>,
-        >,
+        fut: impl Future<Output = Result<std::process::Output, openssh::Error>>,
         timeout: Duration,
     ) -> Result<String, SshError> {
         match tokio::time::timeout(timeout, fut).await {
             Err(_) => Err(SshError::Timeout),
-            Ok(Err(e)) => Err(SshError::Command(error_detail(&e))),
+            Ok(Err(e)) => Err(SshError::Command(e)),
             Ok(Ok(out)) => {
                 let mut text =
                     String::from_utf8_lossy(&out.stdout).into_owned();
@@ -145,79 +168,27 @@ impl SshSession {
                 if out.status.success() {
                     Ok(text)
                 } else {
-                    let detail = text
-                        .lines()
-                        .rev()
-                        .find(|line| !line.trim().is_empty())
-                        .map_or_else(
-                            || {
-                                format!(
-                                    "remote command exited with {}",
-                                    out.status
-                                )
-                            },
-                            |line| line.trim().chars().take(120).collect(),
-                        );
-                    Err(SshError::Command(detail))
+                    Err(SshError::Exit {
+                        status: out.status,
+                        output: text,
+                    })
                 }
             }
         }
     }
 
-    /// Lets sibling SSH operations use the same bounded command duration
-    /// without exposing the backing field.
+    /// Port whose remote startup or listener still needs cleanup.
+    pub fn listener_port(&self) -> Option<u16> {
+        NonZeroU16::new(
+            self.listener_port
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .map(NonZeroU16::get)
+    }
+
     pub const fn command_timeout(&self) -> Duration {
         self.default_timeout
     }
-
-    pub async fn preflight(&self) -> Preflight {
-        let timeout = self.default_timeout;
-        let openssl = self
-            .run_command("openssl", &["version"], timeout)
-            .await
-            .is_ok_and(|s| !s.trim().is_empty());
-        let port_free = self
-            .run_shell(
-                "ss -ltn 2>/dev/null | grep -q ':443 ' && echo BUSY || echo FREE",
-                timeout,
-            )
-            .await
-            .is_ok_and(|s| s.trim() == "FREE");
-        let can_sudo = self
-            .run_command("sudo", &["-n", "true"], timeout)
-            .await
-            .is_ok();
-        Preflight {
-            has_openssl: openssl,
-            port_443_free: port_free,
-            can_sudo,
-        }
-    }
-}
-
-/// The deepest source's last non-empty line, capped so it fits a report row.
-/// `openssh` nests the real reason several sources deep, and only the last
-/// line of it names what actually went wrong.
-fn error_detail(err: &openssh::Error) -> String {
-    let deepest =
-        std::iter::successors(Some(err as &dyn std::error::Error), |e| {
-            e.source()
-        })
-        .last()
-        .unwrap_or(err);
-    let text = deepest.to_string();
-    let reason = text
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    let reason = if reason.is_empty() {
-        err.to_string()
-    } else {
-        reason.to_string()
-    };
-    reason.chars().take(120).collect()
 }
 
 #[cfg(test)]
@@ -235,5 +206,45 @@ mod tests {
 
         assert_eq!(mode, 0o600);
         assert!(text.ends_with("-----END KEY-----\n"));
+    }
+    #[test]
+    fn io_errors_retain_their_typed_source_and_full_detail() {
+        use std::error::Error as _;
+        let detail = "x".repeat(300);
+        let error = SshError::io(
+            "spawn ssh",
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                detail.clone(),
+            ),
+        );
+        let source = error
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap();
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(source.to_string(), detail);
+    }
+    #[tokio::test]
+    async fn remote_command_errors_keep_the_complete_source_chain() {
+        use std::error::Error as _;
+        let source = openssh::Error::Remote(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "remote execution denied",
+        ));
+        let error =
+            SshSession::collect(async { Err(source) }, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+        let io = error
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap();
+        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(io.to_string(), "remote execution denied");
     }
 }

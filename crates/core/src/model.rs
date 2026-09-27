@@ -206,43 +206,56 @@ impl fmt::Display for CityName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckResult {
     pub gate: GateId,
-    pub severity: Severity,
     pub detail: String,
-    /// Set when nothing was judged: the gate was turned off by `--skip-gate`,
-    /// `--no-ssh` or `--no-neighbors`. The severity is then `Ok` only because
-    /// no verdict was reached, so the report prints `SKIP` instead of `OK`
-    /// and the exit code stays unaffected.
-    pub skipped: bool,
+    outcome: CheckOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckOutcome {
+    Judged(Severity),
+    Skipped,
 }
 
 impl CheckResult {
     pub fn new(gate: impl Into<GateId>, verdict: Verdict) -> Self {
         Self {
             gate: gate.into(),
-            severity: verdict.severity,
             detail: verdict.detail,
-            skipped: false,
+            outcome: CheckOutcome::Judged(verdict.severity),
         }
     }
 
-    /// A gate the operator turned off. `reason` is what would otherwise have
-    /// been judged (or why judging was impossible) and reaches the report
-    /// unchanged.
     pub fn skipped(gate: impl Into<GateId>, reason: impl Into<String>) -> Self {
         Self {
             gate: gate.into(),
-            severity: Severity::Ok,
             detail: reason.into(),
-            skipped: true,
+            outcome: CheckOutcome::Skipped,
         }
     }
 
-    /// What the report prints in the severity column.
+    pub const fn severity(&self) -> Severity {
+        match self.outcome {
+            CheckOutcome::Judged(severity) => severity,
+            CheckOutcome::Skipped => Severity::Ok,
+        }
+    }
+
+    pub const fn is_skipped(&self) -> bool {
+        matches!(self.outcome, CheckOutcome::Skipped)
+    }
+
+    #[must_use]
+    pub const fn escalate_warning(mut self) -> Self {
+        if matches!(self.outcome, CheckOutcome::Judged(Severity::Warn)) {
+            self.outcome = CheckOutcome::Judged(Severity::Fail);
+        }
+        self
+    }
+
     pub const fn label(&self) -> &'static str {
-        if self.skipped {
-            "SKIP"
-        } else {
-            self.severity.as_str()
+        match self.outcome {
+            CheckOutcome::Skipped => "SKIP",
+            CheckOutcome::Judged(severity) => severity.as_str(),
         }
     }
 }
@@ -768,7 +781,7 @@ mod tests {
             "ports 443 and 8443 are already in use",
         );
 
-        assert_eq!(sut.severity, Severity::Ok);
+        assert_eq!(sut.severity(), Severity::Ok);
         assert_eq!(sut.label(), "SKIP");
         assert_eq!(sut.detail, "ports 443 and 8443 are already in use");
     }

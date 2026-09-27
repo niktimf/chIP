@@ -196,7 +196,15 @@ impl GlobalpingClient {
         id: &MeasurementId,
         deadline: Duration,
     ) -> Result<RawMeasurement, GlobalpingError> {
-        let start = tokio::time::Instant::now();
+        tokio::time::timeout(deadline, self.poll(id))
+            .await
+            .map_err(|_| GlobalpingError::Timeout)?
+    }
+
+    async fn poll(
+        &self,
+        id: &MeasurementId,
+    ) -> Result<RawMeasurement, GlobalpingError> {
         loop {
             let measurement: RawMeasurement = self
                 .request(
@@ -209,9 +217,6 @@ impl GlobalpingClient {
                 .await?;
             if measurement.status != "in-progress" {
                 return Ok(measurement);
-            }
-            if start.elapsed() >= deadline {
-                return Err(GlobalpingError::Timeout);
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
@@ -542,5 +547,21 @@ mod tests {
 
         assert!(!displayed.contains("SECRET123"), "{displayed}");
         assert!(!debugged.contains("SECRET123"), "{debugged}");
+    }
+    #[tokio::test]
+    async fn a_finished_response_arriving_after_the_deadline_is_rejected() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"id": "slow", "status": "finished", "results": []}))
+                .set_delay(Duration::from_millis(300)))
+            .mount(&server).await;
+        let result = client_against(&server)
+            .poll_until_finished(
+                &measurement_id("slow"),
+                Duration::from_millis(50),
+            )
+            .await;
+        assert!(matches!(result, Err(GlobalpingError::Timeout)));
     }
 }

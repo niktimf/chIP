@@ -15,7 +15,9 @@ use std::num::NonZeroU16;
 use std::time::Duration;
 
 use chip_io::credentials::SshPrivateKey;
-use chip_io::ssh::{ListenerOutcome, SocksTunnel, SshConfig, SshSession};
+use chip_io::ssh::{
+    ListenerOutcome, ListenerReadiness, SocksTunnel, SshConfig, SshSession,
+};
 use chip_io::tunnel::TunnelClient;
 
 fn candidate() -> Option<Ipv4Addr> {
@@ -67,9 +69,18 @@ async fn the_candidate_carries_what_a_scan_needs_over_ssh() {
     let sut = SshSession::connect(ip, &config())
         .await
         .expect("the candidate accepts our key");
-    let preflight = sut.preflight().await;
+    let readiness = sut
+        .listener_readiness(listener_port())
+        .await
+        .expect("preflight succeeds");
 
-    assert!(preflight.has_openssl, "the listener needs openssl remotely");
+    assert!(
+        matches!(
+            readiness,
+            ListenerReadiness::Ready | ListenerReadiness::PortInUse
+        ),
+        "listener prerequisites: {readiness:?}"
+    );
 }
 
 #[tokio::test]

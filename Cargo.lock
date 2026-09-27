@@ -214,7 +214,6 @@ dependencies = [
  "pretty_assertions",
  "regex",
  "rstest",
- "serde",
  "thiserror",
  "url",
 ]

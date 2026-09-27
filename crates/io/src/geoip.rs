@@ -93,7 +93,10 @@ impl GeoIpClient {
         }
     }
 
-    pub async fn consensus(&self, ip: Ipv4Addr) -> GeoConsensusFacts {
+    pub async fn consensus(
+        &self,
+        ip: Ipv4Addr,
+    ) -> Result<GeoConsensusFacts, tokio::task::JoinError> {
         let mut tasks = tokio::task::JoinSet::new();
         for (index, source) in self.sources.iter().enumerate() {
             let http = self.http.clone();
@@ -106,12 +109,10 @@ impl GeoIpClient {
             });
         }
         let mut votes = vec![None; self.sources.len()];
-        while let Some(result) = tasks.join_next().await {
-            if let Ok((index, vote)) = result {
-                votes[index] = vote;
-            }
+        for (index, vote) in crate::tasks::collect(tasks).await? {
+            votes[index] = vote;
         }
-        GeoConsensusFacts { votes }
+        Ok(GeoConsensusFacts { votes })
     }
 
     async fn query_one(
@@ -120,15 +121,17 @@ impl GeoIpClient {
         url: &str,
         pointer: &str,
     ) -> Option<CountryCode> {
-        let response = tokio::time::timeout(timeout, http.get(url).send())
-            .await
-            .ok()?
-            .ok()?;
-        if !response.status().is_success() {
-            return None;
-        }
-        let value: serde_json::Value = response.json().await.ok()?;
-        extract(&value, pointer)
+        tokio::time::timeout(timeout, async {
+            let response = http.get(url).send().await.ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            let value: serde_json::Value = response.json().await.ok()?;
+            extract(&value, pointer)
+        })
+        .await
+        .ok()
+        .flatten()
     }
 }
 
@@ -216,8 +219,42 @@ mod tests {
             sources,
         );
 
-        let facts = sut.consensus("203.0.113.1".parse().unwrap()).await;
+        let facts =
+            sut.consensus("203.0.113.1".parse().unwrap()).await.unwrap();
 
         assert_eq!(facts.votes, vec![Some(cc("FI")), None]);
+    }
+    #[tokio::test]
+    async fn source_timeout_includes_reading_the_response_body() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, hold) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
+                .await
+                .unwrap();
+            let _ = hold.await;
+        });
+        let http = reqwest::Client::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            GeoIpClient::query_one(
+                &http,
+                Duration::from_millis(100),
+                &format!("http://{address}"),
+                "/country",
+            ),
+        )
+        .await;
+        let _ = release.send(());
+        server.await.unwrap();
+        assert_eq!(result.unwrap(), None);
     }
 }

@@ -73,7 +73,7 @@ async fn probe_at(
 /// endpoints. Requests are concurrent and every task is joined.
 pub async fn probe_portal_endpoints(
     client: &TunnelClient,
-) -> (Vec<PortalOutcome>, Vec<PortalOutcome>) {
+) -> Result<(Vec<PortalOutcome>, Vec<PortalOutcome>), tokio::task::JoinError> {
     let mut tasks = tokio::task::JoinSet::new();
     for (index, endpoint) in PORTAL_ENDPOINTS.iter().copied().enumerate() {
         let client = client.clone();
@@ -89,19 +89,14 @@ pub async fn probe_portal_endpoints(
         });
     }
 
-    let mut rows = Vec::with_capacity(PORTAL_ENDPOINTS.len());
-    while let Some(result) = tasks.join_next().await {
-        if let Ok(row) = result {
-            rows.push(row);
-        }
-    }
+    let mut rows = crate::tasks::collect(tasks).await?;
     rows.sort_by_key(|(index, _, _)| *index);
     let (https, http): (Vec<_>, Vec<_>) =
         rows.into_iter().partition(|(_, is_https, _)| *is_https);
-    (
+    Ok((
         https.into_iter().map(|(_, _, outcome)| outcome).collect(),
         http.into_iter().map(|(_, _, outcome)| outcome).collect(),
-    )
+    ))
 }
 
 #[cfg(test)]

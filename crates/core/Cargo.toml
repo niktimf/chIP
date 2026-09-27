@@ -10,7 +10,6 @@ country-code-enum = { workspace = true }
 ipnet = { workspace = true }
 itertools = { workspace = true }
 regex = { workspace = true }
-serde = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
 

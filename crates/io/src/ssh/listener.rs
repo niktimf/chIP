@@ -1,11 +1,43 @@
 use super::session::{SshError, SshSession};
 use chip_core::model::ProcStatSnapshot;
+use std::num::NonZeroU16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListenerOutcome {
     Listening,
     PortInUse,
     Failed(String),
+}
+
+/// A successful preflight describes one actionable state. Transport and
+/// command failures remain errors, rather than masquerading as a busy port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerReadiness {
+    Ready,
+    PortInUse,
+    MissingOpenSsl,
+    MissingSocketInspector,
+}
+
+impl ListenerReadiness {
+    fn parse(output: &str) -> Result<Self, SshError> {
+        match output.trim() {
+            "READY" => Ok(Self::Ready),
+            "BUSY" => Ok(Self::PortInUse),
+            "MISSING_OPENSSL" => Ok(Self::MissingOpenSsl),
+            "MISSING_SS" => Ok(Self::MissingSocketInspector),
+            _ => Err(SshError::InvalidPreflightResponse(output.to_owned())),
+        }
+    }
+}
+
+fn listener_preflight_script(port: NonZeroU16) -> String {
+    format!(
+        "command -v openssl >/dev/null 2>&1 || {{ echo MISSING_OPENSSL; exit 0; }}; \
+         command -v ss >/dev/null 2>&1 || {{ echo MISSING_SS; exit 0; }}; \
+         LISTENERS=$(ss -H -ltn 'sport = :{port}') || exit; \
+         if [ -z \"$LISTENERS\" ]; then echo READY; else echo BUSY; fi"
+    )
 }
 
 fn parse_proc_stat(text: &str) -> Option<ProcStatSnapshot> {
@@ -48,7 +80,8 @@ fn listener_start_script(port: u16) -> String {
 
 fn listener_stop_script(port: u16) -> String {
     format!(
-        "pkill -f '^timeout 600 openssl s_server -accept {port}' 2>/dev/null || true; \
+        "pkill -KILL -u \"$(id -u)\" -f '[c]hip-listener-start-{port}$' 2>/dev/null || true; \
+         pkill -f '^timeout 600 openssl s_server -accept {port}' 2>/dev/null || true; \
          for D in /tmp/chip-pf-{port}.*; do \
            [ -L \"$D\" ] && continue; [ -d \"$D\" ] || continue; \
            [ \"$(stat -c %u \"$D\" 2>/dev/null)\" = \"$(id -u)\" ] || continue; \
@@ -62,6 +95,16 @@ fn listener_stop_script(port: u16) -> String {
 }
 
 impl SshSession {
+    pub async fn listener_readiness(
+        &self,
+        port: NonZeroU16,
+    ) -> Result<ListenerReadiness, SshError> {
+        let output = self
+            .run_shell(&listener_preflight_script(port), self.command_timeout())
+            .await?;
+        ListenerReadiness::parse(&output)
+    }
+
     /// Starts `openssl s_server` on `port` under `timeout 600` (it dies on
     /// its own after 10 minutes even if this process is killed first), after
     /// generating a throwaway self-signed cert in a private temporary
@@ -71,28 +114,46 @@ impl SshSession {
         &self,
         port: u16,
     ) -> Result<ListenerOutcome, SshError> {
+        if self.listener_port().is_some() {
+            return Err(SshError::ListenerAlreadyStarted);
+        }
+        let port =
+            NonZeroU16::new(port).ok_or(SshError::InvalidListenerPort)?;
+        match self.listener_readiness(port).await? {
+            ListenerReadiness::Ready => {}
+            ListenerReadiness::PortInUse => {
+                return Ok(ListenerOutcome::PortInUse);
+            }
+            ListenerReadiness::MissingOpenSsl => {
+                return Ok(ListenerOutcome::Failed(
+                    "openssl is not installed on the candidate".to_string(),
+                ));
+            }
+            ListenerReadiness::MissingSocketInspector => {
+                return Ok(ListenerOutcome::Failed(
+                    "ss is not installed on the candidate".to_string(),
+                ));
+            }
+        }
         let timeout = self.command_timeout();
-        let preflight = self.preflight().await;
-        if !preflight.has_openssl {
-            return Ok(ListenerOutcome::Failed(
-                "openssl is not installed on the candidate".to_string(),
-            ));
-        }
-        let port_free = if port == 443 {
-            preflight.port_443_free
-        } else {
-            self.run_shell(
-                &format!("ss -ltn 2>/dev/null | grep -q ':{port} ' && echo BUSY || echo FREE"),
-                timeout,
-            )
-            .await
-            .is_ok_and(|output| output.trim() == "FREE")
-        };
-        if !port_free {
-            return Ok(ListenerOutcome::PortInUse);
-        }
+        let port = port.get();
         let script = listener_start_script(port);
-        let output = self.run_shell(&script, timeout).await?;
+        // Ownership is registered before awaiting a command that can create
+        // remote state, including when its response is lost or cancelled.
+        self.listener_port
+            .compare_exchange(
+                0,
+                port,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .map_err(|_| SshError::ListenerAlreadyStarted)?;
+        // Give the remote startup shell an identity so cleanup can stop it
+        // before removing state, even if the SSH response was cancelled.
+        let tag = format!("chip-listener-start-{port}");
+        let output = self
+            .run_command("sh", &["-c", &script, &tag], timeout)
+            .await?;
         if output.contains("LISTENING") {
             Ok(ListenerOutcome::Listening)
         } else {
@@ -103,15 +164,20 @@ impl SshSession {
     pub async fn stop_listener(&self, port: u16) -> Result<(), SshError> {
         let timeout = self.command_timeout();
         let script = listener_stop_script(port);
-        self.run_shell(&script, timeout).await.map(|_| ())
+        self.run_shell(&script, timeout).await?;
+        let _ = self.listener_port.compare_exchange(
+            port,
+            0,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(())
     }
 
     pub async fn steal_snapshot(&self) -> Result<ProcStatSnapshot, SshError> {
         let timeout = self.command_timeout();
         let text = self.run_command("cat", &["/proc/stat"], timeout).await?;
-        parse_proc_stat(&text).ok_or_else(|| {
-            SshError::Command("could not parse /proc/stat".to_string())
-        })
+        parse_proc_stat(&text).ok_or(SshError::InvalidSnapshot)
     }
 }
 
@@ -231,5 +297,105 @@ mod tests {
                 .unwrap();
             assert!(status.success(), "sh -n failed for: {script}");
         }
+    }
+    #[rstest::rstest]
+    #[case("READY\n", ListenerReadiness::Ready)]
+    #[case("BUSY\n", ListenerReadiness::PortInUse)]
+    #[case("MISSING_OPENSSL\n", ListenerReadiness::MissingOpenSsl)]
+    #[case("MISSING_SS\n", ListenerReadiness::MissingSocketInspector)]
+    fn preflight_returns_one_actionable_state(
+        #[case] response: &str,
+        #[case] expected: ListenerReadiness,
+    ) {
+        assert_eq!(ListenerReadiness::parse(response).unwrap(), expected);
+    }
+
+    #[test]
+    fn unreadable_preflight_is_not_a_free_or_busy_port() {
+        assert!(matches!(
+            ListenerReadiness::parse(""),
+            Err(SshError::InvalidPreflightResponse(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_inspection_failure_is_not_reported_as_a_free_port() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stub(dir.path(), "openssl", "exit 0");
+        write_stub(dir.path(), "ss", "echo 'inspection denied' >&2; exit 1");
+        let result = run_sh(
+            &listener_preflight_script(NonZeroU16::new(8443).unwrap()),
+            dir.path(),
+        );
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+    }
+    #[cfg(unix)]
+    fn wait_for_file(path: &std::path::Path) -> bool {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !path.exists() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    const DELAYED_CERT_GENERATION: &str = r#"
+if [ "$1" = req ]; then
+    touch "$CHIP_TEST_STATE/started"
+    for attempt in $(seq 1 300); do
+        [ -f "$CHIP_TEST_STATE/release" ] && break
+        sleep 0.01
+    done
+    touch "$CHIP_TEST_STATE/done"
+else
+    touch "$CHIP_TEST_STATE/server"
+fi
+"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_stops_startup_before_it_can_launch_a_late_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let reservation =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        write_stub(dir.path(), "openssl", DELAYED_CERT_GENERATION);
+        write_stub(dir.path(), "ufw", "exit 0");
+        write_stub(dir.path(), "sudo", "exit 1");
+        write_stub(dir.path(), "ss", "exit 0");
+        let mut startup = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &listener_start_script(port),
+                &format!("chip-listener-start-{port}"),
+            ])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("CHIP_TEST_STATE", dir.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = wait_for_file(&dir.path().join("started"));
+        let stopped = run_sh(&listener_stop_script(port), dir.path());
+        std::fs::write(dir.path().join("release"), "").unwrap();
+        let status = startup.wait().unwrap();
+        let finished = wait_for_file(&dir.path().join("done"));
+        assert!(started && finished, "startup fixture did not run");
+        assert!(stopped.status.success());
+        assert!(!status.success(), "startup must be terminated by cleanup");
+        assert!(!dir.path().join("server").exists());
+        assert!(listener_state_dirs(port).is_empty());
     }
 }

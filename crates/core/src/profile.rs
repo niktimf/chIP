@@ -142,8 +142,8 @@ mod tests {
 
         let out = ScanProfile::RuBridge.apply(result);
 
-        assert!(out.skipped);
-        assert_eq!(out.severity, Severity::Ok);
+        assert!(out.is_skipped());
+        assert_eq!(out.severity(), Severity::Ok);
         assert!(out.detail.contains("--country RU"), "{}", out.detail);
     }
 

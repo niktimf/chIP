@@ -12,3 +12,5 @@ pub mod ripestat;
 pub mod rkn_registry;
 pub mod ssh;
 pub mod tunnel;
+
+mod tasks;

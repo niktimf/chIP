@@ -44,9 +44,8 @@ impl SocksTunnel {
             key_file,
             known_hosts_file,
         } = prepare_tunnel_command(program, address, config, local_port)?;
-        let mut child = command.spawn().map_err(|e| {
-            SshError::Connect(format!("could not spawn ssh: {e}"))
-        })?;
+        let mut child =
+            command.spawn().map_err(|e| SshError::io("spawn ssh", e))?;
         wait_for_socks(&mut child, local_port, config.connect_timeout).await?;
 
         Ok(Self {
@@ -78,13 +77,13 @@ fn prepare_tunnel_command(
         .as_ref()
         .map(|key| secret_file(key.expose()))
         .transpose()
-        .map_err(|error| SshError::Connect(error.to_string()))?;
+        .map_err(|error| SshError::io("prepare SSH credentials", error))?;
     let known_hosts_file = config
         .known_hosts
         .as_deref()
         .map(secret_file)
         .transpose()
-        .map_err(|error| SshError::Connect(error.to_string()))?;
+        .map_err(|error| SshError::io("prepare SSH credentials", error))?;
     let mut command = base_tunnel_command(program, config, local_port);
     configure_authentication(
         &mut command,
@@ -156,22 +155,22 @@ async fn wait_for_socks(
     let ready_deadline = tokio::time::Instant::now()
         + connect_timeout.min(Duration::from_secs(5));
     loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(SshError::Connect(child_error(child, status).await));
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| SshError::io("inspect ssh process", error))?
+        {
+            return Err(child_error(child, status).await);
         }
         if socks5_ready(local_port).await {
             return Ok(());
         }
         if tokio::time::Instant::now() >= ready_deadline {
             let _ = child.kill().await;
-            child.wait().await.map_err(|error| {
-                SshError::Connect(format!(
-                    "SOCKS listener did not become ready and ssh could not be reaped: {error}"
-                ))
-            })?;
-            return Err(SshError::Connect(
-                "SOCKS listener did not become ready".to_string(),
-            ));
+            child
+                .wait()
+                .await
+                .map_err(|error| SshError::io("reap ssh process", error))?;
+            return Err(SshError::SocksNotReady);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -194,19 +193,24 @@ async fn socks5_ready(local_port: NonZeroU16) -> bool {
 async fn child_error(
     child: &mut Child,
     status: std::process::ExitStatus,
-) -> String {
+) -> SshError {
     let mut stderr = String::new();
     if let Some(pipe) = child.stderr.take() {
-        let _ = pipe.take(4096).read_to_string(&mut stderr).await;
-    }
-    stderr
-        .lines()
-        .map(str::trim)
-        .rfind(|line| !line.is_empty())
-        .map_or_else(
-            || format!("ssh exited with {status}"),
-            |line| line.chars().take(120).collect(),
+        match tokio::time::timeout(
+            Duration::from_secs(1),
+            pipe.take(4096).read_to_string(&mut stderr),
         )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => return SshError::io("read ssh stderr", error),
+            Err(_) => return SshError::Timeout,
+        }
+    }
+    SshError::Exit {
+        status,
+        output: stderr,
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -249,7 +253,7 @@ mod tests {
         )
         .await;
         match result {
-            Err(SshError::Connect(msg)) => {
+            Err(SshError::Exit { output: msg, .. }) => {
                 assert!(msg.contains("Permission denied"), "{msg}");
             }
             other => {
@@ -275,7 +279,7 @@ mod tests {
         .await;
 
         match sut {
-            Err(SshError::Connect(detail)) => {
+            Err(SshError::Exit { output: detail, .. }) => {
                 assert!(detail.contains("arguments accepted"), "{detail}");
             }
             other => {
@@ -347,7 +351,7 @@ mod tests {
 
         responder.abort();
         assert!(
-            matches!(result, Err(SshError::Connect(ref detail)) if detail.contains("did not become ready")),
+            matches!(result, Err(SshError::SocksNotReady)),
             "unexpected result: {:?}",
             result.map(|_| ())
         );

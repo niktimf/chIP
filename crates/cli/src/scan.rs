@@ -1,12 +1,11 @@
 use std::net::Ipv4Addr;
 use std::num::NonZeroU16;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chip_core::ip_lists::RknRegistry;
 use chip_core::model::{
-    CaptchaObservation, PingSweepFacts, PortalOutcome, ReputationFacts,
-    RiskScore, ServiceCountryVote, ServiceState,
+    PingSweepFacts, ReputationFacts, RiskScore, ServiceState,
 };
 use chip_core::verdict::ai::judge_ai_endpoints;
 use chip_core::verdict::blocklists::judge_blocklists;
@@ -58,6 +57,62 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const GLOBALPING_DEADLINE: Duration = Duration::from_secs(90);
 const SERVICE_COUNTRY_FAIL_ON: &[&str] = &["google", "youtube"];
 
+/// All producers are polled in this scope; the short collector lock is never held across await.
+#[derive(Default)]
+struct ScanProgress(Mutex<Vec<CheckResult>>);
+
+impl ScanProgress {
+    fn add(&self, results: impl IntoIterator<Item = CheckResult>) {
+        self.0
+            .lock()
+            .expect("result collector cannot be poisoned")
+            .extend(results);
+    }
+
+    async fn record(
+        &self,
+        work: impl std::future::Future<Output = Vec<CheckResult>>,
+    ) {
+        self.add(work.await);
+    }
+
+    fn finish(self) -> Vec<CheckResult> {
+        self.0
+            .into_inner()
+            .expect("result collector cannot be poisoned")
+    }
+
+    fn deadline(&self, duration: Duration) {
+        let detail = format!(
+            "phase B exceeded the {}s overall deadline",
+            duration.as_secs()
+        );
+        let mut results =
+            self.0.lock().expect("result collector cannot be poisoned");
+        for gate in ["latency", "reach", "steal"]
+            .into_iter()
+            .chain(TUNNEL_GATES)
+            .chain(NEIGHBOR_GATES)
+        {
+            if !results.iter().any(|result| result.gate == gate) {
+                results.push(CheckResult::new(gate, Verdict::error(&detail)));
+            }
+        }
+        results.push(CheckResult::new("scan-deadline", Verdict::error(detail)));
+    }
+}
+
+fn apply_rules(
+    profile: ScanProfile,
+    overrides: &chip_core::GateOverrides,
+    results: Vec<CheckResult>,
+) -> Vec<CheckResult> {
+    results
+        .into_iter()
+        .map(|result| overrides.apply(profile.apply(result)))
+        .collect()
+}
+
 pub fn network_24(ip: Ipv4Addr) -> Ipv4Net {
     Ipv4Net::new(ip, 24)
         .expect("24 is a valid IPv4 prefix length")
@@ -68,7 +123,7 @@ pub fn should_short_circuit(results: &[CheckResult], fail_fast: bool) -> bool {
     fail_fast
         && results
             .iter()
-            .any(|result| result.severity == Severity::Fail)
+            .any(|result| result.severity() == Severity::Fail)
 }
 
 pub fn globalping_budget(eyeball: u8, datacenter: u8) -> u32 {
@@ -144,8 +199,13 @@ pub async fn run_phase_a(
     let geo = async {
         match profile.scope("geo") {
             GateScope::Judged => {
-                let facts = geo_client.consensus(ip).await;
-                CheckResult::new("geo", judge_geo(&facts, command.country()))
+                let verdict = geo_client.consensus(ip).await.map_or_else(
+                    |error| {
+                        Verdict::error(format!("GeoIP task failed: {error}"))
+                    },
+                    |facts| judge_geo(&facts, command.country()),
+                );
+                CheckResult::new("geo", verdict)
             }
             GateScope::Skipped(reason) => CheckResult::skipped("geo", reason),
         }
@@ -192,7 +252,10 @@ async fn anchor_measurements(
     client: &GlobalpingClient,
     first_measurement_id: &MeasurementId,
     anchors: &[Anchor],
-) -> Vec<(String, chip_io::globalping::RawMeasurement)> {
+) -> Result<
+    Vec<(String, chip_io::globalping::RawMeasurement)>,
+    tokio::task::JoinError,
+> {
     let client = Arc::new(client.clone());
     let mut tasks = tokio::task::JoinSet::new();
     for anchor in anchors {
@@ -217,12 +280,12 @@ async fn anchor_measurements(
     }
     let mut measurements = Vec::new();
     while let Some(result) = tasks.join_next().await {
-        if let Ok(Some(measurement)) = result {
+        if let Some(measurement) = result? {
             measurements.push(measurement);
         }
     }
     measurements.sort_by(|left, right| left.0.cmp(&right.0));
-    measurements
+    Ok(measurements)
 }
 
 async fn reach_measurement(
@@ -288,7 +351,16 @@ async fn latency_results(
     if !command.profile().judges("latency") {
         return command.profile().skipped(["latency"]);
     }
-    let anchors = anchor_measurements(client, candidate_id, city_anchors).await;
+    let anchors =
+        match anchor_measurements(client, candidate_id, city_anchors).await {
+            Ok(anchors) => anchors,
+            Err(error) => {
+                return vec![CheckResult::new(
+                    "latency",
+                    Verdict::error(format!("anchor task failed: {error}")),
+                )];
+            }
+        };
     let latency = ping_sweep_facts(candidate, &anchors).map_or_else(
         |error| Verdict::error(error.to_string()),
         |facts: PingSweepFacts| {
@@ -304,6 +376,7 @@ async fn run_globalping_measurements(
     city_anchors: &[Anchor],
     listener: Option<u16>,
     control_anchor: Option<&Anchor>,
+    progress: &ScanProgress,
 ) -> Vec<CheckResult> {
     // Without a listener the candidate ping would only feed the latency gate.
     if listener.is_none() && !command.profile().judges("latency") {
@@ -328,27 +401,26 @@ async fn run_globalping_measurements(
         Ok(measurement) => measurement,
         Err(error) => return unavailable_globalping_results(&error, listener),
     };
-    let mut results = latency_results(
-        client,
-        command,
-        &candidate_id,
-        &candidate,
-        city_anchors,
-    )
-    .await;
+    progress
+        .record(latency_results(
+            client,
+            command,
+            &candidate_id,
+            &candidate,
+            city_anchors,
+        ))
+        .await;
     if let Some(port) = listener {
-        results.push(
-            reach_measurement(
-                client,
-                &candidate_id,
-                command.ip(),
-                port,
-                control_anchor,
-            )
-            .await,
-        );
+        progress.add([reach_measurement(
+            client,
+            &candidate_id,
+            command.ip(),
+            port,
+            control_anchor,
+        )
+        .await]);
     }
-    results
+    Vec::new()
 }
 
 fn unavailable_globalping_results(
@@ -408,137 +480,147 @@ fn tunnel_results(verdict: &Verdict) -> Vec<CheckResult> {
         .collect()
 }
 
-type NamedServiceState = (&'static str, ServiceState);
-type CdnEdgeObservation = (&'static str, Option<CountryCode>);
-
-struct TunnelObservations {
-    fail_services: [NamedServiceState; 4],
-    warn_services: [NamedServiceState; 4],
-    portal: (Vec<PortalOutcome>, Vec<PortalOutcome>),
-    votes: Vec<ServiceCountryVote>,
-    captcha: (CaptchaObservation, CaptchaObservation),
-    edges: Vec<CdnEdgeObservation>,
-    ai: Vec<NamedServiceState>,
-}
-
-impl TunnelObservations {
-    async fn probe(client: &TunnelClient) -> Self {
-        let (
-            chatgpt_web,
-            chatgpt_app,
-            gemini,
-            youtube_premium,
-            netflix,
-            claude,
-            tiktok,
-            notebooklm,
-            portal,
-            votes,
-            captcha,
-            edges,
-            ai,
-        ) = tokio::join!(
-            probe_chatgpt_web(client),
-            probe_chatgpt_app(client),
-            probe_gemini(client),
-            probe_youtube_premium(client),
-            probe_netflix(client),
-            probe_claude(client),
-            probe_tiktok(client),
-            probe_notebooklm(client),
-            probe_portal_endpoints(client),
-            probe_country_votes(client),
-            probe_search_captcha(client),
-            probe_cdn_edges(client),
-            probe_ai_endpoints(client),
-        );
-        Self {
-            fail_services: [
-                ("chatgpt_web", chatgpt_web),
-                ("chatgpt_app", chatgpt_app),
-                ("gemini", gemini),
-                ("youtube_premium", youtube_premium),
-            ],
-            warn_services: [
-                ("netflix", netflix),
-                ("claude", claude),
-                ("tiktok", tiktok),
-                ("notebooklm", notebooklm),
-            ],
-            portal,
-            votes,
-            captcha,
-            edges,
-            ai,
-        }
-    }
-
-    fn into_results(self, expected_country: CountryCode) -> Vec<CheckResult> {
-        let mut results =
-            service_results(self.fail_services, judge_services_fail);
-        results
-            .extend(service_results(self.warn_services, judge_services_warn));
-        results.push(CheckResult::new(
-            "tampering",
-            judge_tampering(&self.portal.0, &self.portal.1),
-        ));
-        results.push(CheckResult::new(
-            "service-geo",
-            judge_service_country(
-                &self.votes,
-                &expected_country,
-                SERVICE_COUNTRY_FAIL_ON,
-            ),
-        ));
-        results.push(CheckResult::new(
-            "service-geo:captcha",
-            judge_search_captcha(&self.captcha.0, &self.captcha.1),
-        ));
-        results.push(CheckResult::new(
-            "service-geo:cdn",
-            judge_cdn_edge(&self.edges),
-        ));
-        results.extend(self.ai.into_iter().map(|(name, state)| {
-            CheckResult::new(
-                format!("ai:{name}"),
-                judge_ai_endpoints(&[(name, state)]),
-            )
-        }));
-        results
-    }
-}
-
-fn service_results<const N: usize>(
-    states: [NamedServiceState; N],
+async fn record_service(
+    progress: &ScanProgress,
+    name: &str,
+    work: impl std::future::Future<Output = ServiceState>,
     judge: fn(&[(&str, ServiceState)]) -> Verdict,
-) -> Vec<CheckResult> {
-    states
-        .into_iter()
-        .map(|(name, state)| {
-            CheckResult::new(format!("service:{name}"), judge(&[(name, state)]))
-        })
-        .collect()
+) {
+    let state = work.await;
+    progress.add([CheckResult::new(
+        format!("service:{name}"),
+        judge(&[(name, state)]),
+    )]);
+}
+
+async fn record_portal(client: &TunnelClient, progress: &ScanProgress) {
+    let verdict = probe_portal_endpoints(client).await.map_or_else(
+        |error| Verdict::error(format!("portal task failed: {error}")),
+        |(https, http)| judge_tampering(&https, &http),
+    );
+    progress.add([CheckResult::new("tampering", verdict)]);
 }
 
 async fn run_tunnel_checks(
     client: &TunnelClient,
     expected_country: &CountryCode,
     profile: ScanProfile,
-) -> Vec<CheckResult> {
-    match profile {
-        ScanProfile::Exit => Box::pin(TunnelObservations::probe(client))
-            .await
-            .into_results(*expected_country),
-        ScanProfile::RuBridge => {
-            let (plain, tls) = probe_portal_endpoints(client).await;
-            let mut results = profile.skipped(TUNNEL_GATES);
-            results.push(CheckResult::new(
-                "tampering",
-                judge_tampering(&plain, &tls),
-            ));
-            results
-        }
+    progress: &ScanProgress,
+) {
+    if profile == ScanProfile::RuBridge {
+        progress.add(profile.skipped(TUNNEL_GATES));
+        record_portal(client, progress).await;
+        return;
     }
+    tokio::join!(
+        record_primary_services(client, progress),
+        record_secondary_services(client, progress),
+        record_portal(client, progress),
+        record_service_geo(client, expected_country, progress),
+    );
+}
+
+async fn record_primary_services(
+    client: &TunnelClient,
+    progress: &ScanProgress,
+) {
+    tokio::join!(
+        record_service(
+            progress,
+            "chatgpt_web",
+            probe_chatgpt_web(client),
+            judge_services_fail
+        ),
+        record_service(
+            progress,
+            "chatgpt_app",
+            probe_chatgpt_app(client),
+            judge_services_fail
+        ),
+        record_service(
+            progress,
+            "gemini",
+            probe_gemini(client),
+            judge_services_fail
+        ),
+        record_service(
+            progress,
+            "youtube_premium",
+            probe_youtube_premium(client),
+            judge_services_fail
+        ),
+    );
+}
+
+async fn record_secondary_services(
+    client: &TunnelClient,
+    progress: &ScanProgress,
+) {
+    tokio::join!(
+        record_service(
+            progress,
+            "netflix",
+            probe_netflix(client),
+            judge_services_warn
+        ),
+        record_service(
+            progress,
+            "claude",
+            probe_claude(client),
+            judge_services_warn
+        ),
+        record_service(
+            progress,
+            "tiktok",
+            probe_tiktok(client),
+            judge_services_warn
+        ),
+        record_service(
+            progress,
+            "notebooklm",
+            probe_notebooklm(client),
+            judge_services_warn
+        ),
+    );
+}
+
+async fn record_service_geo(
+    client: &TunnelClient,
+    country: &CountryCode,
+    progress: &ScanProgress,
+) {
+    tokio::join!(
+        async {
+            let votes = probe_country_votes(client).await;
+            progress.add([CheckResult::new(
+                "service-geo",
+                judge_service_country(&votes, country, SERVICE_COUNTRY_FAIL_ON),
+            )]);
+        },
+        async {
+            let (google, bing) = probe_search_captcha(client).await;
+            progress.add([CheckResult::new(
+                "service-geo:captcha",
+                judge_search_captcha(&google, &bing),
+            )]);
+        },
+        async {
+            let edges = probe_cdn_edges(client).await;
+            progress.add([CheckResult::new(
+                "service-geo:cdn",
+                judge_cdn_edge(&edges),
+            )]);
+        },
+        async {
+            let states = probe_ai_endpoints(client).await;
+            progress.add(states.into_iter().map(|(name, state)| {
+                CheckResult::new(
+                    format!("ai:{name}"),
+                    judge_ai_endpoints(&[(name, state)]),
+                )
+            }));
+        },
+    );
 }
 
 fn select_anchors(
@@ -589,10 +671,7 @@ async fn start_listener(
                 return (None, results);
             }
             Err(error) => {
-                results.push(CheckResult::new(
-                    "reach",
-                    Verdict::error(error.to_string()),
-                ));
+                results.push(CheckResult::new("reach", ssh_failure(error)));
                 return (None, results);
             }
         }
@@ -631,8 +710,8 @@ impl SshSetup {
     }
 
     async fn stop_listener(&self) -> Option<CheckResult> {
-        let port = self.listener_port?;
         let session = self.session.as_ref()?;
+        let port = session.listener_port()?;
         match session.stop_listener(port).await {
             Ok(()) => {
                 tracing::debug!(port, "temporary listener stopped");
@@ -640,10 +719,7 @@ impl SshSetup {
             }
             Err(error) => {
                 tracing::warn!(port, error = %error, "temporary listener cleanup failed");
-                Some(CheckResult::new(
-                    "listener-cleanup",
-                    Verdict::error(error.to_string()),
-                ))
+                Some(CheckResult::new("listener-cleanup", ssh_failure(error)))
             }
         }
     }
@@ -658,24 +734,19 @@ fn skipped_ssh_results() -> Vec<CheckResult> {
         .collect()
 }
 
-fn unavailable_ssh_results(error: &impl std::fmt::Display) -> Vec<CheckResult> {
-    let detail = format!("SSH unavailable: {error}");
+fn ssh_failure(error: chip_io::ssh::SshError) -> Verdict {
+    // Formatting belongs to the CLI boundary; the adapter retains typed causes.
+    Verdict::error(format!("{:#}", anyhow::Error::new(error)))
+}
+
+fn unavailable_ssh_results(error: chip_io::ssh::SshError) -> Vec<CheckResult> {
+    let detail = format!("SSH unavailable: {:#}", anyhow::Error::new(error));
     let mut results =
         vec![CheckResult::new("ssh", Verdict::error(detail.clone()))];
     results.push(CheckResult::new("reach", Verdict::error(detail.clone())));
     results.extend(tunnel_results(&Verdict::error(detail)));
     results.push(CheckResult::new("steal", Verdict::error("SSH unavailable")));
     results
-}
-
-async fn run_until_deadline_then_cleanup<T, CleanupOutput>(
-    deadline: tokio::time::Instant,
-    work: impl std::future::Future<Output = T>,
-    cleanup: impl std::future::Future<Output = CleanupOutput>,
-) -> (Result<T, tokio::time::error::Elapsed>, CleanupOutput) {
-    let outcome = tokio::time::timeout_at(deadline, work).await;
-    let cleanup_output = cleanup.await;
-    (outcome, cleanup_output)
 }
 
 #[tracing::instrument(
@@ -749,35 +820,30 @@ fn ssh_config(command: &ScanCommand) -> SshConfig {
     skip_all,
     fields(candidate_ip = %command.ip())
 )]
-async fn prepare_ssh(command: &ScanCommand) -> (SshSetup, Vec<CheckResult>) {
-    let config = ssh_config(command);
-    let ip = command.ip();
+async fn prepare_ssh(
+    command: &ScanCommand,
+    setup: &mut SshSetup,
+) -> Vec<CheckResult> {
     if !command.ssh_enabled() {
-        return (SshSetup::disconnected(config), skipped_ssh_results());
+        return Vec::new();
     }
-
-    let session = match SshSession::connect(ip, &config).await {
+    let session = match SshSession::connect(command.ip(), &setup.config).await {
         Ok(session) => session,
-        Err(error) => {
-            let results = unavailable_ssh_results(&error);
-            return (SshSetup::disconnected(config), results);
-        }
+        Err(error) => return unavailable_ssh_results(error),
     };
-    let (listener_port, results) = start_listener(&session, ip).await;
-    (
-        SshSetup {
-            session: Some(session),
-            config,
-            listener_port,
-        },
-        results,
-    )
+    // Store the owner before any remote listener can be created. The session
+    // records a pending port before starting the mutating remote command.
+    let session = setup.session.insert(session);
+    let (listener_port, results) = start_listener(session, command.ip()).await;
+    setup.listener_port = listener_port;
+    results
 }
 
 async fn run_globalping_branch(
     sources: Result<GlobalpingSources, GlobalpingSetupError>,
     command: &ScanCommand,
     listener_port: Option<u16>,
+    progress: &ScanProgress,
 ) -> Vec<CheckResult> {
     match sources {
         Ok(sources) => {
@@ -787,6 +853,7 @@ async fn run_globalping_branch(
                 &sources.city_anchors,
                 listener_port,
                 sources.reference_anchors.first(),
+                progress,
             )
             .await
         }
@@ -815,6 +882,7 @@ async fn run_globalping_branch(
 async fn run_socks_checks(
     command: &ScanCommand,
     setup: &SshSetup,
+    progress: &ScanProgress,
 ) -> Vec<CheckResult> {
     let Some(_session) = &setup.session else {
         return Vec::new();
@@ -831,9 +899,7 @@ async fn run_socks_checks(
         match SocksTunnel::start(command.ip(), &setup.config, port).await {
             Ok(tunnel) => tunnel,
             Err(error) => {
-                return tunnel_results(&Verdict::error(format!(
-                    "SOCKS tunnel failed: {error}"
-                )));
+                return tunnel_results(&ssh_failure(error));
             }
         };
     let results = match TunnelClient::new(tunnel.local_addr(), REQUEST_TIMEOUT)
@@ -843,8 +909,10 @@ async fn run_socks_checks(
                 &client,
                 command.country(),
                 command.profile(),
+                progress,
             ))
-            .await
+            .await;
+            Vec::new()
         }
         Err(error) => tunnel_results(&Verdict::error(error.to_string())),
     };
@@ -856,12 +924,14 @@ async fn run_steal_check(session: &SshSession) -> CheckResult {
     let verdict = match session.steal_snapshot().await {
         Ok(before) => {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            session.steal_snapshot().await.map_or_else(
-                |error| Verdict::error(error.to_string()),
-                |after| judge_steal(steal_pct(&before, &after)),
-            )
+            session
+                .steal_snapshot()
+                .await
+                .map_or_else(ssh_failure, |after| {
+                    judge_steal(steal_pct(&before, &after))
+                })
         }
-        Err(error) => Verdict::error(error.to_string()),
+        Err(error) => ssh_failure(error),
     };
     CheckResult::new("steal", verdict)
 }
@@ -869,16 +939,18 @@ async fn run_steal_check(session: &SshSession) -> CheckResult {
 async fn run_ssh_checks(
     command: &ScanCommand,
     setup: &SshSetup,
+    progress: &ScanProgress,
 ) -> Vec<CheckResult> {
     let Some(session) = &setup.session else {
         return Vec::new();
     };
-    let (mut results, steal) = tokio::join!(
-        run_socks_checks(command, setup),
-        run_steal_check(session)
+    tokio::join!(
+        progress.record(run_socks_checks(command, setup, progress)),
+        async {
+            progress.add([run_steal_check(session).await]);
+        }
     );
-    results.push(steal);
-    results
+    Vec::new()
 }
 
 #[tracing::instrument(
@@ -889,18 +961,25 @@ async fn run_ssh_checks(
 )]
 async fn run_neighbor_checks(command: &ScanCommand) -> Vec<CheckResult> {
     if !command.neighbors_enabled() {
-        return NEIGHBOR_GATES
-            .into_iter()
-            .map(|gate| {
-                CheckResult::skipped(
-                    gate,
-                    "--no-neighbors: the /24 was not swept",
-                )
-            })
-            .collect();
+        return Vec::new();
     }
     let ip = command.ip();
-    let probes = sweep(network_24(ip), &SweepConfig::default()).await;
+    let probes = match sweep(network_24(ip), &SweepConfig::default()).await {
+        Ok(probes) => probes,
+        Err(error) => {
+            return NEIGHBOR_GATES
+                .into_iter()
+                .map(|gate| {
+                    CheckResult::new(
+                        gate,
+                        Verdict::error(format!(
+                            "neighbor task failed: {error}"
+                        )),
+                    )
+                })
+                .collect();
+        }
+    };
     let candidate_ptr = probes.iter().find(|probe| probe.ip == ip).map_or_else(
         || {
             chip_core::model::PtrLookup::Unavailable(
@@ -933,42 +1012,45 @@ pub async fn run_phase_b(
     http: &reqwest::Client,
 ) -> Vec<CheckResult> {
     let deadline = tokio::time::Instant::now() + command.deadline();
-    // Preparation is individually bounded by the HTTP and SSH adapters. Keep
-    // it outside the cancelling timeout so a listener cannot be created in a
-    // future that is then dropped before its owner gets a chance to clean up.
-    let (sources, (ssh, mut results)) =
-        tokio::join!(prepare_globalping(command, http), prepare_ssh(command));
-    let listener_port = ssh.listener_port;
-    let checks = Box::pin(async {
-        let (globalping, ssh_checks, neighbors) = tokio::join!(
-            run_globalping_branch(sources, command, listener_port),
-            run_ssh_checks(command, &ssh),
-            run_neighbor_checks(command),
+    let progress = ScanProgress::default();
+    if !command.ssh_enabled() {
+        progress.add(skipped_ssh_results());
+    }
+    if !command.neighbors_enabled() {
+        progress.add(NEIGHBOR_GATES.into_iter().map(|gate| {
+            CheckResult::skipped(gate, "--no-neighbors: the /24 was not swept")
+        }));
+    }
+    let mut ssh = SshSetup::disconnected(ssh_config(command));
+    let work = async {
+        let (sources, ()) = tokio::join!(
+            prepare_globalping(command, http),
+            progress.record(prepare_ssh(command, &mut ssh)),
         );
-        let mut checks = globalping;
-        checks.extend(ssh_checks);
-        checks.extend(neighbors);
-        checks
-    });
-    let (outcome, cleanup_error) =
-        run_until_deadline_then_cleanup(deadline, checks, ssh.stop_listener())
-            .await;
-    if let Ok(checks) = outcome {
-        results.extend(checks);
-    } else {
-        tracing::warn!("phase B deadline exceeded");
-        results.push(CheckResult::new(
-            "scan-deadline",
-            Verdict::error(format!(
-                "phase B exceeded the {}s overall deadline",
-                command.deadline().as_secs()
+        tokio::join!(
+            progress.record(run_globalping_branch(
+                sources,
+                command,
+                ssh.listener_port,
+                &progress
             )),
-        ));
+            progress.record(run_ssh_checks(command, &ssh, &progress)),
+            progress.record(run_neighbor_checks(command)),
+        );
+    };
+    if tokio::time::timeout_at(deadline, Box::pin(work))
+        .await
+        .is_err()
+    {
+        tracing::warn!("phase B deadline exceeded");
+        progress.deadline(command.deadline());
     }
-    if let Some(cleanup_error) = cleanup_error {
-        results.push(cleanup_error);
+    // Cleanup has its own bounded SSH command timeout and runs even when
+    // preparation or measurements were cancelled by the phase deadline.
+    if let Some(error) = ssh.stop_listener().await {
+        progress.add([error]);
     }
-    results
+    progress.finish()
 }
 
 #[tracing::instrument(
@@ -993,18 +1075,19 @@ pub async fn run_scan(command: &ScanCommand) -> Report {
             };
         }
     };
-    let mut results = run_phase_a(command, &http).await;
+    let mut results = apply_rules(
+        command.profile(),
+        command.gate_overrides(),
+        run_phase_a(command, &http).await,
+    );
     if !should_short_circuit(&results, command.fail_fast()) {
-        results.extend(run_phase_b(command, &http).await);
+        results.extend(apply_rules(
+            command.profile(),
+            command.gate_overrides(),
+            run_phase_b(command, &http).await,
+        ));
     }
-    let profile = command.profile();
-    let overrides = command.gate_overrides();
-    let report = Report {
-        results: results
-            .into_iter()
-            .map(|result| overrides.apply(profile.apply(result)))
-            .collect(),
-    };
+    let report = Report { results };
     tracing::debug!(
         overall = %report.overall(),
         result_count = report.results.len(),
@@ -1051,7 +1134,7 @@ mod tests {
 
         assert_eq!(sut.exit_code(), 0);
         assert_eq!(sut.results.len(), TUNNEL_GATES.len() + 2);
-        assert!(sut.results.iter().all(|result| result.skipped), "{table}");
+        assert!(sut.results.iter().all(CheckResult::is_skipped), "{table}");
         assert!(!table.contains("OK "), "{table}");
     }
 
@@ -1076,19 +1159,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deadline_cancellation_still_runs_resource_cleanup() {
-        let cleaned = std::cell::Cell::new(false);
-        let work = std::future::pending::<()>();
-        let cleanup = async { cleaned.set(true) };
+    async fn deadline_keeps_completed_failures_and_marks_only_missing_gates() {
+        let progress = ScanProgress::default();
+        let work = async {
+            tokio::join!(
+                progress.record(async {
+                    vec![CheckResult::new("reach", Verdict::fail("blocked"))]
+                }),
+                std::future::pending::<()>(),
+            );
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), work)
+                .await
+                .is_err()
+        );
+        progress.deadline(Duration::from_secs(1));
+        let report = Report {
+            results: progress.finish(),
+        };
 
-        let (outcome, ()) = run_until_deadline_then_cleanup(
-            tokio::time::Instant::now(),
-            work,
-            cleanup,
-        )
-        .await;
-
-        assert!(outcome.is_err());
-        assert!(cleaned.get());
+        assert_eq!(report.exit_code(), 1);
+        let reach: Vec<_> = report
+            .results
+            .iter()
+            .filter(|result| result.gate == "reach")
+            .collect();
+        assert_eq!(reach.len(), 1);
+        assert_eq!(reach[0].severity(), Severity::Fail);
+        assert!(report.results.iter().any(|result| result.gate == "latency"
+            && result.severity() == Severity::Error));
+    }
+    #[rstest::rstest]
+    #[case::skipped_failure(Verdict::fail("blocked"), true, false)]
+    #[case::escalated_warning(Verdict::warn("suspicious"), false, true)]
+    fn fail_fast_uses_the_same_rules_as_the_final_report(
+        #[case] verdict: Verdict,
+        #[case] skip: bool,
+        #[case] expected_stop: bool,
+    ) {
+        let mut overrides = chip_core::GateOverrides::default();
+        if skip {
+            overrides.skip.insert("reputation".into());
+        } else {
+            overrides.escalate.insert("reputation".into());
+        }
+        let results = apply_rules(
+            ScanProfile::Exit,
+            &overrides,
+            vec![CheckResult::new("reputation", verdict)],
+        );
+        assert_eq!(should_short_circuit(&results, true), expected_stop);
+        let report = Report { results };
+        assert_eq!(report.exit_code() == 1, expected_stop);
     }
 }
