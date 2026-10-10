@@ -3,7 +3,7 @@ use std::fmt;
 
 use strum::Display;
 
-use crate::Verdict;
+use crate::report::Verdict;
 use itertools::Itertools as _;
 
 /// A proxycheck detection raised for an address.

@@ -1,7 +1,7 @@
 use std::num::NonZeroU64;
 use std::time::Duration;
 
-use crate::Verdict;
+use crate::report::Verdict;
 use crate::values::Percent;
 
 /// `/proc/stat`'s first `cpu ` line, reduced to what the steal share needs: the

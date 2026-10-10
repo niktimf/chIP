@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
 
-use crate::Verdict;
+use crate::report::Verdict;
 use ipnet::Ipv4Net;
 
 /// How the candidate's address is routed, as the RIS peers see it.

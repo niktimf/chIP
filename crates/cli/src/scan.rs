@@ -30,9 +30,10 @@ use chip_core::checks::tunnel::service_geo::{
 use chip_core::checks::tunnel::services::ServiceTier;
 use chip_core::checks::tunnel::tampering::judge_tampering;
 use chip_core::report::gate;
-use chip_core::{
-    CheckResult, CountryCode, GateId, GateScope, Report, ScanProfile, Verdict,
-};
+use chip_core::report::gate::GateId;
+use chip_core::report::profile::{GateScope, ScanProfile};
+use chip_core::report::{CheckResult, Report, Verdict};
+use chip_core::values::CountryCode;
 use chip_io::atlas::{AnchorClient, AtlasError};
 use chip_io::blocklists::BlockListsClient;
 use chip_io::geoip::GeoIpClient;
@@ -116,7 +117,7 @@ impl ScanProgress {
 
 fn apply_rules(
     profile: ScanProfile,
-    overrides: &chip_core::GateOverrides,
+    overrides: &chip_core::report::gate::GateOverrides,
     results: Vec<CheckResult>,
 ) -> Vec<CheckResult> {
     results
@@ -1222,7 +1223,7 @@ pub async fn run_scan(command: &ScanCommand) -> Report {
 mod tests {
     use std::collections::HashSet;
 
-    use chip_core::{ScanOutcome, Severity};
+    use chip_core::report::{ScanOutcome, Severity};
 
     use super::*;
     use crate::config::FailurePolicy;
@@ -1546,7 +1547,7 @@ mod tests {
 
     fn reputation_result(
         verdict: Verdict,
-        overrides: &chip_core::GateOverrides,
+        overrides: &chip_core::report::gate::GateOverrides,
     ) -> Vec<CheckResult> {
         apply_rules(
             ScanProfile::Exit,
@@ -1555,14 +1556,14 @@ mod tests {
         )
     }
 
-    fn skipping(id: GateId) -> chip_core::GateOverrides {
-        let mut overrides = chip_core::GateOverrides::default();
+    fn skipping(id: GateId) -> chip_core::report::gate::GateOverrides {
+        let mut overrides = chip_core::report::gate::GateOverrides::default();
         overrides.skip.insert(id);
         overrides
     }
 
-    fn escalating(id: GateId) -> chip_core::GateOverrides {
-        let mut overrides = chip_core::GateOverrides::default();
+    fn escalating(id: GateId) -> chip_core::report::gate::GateOverrides {
+        let mut overrides = chip_core::report::gate::GateOverrides::default();
         overrides.escalate.insert(id);
         overrides
     }

@@ -1,5 +1,5 @@
-use crate::Verdict;
 use crate::checks::tunnel::portal::{PortalChecks, PortalOutcome};
+use crate::report::Verdict;
 
 pub fn judge_tampering(checks: &PortalChecks) -> Verdict {
     let PortalChecks { https, http } = checks;

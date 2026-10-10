@@ -20,7 +20,7 @@ use std::process::Command;
 /// fine" to whoever runs the rotation.
 fn expected_gates() -> Vec<&'static str> {
     chip_core::report::gate::scan_gates()
-        .map(chip_core::GateId::as_str)
+        .map(chip_core::report::gate::GateId::as_str)
         .collect()
 }
 

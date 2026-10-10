@@ -63,8 +63,9 @@ impl Anchor {
     }
 }
 
-/// Anchors whose city contains `city`, ignoring case. See [`pick`] for which
-/// of them are kept.
+/// Anchors whose city contains `city`, ignoring case. Client probes are
+/// dropped, and of the anchors sorted by `fqdn` the first one of each AS is
+/// kept, at most `count` of them.
 pub fn select_for_city(
     anchors: &[Anchor],
     city: &CityName,
@@ -79,7 +80,7 @@ pub fn select_for_city(
     )
 }
 
-/// Anchors in `country`. See [`pick`] for which of them are kept.
+/// Anchors in `country`, kept by the same rule as in [`select_for_city`].
 pub fn select_for_country(
     anchors: &[Anchor],
     country: &CountryCode,

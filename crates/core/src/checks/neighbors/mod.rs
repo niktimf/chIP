@@ -1,7 +1,7 @@
 //! Gates of [`Channel::Neighbors`](crate::report::gate::Channel::Neighbors):
 //! the `/24` sweep from the runner.
 
-use crate::Verdict;
+use crate::report::Verdict;
 
 mod facts;
 pub use facts::{

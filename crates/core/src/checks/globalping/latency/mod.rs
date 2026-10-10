@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::Verdict;
+use crate::report::Verdict;
 use crate::values::units::{duration_from_millis, millis};
 
 pub mod anchor;

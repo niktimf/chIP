@@ -1,7 +1,7 @@
 use http::StatusCode;
 use regex::regex;
 
-use crate::Verdict;
+use crate::report::Verdict;
 use crate::values::CountryCode;
 
 mod facts;

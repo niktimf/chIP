@@ -1,5 +1,5 @@
-use crate::Verdict;
 use crate::checks::globalping::ProbeAlignmentError;
+use crate::report::Verdict;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpProbeOutcome {

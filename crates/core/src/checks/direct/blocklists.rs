@@ -1,4 +1,4 @@
-use crate::Verdict;
+use crate::report::Verdict;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockListStatus {

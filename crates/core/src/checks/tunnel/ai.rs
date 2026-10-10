@@ -1,8 +1,8 @@
-use crate::Verdict;
 use crate::checks::tunnel::ServiceState;
 use crate::checks::tunnel::services::{
     CLOUDFLARE_CHALLENGED, is_cloudflare_challenge,
 };
+use crate::report::Verdict;
 use http::StatusCode;
 
 /// An AI API whose reachability the `ai:*` gates probe. The variant carries

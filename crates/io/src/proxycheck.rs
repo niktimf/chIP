@@ -35,7 +35,7 @@ pub enum ProxycheckError {
         operation: &'static str,
         source: serde_json::Error,
     },
-    /// Built only by [`ProxycheckError::request`], which strips the URL:
+    /// Built only by `ProxycheckError::request`, which strips the URL:
     /// the URL carries the API key.
     #[error("proxycheck.io request failed: {operation}")]
     Request {

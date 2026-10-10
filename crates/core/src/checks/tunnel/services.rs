@@ -6,8 +6,8 @@
 //! the actual fetching through the SOCKS tunnel and calls the matching
 //! `classify_*` function.
 
-use crate::Verdict;
 use crate::checks::tunnel::ServiceState;
+use crate::report::Verdict;
 use http::StatusCode;
 use regex::regex;
 use url::Url;

@@ -1,4 +1,4 @@
-use crate::Verdict;
+use crate::report::Verdict;
 use crate::values::CountryCode;
 
 /// One vote per keyless `GeoIP` source, in the order the sources are

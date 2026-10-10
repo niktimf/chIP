@@ -1,4 +1,4 @@
-use crate::Verdict;
+use crate::report::Verdict;
 use ipnet::Ipv4Net;
 
 /// Where the candidate itself stands in the RKN registry export.

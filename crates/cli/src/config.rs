@@ -7,11 +7,10 @@ use std::str::FromStr;
 use chip_core::checks::globalping::latency::{
     InvalidLatencyThresholds, LatencyThresholds,
 };
-use chip_core::values::InvalidCityName;
-use chip_core::{
-    CheckResult, CityName, CountryCode, GateId, GateOverrides, ScanProfile,
-    Severity,
-};
+use chip_core::report::gate::{GateId, GateOverrides};
+use chip_core::report::profile::ScanProfile;
+use chip_core::report::{CheckResult, Severity};
+use chip_core::values::{CityName, CountryCode, InvalidCityName};
 use chip_io::credentials::{
     EmptySecret, GlobalpingToken, ProxycheckApiKey, SshPrivateKey,
 };
@@ -578,7 +577,7 @@ impl CalibrateCommand {
 mod tests {
     use std::collections::HashSet;
 
-    use chip_core::Verdict;
+    use chip_core::report::Verdict;
     use chip_core::report::gate;
 
     use super::*;

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use chip_core::{CheckResult, Report, ScanOutcome};
+use chip_core::report::{CheckResult, Report, ScanOutcome};
 use clap::Parser as _;
 use config::{Cli, Command};
 use serde::Serialize;
@@ -279,7 +279,7 @@ async fn run_calibrate_command(
 
 #[cfg(test)]
 mod tests {
-    use chip_core::Verdict;
+    use chip_core::report::Verdict;
     use chip_core::report::gate::{GEO, LATENCY, REACH, REPUTATION};
 
     use super::*;
