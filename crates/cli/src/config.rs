@@ -6,8 +6,12 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use chip_core::verdict::latency::LatencyThresholds;
-use chip_core::{CityName, CountryCode, GateId, GateOverrides, ScanProfile};
+use chip_core::{
+    CheckResult, CityName, CountryCode, GateId, GateOverrides, ScanProfile,
+    Severity,
+};
 use chip_io::credentials::{GlobalpingToken, ProxycheckApiKey, SshPrivateKey};
+use chip_io::ssh::HostKeyPolicy;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,18 +284,76 @@ impl ProbeSelection {
     }
 }
 
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "tracked: CLI-B7 in docs/notes/2026-10-10-playbook-review.md"
-)]
+/// Whether phase B still runs after a phase-A gate failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailurePolicy {
+    /// A failed phase-A gate already rules the candidate out, so phase B is
+    /// not started.
+    FailFast,
+    /// Phase B runs whatever phase A reported.
+    RunAll,
+}
+
+impl FailurePolicy {
+    /// Whether the scan stops after these results. Only a failure stops it:
+    /// an unjudged gate may still pass on retry.
+    pub fn stops_after(self, results: &[CheckResult]) -> bool {
+        match self {
+            Self::FailFast => results
+                .iter()
+                .any(|result| result.severity() == Severity::Fail),
+            Self::RunAll => false,
+        }
+    }
+}
+
+/// Whether the candidate's /24 is swept for neighbors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeighborSweep {
+    Enabled,
+    Disabled,
+}
+
+/// How the scan reaches the candidate over SSH.
+#[derive(Debug, Clone)]
+pub enum SshAccess {
+    /// `--no-ssh`: every gate that needs the listener or the tunnel is
+    /// skipped.
+    Disabled,
+    Enabled(SshSettings),
+}
+
+#[derive(Debug, Clone)]
+pub struct SshSettings {
+    user: String,
+    port: NonZeroU16,
+    host_keys: HostKeyPolicy,
+    private_key: Option<SshPrivateKey>,
+}
+
+impl SshSettings {
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    pub const fn port(&self) -> NonZeroU16 {
+        self.port
+    }
+
+    pub const fn host_keys(&self) -> &HostKeyPolicy {
+        &self.host_keys
+    }
+
+    pub const fn private_key(&self) -> Option<&SshPrivateKey> {
+        self.private_key.as_ref()
+    }
+}
+
 pub struct ScanCommand {
     ip: Ipv4Addr,
     country: CountryCode,
     city: Option<CityName>,
-    ssh_private_key: Option<SshPrivateKey>,
-    ssh_user: String,
-    ssh_port: NonZeroU16,
-    ssh_known_hosts: Option<String>,
+    ssh_access: SshAccess,
     globalping_token: Option<GlobalpingToken>,
     proxycheck_api_key: Option<ProxycheckApiKey>,
     latency_thresholds: LatencyThresholds,
@@ -300,9 +362,8 @@ pub struct ScanCommand {
     deadline: std::time::Duration,
     gate_overrides: GateOverrides,
     anchor: Option<Ipv4Addr>,
-    neighbors_enabled: bool,
-    ssh_enabled: bool,
-    fail_fast: bool,
+    neighbor_sweep: NeighborSweep,
+    failure_policy: FailurePolicy,
     json: Option<PathBuf>,
 }
 
@@ -316,14 +377,34 @@ impl TryFrom<(ScanArgs, SecretInputs)> for ScanCommand {
             LatencyThresholds::new(args.max_excess_ms, args.max_loss_pct)
                 .map_err(|error| anyhow::anyhow!(error))?;
         let probes = ProbeSelection::new(args.eyeball_probes, args.dc_probes)?;
+        let ssh_access = if args.no_ssh {
+            SshAccess::Disabled
+        } else {
+            let host_keys = args
+                .ssh_known_hosts
+                .map_or(HostKeyPolicy::TrustOnFirstUse, HostKeyPolicy::Pinned);
+            SshAccess::Enabled(SshSettings {
+                user: args.ssh_user,
+                port: args.ssh_port,
+                host_keys,
+                private_key: secrets.ssh_private_key,
+            })
+        };
+        let neighbor_sweep = if args.no_neighbors {
+            NeighborSweep::Disabled
+        } else {
+            NeighborSweep::Enabled
+        };
+        let failure_policy = if args.no_fail_fast {
+            FailurePolicy::RunAll
+        } else {
+            FailurePolicy::FailFast
+        };
         Ok(Self {
             ip: args.ip.as_ipv4(),
             country: args.country,
             city: args.city,
-            ssh_private_key: secrets.ssh_private_key,
-            ssh_user: args.ssh_user,
-            ssh_port: args.ssh_port,
-            ssh_known_hosts: args.ssh_known_hosts,
+            ssh_access,
             globalping_token: secrets.globalping_token,
             proxycheck_api_key: secrets.proxycheck_api_key,
             latency_thresholds,
@@ -335,9 +416,8 @@ impl TryFrom<(ScanArgs, SecretInputs)> for ScanCommand {
                 skip: args.skip_gate.into_iter().collect(),
             },
             anchor: args.anchor,
-            neighbors_enabled: !args.no_neighbors,
-            ssh_enabled: !args.no_ssh,
-            fail_fast: !args.no_fail_fast,
+            neighbor_sweep,
+            failure_policy,
             json: args.json,
         })
     }
@@ -360,20 +440,8 @@ impl ScanCommand {
         self.city.as_ref()
     }
 
-    pub const fn ssh_private_key(&self) -> Option<&SshPrivateKey> {
-        self.ssh_private_key.as_ref()
-    }
-
-    pub fn ssh_user(&self) -> &str {
-        &self.ssh_user
-    }
-
-    pub const fn ssh_port(&self) -> NonZeroU16 {
-        self.ssh_port
-    }
-
-    pub fn ssh_known_hosts(&self) -> Option<&str> {
-        self.ssh_known_hosts.as_deref()
+    pub const fn ssh_access(&self) -> &SshAccess {
+        &self.ssh_access
     }
 
     pub const fn globalping_token(&self) -> Option<&GlobalpingToken> {
@@ -408,16 +476,12 @@ impl ScanCommand {
         self.anchor
     }
 
-    pub const fn neighbors_enabled(&self) -> bool {
-        self.neighbors_enabled
+    pub const fn neighbor_sweep(&self) -> NeighborSweep {
+        self.neighbor_sweep
     }
 
-    pub const fn ssh_enabled(&self) -> bool {
-        self.ssh_enabled
-    }
-
-    pub const fn fail_fast(&self) -> bool {
-        self.fail_fast
+    pub const fn failure_policy(&self) -> FailurePolicy {
+        self.failure_policy
     }
 
     pub fn json_path(&self) -> Option<&std::path::Path> {
@@ -496,6 +560,8 @@ impl CalibrateCommand {
 
 #[cfg(test)]
 mod tests {
+    use chip_core::{Verdict, gate};
+
     use super::*;
 
     fn parse(args: &[&str]) -> Cli {
@@ -503,12 +569,26 @@ mod tests {
             .unwrap()
     }
 
-    fn scan_command(args: &[&str]) -> anyhow::Result<Box<ScanCommand>> {
-        let command = parse(args).into_command_with(SecretInputs::default())?;
+    fn scan_command_with(
+        args: &[&str],
+        secrets: SecretInputs,
+    ) -> anyhow::Result<Box<ScanCommand>> {
+        let command = parse(args).into_command_with(secrets)?;
         let Command::Scan(command) = command else {
             anyhow::bail!("expected scan command")
         };
         Ok(command)
+    }
+
+    fn scan_command(args: &[&str]) -> anyhow::Result<Box<ScanCommand>> {
+        scan_command_with(args, SecretInputs::default())
+    }
+
+    fn ssh_settings(command: &ScanCommand) -> &SshSettings {
+        let SshAccess::Enabled(settings) = command.ssh_access() else {
+            panic!("expected SSH access to be enabled")
+        };
+        settings
     }
 
     #[test]
@@ -518,12 +598,144 @@ mod tests {
 
         assert_eq!(sut.ip(), Ipv4Addr::new(203, 0, 113, 1));
         assert_eq!(sut.country().as_str(), "FI");
-        assert_eq!(sut.ssh_user(), "root");
+        assert_eq!(ssh_settings(&sut).user(), "root");
         assert_eq!(sut.reference_city().as_str(), "Helsinki");
         assert_eq!((sut.probes().eyeball(), sut.probes().datacenter()), (8, 4));
-        assert!(sut.ssh_enabled());
-        assert!(sut.neighbors_enabled());
-        assert!(sut.fail_fast());
+        assert_eq!(sut.neighbor_sweep(), NeighborSweep::Enabled);
+        assert_eq!(sut.failure_policy(), FailurePolicy::FailFast);
+    }
+
+    #[test]
+    fn no_ssh_turns_off_every_ssh_connection() {
+        let sut = scan_command_with(
+            &["scan", "203.0.113.1", "--country", "FI", "--no-ssh"],
+            SecretInputs {
+                ssh_private_key: Some(
+                    SshPrivateKey::try_from("key-value".to_owned()).unwrap(),
+                ),
+                ..SecretInputs::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(sut.ssh_access(), SshAccess::Disabled),
+            "{:?}",
+            sut.ssh_access()
+        );
+    }
+
+    #[test]
+    fn ssh_settings_combine_the_flags_with_the_key_from_the_environment() {
+        let sut = scan_command_with(
+            &[
+                "scan",
+                "203.0.113.1",
+                "--country",
+                "FI",
+                "--ssh-user",
+                "admin",
+                "--ssh-port",
+                "2222",
+            ],
+            SecretInputs {
+                ssh_private_key: Some(
+                    SshPrivateKey::try_from("key-value".to_owned()).unwrap(),
+                ),
+                ..SecretInputs::default()
+            },
+        )
+        .unwrap();
+
+        let settings = ssh_settings(&sut);
+        assert_eq!(settings.user(), "admin");
+        assert_eq!(settings.port().get(), 2222);
+        assert!(settings.private_key().is_some());
+    }
+
+    #[test]
+    fn known_hosts_entries_pin_the_candidate_host_key() {
+        let sut = scan_command(&[
+            "scan",
+            "203.0.113.1",
+            "--country",
+            "FI",
+            "--ssh-known-hosts",
+            "203.0.113.1 ssh-ed25519 AAAA",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            ssh_settings(&sut).host_keys(),
+            &HostKeyPolicy::Pinned("203.0.113.1 ssh-ed25519 AAAA".to_owned())
+        );
+    }
+
+    #[test]
+    fn without_known_hosts_the_first_host_key_is_trusted() {
+        let sut =
+            scan_command(&["scan", "203.0.113.1", "--country", "FI"]).unwrap();
+
+        assert_eq!(
+            ssh_settings(&sut).host_keys(),
+            &HostKeyPolicy::TrustOnFirstUse
+        );
+    }
+
+    #[test]
+    fn no_fail_fast_runs_phase_b_after_a_failure() {
+        let sut = scan_command(&[
+            "scan",
+            "203.0.113.1",
+            "--country",
+            "FI",
+            "--no-fail-fast",
+        ])
+        .unwrap();
+
+        assert_eq!(sut.failure_policy(), FailurePolicy::RunAll);
+    }
+
+    #[test]
+    fn no_neighbors_turns_off_the_neighbor_sweep() {
+        let sut = scan_command(&[
+            "scan",
+            "203.0.113.1",
+            "--country",
+            "FI",
+            "--no-neighbors",
+        ])
+        .unwrap();
+
+        assert_eq!(sut.neighbor_sweep(), NeighborSweep::Disabled);
+    }
+
+    #[rstest::rstest]
+    #[case::fail_fast_on_fail(
+        FailurePolicy::FailFast,
+        Verdict::fail("wrong country"),
+        true
+    )]
+    #[case::error_is_not_fail(
+        FailurePolicy::FailFast,
+        Verdict::error("unavailable"),
+        false
+    )]
+    #[case::run_all_after_fail(
+        FailurePolicy::RunAll,
+        Verdict::fail("wrong country"),
+        false
+    )]
+    fn only_a_failure_under_fail_fast_stops_the_scan(
+        #[case] sut: FailurePolicy,
+        #[case] verdict: Verdict,
+        #[case] expected: bool,
+    ) {
+        let results = [CheckResult::new(gate::GEO, verdict)];
+
+        let actual = sut.stops_after(&results);
+
+        assert_eq!(actual, expected);
     }
 
     #[rstest::rstest]

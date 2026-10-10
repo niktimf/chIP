@@ -26,8 +26,7 @@ use chip_core::verdict::services::{judge_service_fail, judge_service_warn};
 use chip_core::verdict::steal::{judge_steal, steal_pct};
 use chip_core::verdict::tampering::judge_tampering;
 use chip_core::{
-    CheckResult, CountryCode, GateId, GateScope, Report, ScanProfile, Severity,
-    Verdict,
+    CheckResult, CountryCode, GateId, GateScope, Report, ScanProfile, Verdict,
 };
 use chip_io::atlas::{
     Anchor, AnchorClient, select_for_city, select_for_country,
@@ -43,8 +42,7 @@ use chip_io::proxycheck::ProxycheckClient;
 use chip_io::ripestat::RipestatClient;
 use chip_io::rkn_registry::{RknRegistryClient, RknRegistryError};
 use chip_io::ssh::{
-    HostKeyPolicy, ListenerOutcome, SocksTunnel, SshConfig, SshSession,
-    verify_listener,
+    ListenerOutcome, SocksTunnel, SshConfig, SshSession, verify_listener,
 };
 use chip_io::tunnel::{
     TunnelClient, probe_ai_endpoints, probe_chatgpt_app, probe_chatgpt_web,
@@ -55,7 +53,7 @@ use chip_io::tunnel::{
 use ipnet::Ipv4Net;
 use itertools::{Either, Itertools as _};
 
-use crate::config::ScanCommand;
+use crate::config::{NeighborSweep, ScanCommand, SshAccess, SshSettings};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const GLOBALPING_DEADLINE: Duration = Duration::from_secs(90);
@@ -134,17 +132,6 @@ pub fn network_24(ip: Ipv4Addr) -> Ipv4Net {
     Ipv4Net::new(ip, 24)
         .expect("24 is a valid IPv4 prefix length")
         .trunc()
-}
-
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "tracked: CLI-B7 in docs/notes/2026-10-10-playbook-review.md"
-)]
-pub fn should_short_circuit(results: &[CheckResult], fail_fast: bool) -> bool {
-    fail_fast
-        && results
-            .iter()
-            .any(|result| result.severity() == Severity::Fail)
 }
 
 pub fn globalping_budget(eyeball: u8, datacenter: u8) -> u32 {
@@ -784,23 +771,28 @@ struct GlobalpingSetupError {
     detail: String,
 }
 
-struct SshSetup {
-    session: Option<SshSession>,
+/// An open SSH session and the config it was opened with; the SOCKS tunnel
+/// reuses the config for its own connection.
+struct SshConnection {
+    session: SshSession,
     config: SshConfig,
+}
+
+struct SshSetup {
+    connection: Option<SshConnection>,
     listener_port: Option<NonZeroU16>,
 }
 
 impl SshSetup {
-    const fn disconnected(config: SshConfig) -> Self {
+    const fn disconnected() -> Self {
         Self {
-            session: None,
-            config,
+            connection: None,
             listener_port: None,
         }
     }
 
     async fn stop_listener(&self) -> Option<CheckResult> {
-        let session = self.session.as_ref()?;
+        let session = &self.connection.as_ref()?.session;
         let port = session.listener_port()?;
         stop_listener(session, port).await
     }
@@ -916,16 +908,12 @@ async fn prepare_globalping(
     })
 }
 
-fn ssh_config(command: &ScanCommand) -> SshConfig {
+fn ssh_config(settings: &SshSettings) -> SshConfig {
     SshConfig {
-        user: Some(command.ssh_user().to_owned()),
-        port: command.ssh_port(),
-        private_key: command.ssh_private_key().cloned(),
-        host_keys: command
-            .ssh_known_hosts()
-            .map_or(HostKeyPolicy::TrustOnFirstUse, |known_hosts| {
-                HostKeyPolicy::Pinned(known_hosts.to_owned())
-            }),
+        user: Some(settings.user().to_owned()),
+        port: settings.port(),
+        private_key: settings.private_key().cloned(),
+        host_keys: settings.host_keys().clone(),
         connect_timeout: Duration::from_secs(15),
         command_timeout: Duration::from_secs(20),
     }
@@ -942,10 +930,11 @@ async fn prepare_ssh(
     setup: &mut SshSetup,
     progress: &ScanProgress,
 ) {
-    if !command.ssh_enabled() {
+    let SshAccess::Enabled(settings) = command.ssh_access() else {
         return;
-    }
-    let session = match SshSession::connect(command.ip(), &setup.config).await {
+    };
+    let config = ssh_config(settings);
+    let session = match SshSession::connect(command.ip(), &config).await {
         Ok(session) => session,
         Err(error) => {
             progress.add(unavailable_ssh_results(error));
@@ -954,8 +943,9 @@ async fn prepare_ssh(
     };
     // Store the owner before any remote listener can be created. The session
     // records a pending port before starting the mutating remote command.
-    let session = setup.session.insert(session);
-    setup.listener_port = start_listener(session, command.ip(), progress).await;
+    let connection = setup.connection.insert(SshConnection { session, config });
+    setup.listener_port =
+        start_listener(&connection.session, command.ip(), progress).await;
 }
 
 async fn run_globalping_branch(
@@ -1003,7 +993,7 @@ async fn run_socks_checks(
     setup: &SshSetup,
     progress: &ScanProgress,
 ) {
-    let Some(_session) = &setup.session else {
+    let Some(connection) = &setup.connection else {
         return;
     };
     let port = match pick_free_port() {
@@ -1016,14 +1006,19 @@ async fn run_socks_checks(
             return;
         }
     };
-    let tunnel =
-        match SocksTunnel::start(command.ip(), &setup.config, port).await {
-            Ok(tunnel) => tunnel,
-            Err(error) => {
-                progress.add(tunnel_results(&ssh_failure(error)));
-                return;
-            }
-        };
+    let tunnel = match SocksTunnel::start(
+        command.ip(),
+        &connection.config,
+        port,
+    )
+    .await
+    {
+        Ok(tunnel) => tunnel,
+        Err(error) => {
+            progress.add(tunnel_results(&ssh_failure(error)));
+            return;
+        }
+    };
     match TunnelClient::new(tunnel.local_addr(), REQUEST_TIMEOUT) {
         Ok(client) => {
             Box::pin(run_tunnel_checks(
@@ -1062,12 +1057,12 @@ async fn run_ssh_checks(
     setup: &SshSetup,
     progress: &ScanProgress,
 ) {
-    let Some(session) = &setup.session else {
+    let Some(connection) = &setup.connection else {
         return;
     };
     tokio::join!(
         run_socks_checks(command, setup, progress),
-        run_steal_check(session, progress),
+        run_steal_check(&connection.session, progress),
     );
 }
 
@@ -1078,7 +1073,7 @@ async fn run_ssh_checks(
     fields(candidate_ip = %command.ip())
 )]
 async fn run_neighbor_checks(command: &ScanCommand, progress: &ScanProgress) {
-    if !command.neighbors_enabled() {
+    if command.neighbor_sweep() == NeighborSweep::Disabled {
         return;
     }
     let ip = command.ip();
@@ -1127,15 +1122,15 @@ pub async fn run_phase_b(
 ) -> Vec<CheckResult> {
     let deadline = tokio::time::Instant::now() + command.deadline();
     let progress = ScanProgress::default();
-    if !command.ssh_enabled() {
+    if matches!(command.ssh_access(), SshAccess::Disabled) {
         progress.add(skipped_ssh_results());
     }
-    if !command.neighbors_enabled() {
+    if command.neighbor_sweep() == NeighborSweep::Disabled {
         progress.add(gate::neighbor_gates().map(|gate| {
             CheckResult::skipped(gate, "--no-neighbors: the /24 was not swept")
         }));
     }
-    let mut ssh = SshSetup::disconnected(ssh_config(command));
+    let mut ssh = SshSetup::disconnected();
     let work = async {
         let (sources, ()) = tokio::join!(
             prepare_globalping(command, http),
@@ -1194,7 +1189,7 @@ pub async fn run_scan(command: &ScanCommand) -> Report {
         command.gate_overrides(),
         run_phase_a(command, &http).await,
     );
-    if !should_short_circuit(&results, command.fail_fast()) {
+    if !command.failure_policy().stops_after(&results) {
         results.extend(apply_rules(
             command.profile(),
             command.gate_overrides(),
@@ -1212,7 +1207,10 @@ pub async fn run_scan(command: &ScanCommand) -> Report {
 
 #[cfg(test)]
 mod tests {
+    use chip_core::Severity;
+
     use super::*;
+    use crate::config::FailurePolicy;
 
     #[derive(Debug)]
     struct RegistryDownloadFailed(std::io::Error);
@@ -1323,22 +1321,6 @@ mod tests {
         );
     }
 
-    #[rstest::rstest]
-    #[case::fail_fast_on_fail(Verdict::fail("wrong country"), true, true)]
-    #[case::error_is_not_fail(Verdict::error("unavailable"), true, false)]
-    #[case::fail_fast_disabled(Verdict::fail("wrong country"), false, false)]
-    fn fail_fast_obeys_the_verdict_and_opt_out(
-        #[case] verdict: Verdict,
-        #[case] fail_fast: bool,
-        #[case] expected: bool,
-    ) {
-        let sut = [CheckResult::new(gate::GEO, verdict)];
-
-        let actual = should_short_circuit(&sut, fail_fast);
-
-        assert_eq!(actual, expected);
-    }
-
     #[test]
     fn no_ssh_reports_its_gates_as_skipped_rather_than_as_passing() {
         let sut = Report {
@@ -1435,7 +1417,10 @@ mod tests {
             &overrides,
             vec![CheckResult::new(gate::REPUTATION, verdict)],
         );
-        assert_eq!(should_short_circuit(&results, true), expected_stop);
+        assert_eq!(
+            FailurePolicy::FailFast.stops_after(&results),
+            expected_stop
+        );
         let report = Report { results };
         assert_eq!(report.exit_code() == 1, expected_stop);
     }

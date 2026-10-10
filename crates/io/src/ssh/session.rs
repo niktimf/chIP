@@ -69,7 +69,7 @@ pub(super) fn secret_file(content: &str) -> std::io::Result<NamedTempFile> {
 ///
 /// Both policies hand ssh a private temporary `UserKnownHostsFile`, so a
 /// scan never writes to the user's `~/.ssh/known_hosts`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostKeyPolicy {
     /// Accept only keys listed in this `known_hosts` content.
     Pinned(String),
