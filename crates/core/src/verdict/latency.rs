@@ -1,5 +1,8 @@
+use std::time::Duration;
+
 use crate::Verdict;
-use crate::model::{AnchorSeries, PingSweepFacts};
+use crate::model::{AnchorSeries, Percent, PingSample, PingSweepFacts};
+use crate::units::{duration_from_millis, millis};
 
 /// An anchor whose median RTT differs from its city group's median by more
 /// than this is treated as being on a bad path of its own and dropped
@@ -14,31 +17,46 @@ const SUSPICIOUSLY_NEGATIVE_MS: f64 = -5.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LatencyThresholds {
-    max_excess_ms: f64,
-    max_loss_delta_pct: f64,
+    max_excess: Duration,
+    max_loss_delta: PercentagePoints,
 }
 
 impl LatencyThresholds {
+    /// Parses the thresholds in the units the CLI flags use: the RTT excess
+    /// in milliseconds, the loss delta in percentage points.
+    ///
     /// # Errors
     ///
     /// Returns `InvalidLatencyThresholds` when the RTT excess is not finite and
     /// positive, or the loss delta is not finite and non-negative.
-    pub fn new(
+    pub fn from_millis_and_points(
         max_excess_ms: f64,
-        max_loss_delta_pct: f64,
+        max_loss_delta_pp: f64,
     ) -> Result<Self, InvalidLatencyThresholds> {
-        if !max_excess_ms.is_finite() || max_excess_ms <= 0.0 {
-            return Err(InvalidLatencyThresholds::MaxExcess(max_excess_ms));
-        }
-        if !max_loss_delta_pct.is_finite() || max_loss_delta_pct < 0.0 {
-            return Err(InvalidLatencyThresholds::MaxLossDelta(
-                max_loss_delta_pct,
-            ));
-        }
+        let max_excess = duration_from_millis(max_excess_ms)
+            .ok()
+            .filter(|excess| !excess.is_zero())
+            .ok_or(InvalidLatencyThresholds::MaxExcess(max_excess_ms))?;
+        let max_loss_delta = PercentagePoints::non_negative(max_loss_delta_pp)
+            .ok_or(InvalidLatencyThresholds::MaxLossDelta(max_loss_delta_pp))?;
         Ok(Self {
-            max_excess_ms,
-            max_loss_delta_pct,
+            max_excess,
+            max_loss_delta,
         })
+    }
+}
+
+/// The largest tolerated loss delta: a finite, non-negative number of
+/// percentage points.
+///
+/// It is not a [`Percent`]: a threshold above 100 points is accepted and
+/// never trips, since a delta of two percentages stays within 100.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PercentagePoints(f64);
+
+impl PercentagePoints {
+    fn non_negative(points: f64) -> Option<Self> {
+        (points.is_finite() && points >= 0.0).then_some(Self(points))
     }
 }
 
@@ -60,10 +78,16 @@ pub enum InvalidLatencyThresholds {
 /// The raw numbers behind a latency verdict — what `cli::calibrate`
 /// prints to help choose `LatencyThresholds`, and what `judge_latency` itself
 /// is built on, so the two can never disagree.
+///
+/// The fields are differences between the candidate and its best anchor and
+/// can be negative, so they stay `f64` in the unit their names carry instead
+/// of `Duration` and `Percent`. `crate::units` converts RTTs into these
+/// milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LatencySummary {
     pub median_excess_ms: f64,
     pub p75_excess_ms: f64,
+    /// Candidate loss minus anchor loss, in percentage points.
     pub median_loss_delta_pct: f64,
     pub valid_probes: usize,
 }
@@ -135,9 +159,7 @@ pub fn select_anchors(anchors: &[AnchorSeries]) -> Vec<&AnchorSeries> {
             let values: Vec<f64> = a
                 .samples()
                 .iter()
-                .filter_map(|sample| {
-                    sample.map(crate::model::PingSample::rtt_ms)
-                })
+                .filter_map(|sample| sample.map(|sample| millis(sample.rtt())))
                 .collect();
             (!values.is_empty()).then(|| (a, median(&values)))
         })
@@ -181,17 +203,13 @@ pub fn summarize_latency(
         };
         let winner = kept
             .iter()
-            .filter_map(|a| {
-                a.samples()[i].map(|sample| {
-                    (sample.rtt_ms(), sample.loss_pct().unwrap_or(0.0))
-                })
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0));
-        let Some((best_rtt, best_loss)) = winner else {
+            .filter_map(|a| a.samples()[i])
+            .min_by_key(|sample| sample.rtt());
+        let Some(best) = winner else {
             continue;
         };
-        excess.push(candidate.rtt_ms() - best_rtt);
-        loss_delta.push(candidate.loss_pct().unwrap_or(0.0) - best_loss);
+        excess.push(millis(candidate.rtt()) - millis(best.rtt()));
+        loss_delta.push(loss_points(*candidate) - loss_points(best));
     }
 
     if excess.len() < MIN_VALID_PROBES {
@@ -208,6 +226,11 @@ pub fn summarize_latency(
         median_loss_delta_pct: median(&loss_delta),
         valid_probes: excess.len(),
     })
+}
+
+/// A sample without a loss figure counts as lossless.
+fn loss_points(sample: PingSample) -> f64 {
+    sample.loss().map_or(0.0, Percent::get)
 }
 
 pub fn judge_latency(
@@ -228,17 +251,16 @@ pub fn judge_latency(
         "median excess {med:.1}ms, p75 {p75:.1}ms across {valid_probes} probes"
     );
 
-    if med > thresholds.max_excess_ms
-        || loss_med > thresholds.max_loss_delta_pct
-    {
+    let max_excess_ms = millis(thresholds.max_excess);
+    let PercentagePoints(max_loss_delta_pp) = thresholds.max_loss_delta;
+
+    if med > max_excess_ms || loss_med > max_loss_delta_pp {
         Verdict::fail(format!(
-            "{detail}, threshold {}ms/{}pp exceeded",
-            thresholds.max_excess_ms, thresholds.max_loss_delta_pct
+            "{detail}, threshold {max_excess_ms}ms/{max_loss_delta_pp}pp exceeded"
         ))
-    } else if p75 > thresholds.max_excess_ms {
+    } else if p75 > max_excess_ms {
         Verdict::warn(format!(
-            "{detail} (p75 exceeds the {}ms threshold, median does not)",
-            thresholds.max_excess_ms
+            "{detail} (p75 exceeds the {max_excess_ms}ms threshold, median does not)"
         ))
     } else if med < SUSPICIOUSLY_NEGATIVE_MS {
         Verdict::warn(format!(
@@ -252,12 +274,14 @@ pub fn judge_latency(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AnchorSeries, PingSample, Severity};
+    use crate::model::{AnchorSeries, Severity};
     use pretty_assertions::assert_eq;
 
     fn samples(rtt: &[f64], loss_pct: f64) -> Vec<Option<PingSample>> {
         rtt.iter()
-            .map(|&rtt| Some(PingSample::new(rtt, Some(loss_pct)).unwrap()))
+            .map(|&rtt| {
+                Some(PingSample::from_millis(rtt, Some(loss_pct)).unwrap())
+            })
             .collect()
     }
 
@@ -267,7 +291,9 @@ mod tests {
     ) -> Vec<Option<PingSample>> {
         rtt.iter()
             .map(|rtt| {
-                rtt.map(|rtt| PingSample::new(rtt, Some(loss_pct)).unwrap())
+                rtt.map(|rtt| {
+                    PingSample::from_millis(rtt, Some(loss_pct)).unwrap()
+                })
             })
             .collect()
     }
@@ -284,7 +310,7 @@ mod tests {
     }
 
     fn thresholds() -> LatencyThresholds {
-        LatencyThresholds::new(14.0, 2.0).unwrap()
+        LatencyThresholds::from_millis_and_points(14.0, 2.0).unwrap()
     }
 
     #[test]
@@ -317,7 +343,9 @@ mod tests {
     fn an_unusable_rtt_excess_threshold_is_rejected(
         #[case] max_excess_ms: f64,
     ) {
-        let error = LatencyThresholds::new(max_excess_ms, 2.0).unwrap_err();
+        let error =
+            LatencyThresholds::from_millis_and_points(max_excess_ms, 2.0)
+                .unwrap_err();
 
         assert!(
             matches!(error, InvalidLatencyThresholds::MaxExcess(_)),
@@ -329,10 +357,11 @@ mod tests {
     #[case::non_finite(f64::INFINITY)]
     #[case::negative(-1.0)]
     fn an_unusable_loss_delta_threshold_is_rejected(
-        #[case] max_loss_delta_pct: f64,
+        #[case] max_loss_delta_pp: f64,
     ) {
         let error =
-            LatencyThresholds::new(14.0, max_loss_delta_pct).unwrap_err();
+            LatencyThresholds::from_millis_and_points(14.0, max_loss_delta_pp)
+                .unwrap_err();
 
         assert!(
             matches!(error, InvalidLatencyThresholds::MaxLossDelta(_)),
@@ -412,6 +441,20 @@ mod tests {
         let verdict = judge_latency(&sut, &thresholds());
 
         assert_eq!(verdict.severity, expected, "{}", verdict.detail);
+    }
+
+    #[test]
+    fn a_failed_latency_names_the_thresholds_in_flag_units() {
+        let sut =
+            facts(samples(&[80.0; 8], 0.0), vec![anchor("only", &[20.0; 8])]);
+
+        let verdict = judge_latency(&sut, &thresholds());
+
+        assert_eq!(
+            verdict.detail,
+            "median excess 60.0ms, p75 60.0ms across 8 probes, \
+             threshold 14ms/2pp exceeded"
+        );
     }
 
     #[test]

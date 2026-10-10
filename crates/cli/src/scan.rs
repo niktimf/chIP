@@ -23,7 +23,7 @@ use chip_core::verdict::service_geo::{
     judge_cdn_edge, judge_search_captcha, judge_service_country,
 };
 use chip_core::verdict::services::{judge_service_fail, judge_service_warn};
-use chip_core::verdict::steal::{judge_steal, steal_pct};
+use chip_core::verdict::steal::{judge_steal, steal_share};
 use chip_core::verdict::tampering::judge_tampering;
 use chip_core::{
     CheckResult, CountryCode, GateId, GateScope, Report, ScanProfile, Verdict,
@@ -1033,14 +1033,15 @@ async fn run_socks_checks(
 }
 
 async fn run_steal_check(session: &SshSession, progress: &ScanProgress) {
+    const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
     let verdict = match session.steal_snapshot().await {
         Ok(before) => {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(SAMPLE_INTERVAL).await;
             session
                 .steal_snapshot()
                 .await
                 .map_or_else(ssh_failure, |after| {
-                    judge_steal(steal_pct(&before, &after))
+                    judge_steal(steal_share(&before, &after), SAMPLE_INTERVAL)
                 })
         }
         Err(error) => ssh_failure(error),

@@ -1,4 +1,5 @@
 use super::types::{RawMeasurement, RawProbeResult};
+use crate::error_chain::describe_error;
 use chip_core::model::{
     AnchorSeries, HttpProbeOutcome, PingSample, PingSweepFacts,
     ProbeAlignmentError, ReachFacts,
@@ -9,14 +10,14 @@ fn extract_ping(results: &[RawProbeResult]) -> Vec<Option<PingSample>> {
         .iter()
         .map(|r| match (&r.result.stats, r.result.status.as_str()) {
             (Some(stats), "finished") => stats.min.and_then(|rtt| {
-                PingSample::new(rtt, stats.loss)
+                PingSample::from_millis(rtt, stats.loss)
                     .inspect_err(|error| {
                         tracing::warn!(
                             city = r.probe.city.as_deref(),
                             network = r.probe.network.as_deref(),
                             rtt_ms = rtt,
                             loss = stats.loss,
-                            %error,
+                            error = %describe_error(error),
                             "invalid ping sample counted as no reply"
                         );
                     })
@@ -70,6 +71,10 @@ pub fn reach_facts(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use chip_core::model::Percent;
+
     use super::{ping_sweep_facts, reach_facts};
     use crate::globalping::types::{
         RawMeasurement, RawPingStats, RawProbe, RawProbeResult, RawResult,
@@ -155,8 +160,8 @@ mod tests {
         )]);
         let facts = ping_sweep_facts(&candidate, &[]).unwrap();
         let sample = facts.candidate()[0].unwrap();
-        assert!((sample.rtt_ms() - 20.0).abs() < f64::EPSILON);
-        assert_eq!(sample.loss_pct(), Some(1.5));
+        assert_eq!(sample.rtt(), Duration::from_millis(20));
+        assert_eq!(sample.loss(), Some(Percent::try_from(1.5).unwrap()));
     }
 
     #[test]
@@ -187,10 +192,9 @@ mod tests {
                 .unwrap();
         assert_eq!(facts.city_anchors().len(), 1);
         assert_eq!(facts.city_anchors()[0].id(), "as1");
-        assert!(
-            (facts.city_anchors()[0].samples()[0].unwrap().rtt_ms() - 14.0)
-                .abs()
-                < f64::EPSILON
+        assert_eq!(
+            facts.city_anchors()[0].samples()[0].unwrap().rtt(),
+            Duration::from_millis(14)
         );
         assert_eq!(facts.city_anchors()[0].samples()[1], None);
     }

@@ -420,8 +420,10 @@ impl TryFrom<(ScanArgs, EnvironmentInputs)> for ScanCommand {
     fn try_from(
         (args, environment): (ScanArgs, EnvironmentInputs),
     ) -> Result<Self, Self::Error> {
-        let latency_thresholds =
-            LatencyThresholds::new(args.max_excess_ms, args.max_loss_pct)?;
+        let latency_thresholds = LatencyThresholds::from_millis_and_points(
+            args.max_excess_ms,
+            args.max_loss_pct,
+        )?;
         let probes = ProbeSelection::new(args.eyeball_probes, args.dc_probes)?;
         let ssh_access = if args.no_ssh {
             SshAccess::Disabled

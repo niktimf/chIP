@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Context as _;
-use chip_core::verdict::latency::summarize_latency;
+use chip_core::verdict::latency::{LatencySummary, summarize_latency};
 use chip_io::atlas::{Anchor, AnchorClient, select_for_city};
 use chip_io::globalping::{
     GlobalpingClient, Locations, MeasurementId, MeasurementKind,
@@ -15,9 +15,15 @@ const MEASUREMENT_DEADLINE: Duration = Duration::from_secs(90);
 #[derive(Debug, Clone)]
 pub struct CalibrationRow {
     pub label: String,
-    pub median_excess_ms: f64,
-    pub p75_excess_ms: f64,
-    pub median_loss_delta_pct: f64,
+    pub summary: LatencySummary,
+}
+
+/// Threshold values to pass back as `--max-excess-ms` and `--max-loss-pct`,
+/// in the units of those flags.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SuggestedThresholds {
+    pub max_excess_ms: f64,
+    pub max_loss_pct: f64,
 }
 
 struct CalibrationSession {
@@ -112,19 +118,26 @@ fn calibration_row(
         .with_context(|| format!("{} ({})", target.ip(), target.city()))?;
     Ok(CalibrationRow {
         label: format!("{} ({})", target.ip(), target.city()),
-        median_excess_ms: summary.median_excess_ms,
-        p75_excess_ms: summary.p75_excess_ms,
-        median_loss_delta_pct: summary.median_loss_delta_pct,
+        summary,
     })
 }
 
-pub fn suggest_thresholds(rows: &[CalibrationRow]) -> Option<(f64, f64)> {
-    let max_p75 = rows.iter().map(|row| row.p75_excess_ms).reduce(f64::max)?;
+pub fn suggest_thresholds(
+    rows: &[CalibrationRow],
+) -> Option<SuggestedThresholds> {
+    const EXCESS_MARGIN_MS: f64 = 5.0;
+    let max_p75 = rows
+        .iter()
+        .map(|row| row.summary.p75_excess_ms)
+        .reduce(f64::max)?;
     let max_loss = rows
         .iter()
-        .map(|row| row.median_loss_delta_pct)
+        .map(|row| row.summary.median_loss_delta_pct)
         .reduce(f64::max)?;
-    Some((max_p75 + 5.0, max_loss.max(0.0)))
+    Some(SuggestedThresholds {
+        max_excess_ms: max_p75 + EXCESS_MARGIN_MS,
+        max_loss_pct: max_loss.max(0.0),
+    })
 }
 
 pub fn render_calibration(rows: &[CalibrationRow]) -> String {
@@ -134,21 +147,20 @@ pub fn render_calibration(rows: &[CalibrationRow]) -> String {
             format!(
                 "{:<28} {:>7.2} {:>7.2} {:>11.2}\n",
                 row.label,
-                row.median_excess_ms,
-                row.p75_excess_ms,
-                row.median_loss_delta_pct
+                row.summary.median_excess_ms,
+                row.summary.p75_excess_ms,
+                row.summary.median_loss_delta_pct
             )
         })
         .collect::<Vec<_>>()
         .concat();
-    let suggestion = suggest_thresholds(rows).map_or_else(
-        String::new,
-        |(excess, loss)| {
+    let suggestion =
+        suggest_thresholds(rows).map_or_else(String::new, |suggested| {
             format!(
-                "\nsuggested: --max-excess-ms {excess:.1} --max-loss-pct {loss:.1}"
+                "\nsuggested: --max-excess-ms {:.1} --max-loss-pct {:.1}",
+                suggested.max_excess_ms, suggested.max_loss_pct
             )
-        },
-    );
+        });
     format!(
         "node                         median     p75  loss-delta\n\
          {table}{suggestion}"
@@ -176,27 +188,31 @@ pub async fn run_calibrate(
 mod tests {
     use super::*;
 
+    fn row(
+        label: &str,
+        median_excess_ms: f64,
+        p75_excess_ms: f64,
+        median_loss_delta_pct: f64,
+    ) -> CalibrationRow {
+        CalibrationRow {
+            label: label.into(),
+            summary: LatencySummary {
+                median_excess_ms,
+                p75_excess_ms,
+                median_loss_delta_pct,
+                valid_probes: 12,
+            },
+        }
+    }
+
     #[test]
     fn thresholds_add_five_ms_to_the_worst_p75() {
-        let sut = vec![
-            CalibrationRow {
-                label: "a".into(),
-                median_excess_ms: 4.95,
-                p75_excess_ms: 8.96,
-                median_loss_delta_pct: 0.0,
-            },
-            CalibrationRow {
-                label: "b".into(),
-                median_excess_ms: 5.40,
-                p75_excess_ms: 9.12,
-                median_loss_delta_pct: 0.5,
-            },
-        ];
+        let sut = vec![row("a", 4.95, 8.96, 0.0), row("b", 5.40, 9.12, 0.5)];
 
-        let (excess, loss) = suggest_thresholds(&sut).unwrap();
+        let suggested = suggest_thresholds(&sut).unwrap();
 
-        assert!((excess - 14.12).abs() < 0.01);
-        assert!((loss - 0.5).abs() < 0.01);
+        assert!((suggested.max_excess_ms - 14.12).abs() < 0.01);
+        assert!((suggested.max_loss_pct - 0.5).abs() < 0.01);
     }
 
     #[test]

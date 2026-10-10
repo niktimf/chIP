@@ -1,14 +1,16 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::net::Ipv4Addr;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::str::FromStr;
+use std::time::Duration;
 
 use country_code_enum::CountryCode as RegistryCountryCode;
 use ipnet::Ipv4Net;
 use strum::{Display, IntoStaticStr};
 
 use crate::gate::GateId;
+use crate::units;
 
 /// How serious a single check's outcome is. Ordered least to most severe so
 /// `Vec<CheckResult>::sort()` (descending) puts the worst results first.
@@ -299,41 +301,107 @@ impl ReachFacts {
     }
 }
 
+/// A share of a whole in percent: finite and within `0..=100`.
+///
+/// Packet loss and the CPU steal share are such shares. A difference between
+/// two of them can be negative and is not a `Percent`.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct Percent(f64);
+
+impl Percent {
+    pub const ZERO: Self = Self(0.0);
+    const MAX: f64 = 100.0;
+
+    /// `part` of `whole` in percent. A `part` above `whole` saturates at 100
+    /// percent instead of leaving the range.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a share needs no more than f64 precision; part <= whole \
+                  keeps the ratio within 0..=1 after rounding"
+    )]
+    pub fn saturating_ratio(part: u64, whole: NonZeroU64) -> Self {
+        let whole = whole.get();
+        let part = part.min(whole);
+        Self(part as f64 / whole as f64 * Self::MAX)
+    }
+
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for Percent {
+    type Error = InvalidPercent;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        if !value.is_finite() {
+            return Err(InvalidPercent::NotFinite(value));
+        }
+        if !(0.0..=Self::MAX).contains(&value) {
+            return Err(InvalidPercent::OutOfRange(value));
+        }
+        Ok(Self(value))
+    }
+}
+
+/// Why a number is not a [`Percent`], with the rejected value.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+pub enum InvalidPercent {
+    #[error("percent must be finite, got {0}")]
+    NotFinite(f64),
+    #[error("percent must be between 0 and 100, got {0}")]
+    OutOfRange(f64),
+}
+
+impl InvalidPercent {
+    pub const fn value(self) -> f64 {
+        match self {
+            Self::NotFinite(value) | Self::OutOfRange(value) => value,
+        }
+    }
+}
+
 /// One usable ping result. An absent result is represented by
-/// `Option<PingSample>` at the call site; a present sample always has a
-/// finite, non-negative RTT and an optional loss percentage in `0..=100`.
+/// `Option<PingSample>` at the call site; a present sample always has an RTT
+/// and an optional loss share.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PingSample {
-    rtt_ms: f64,
-    loss_pct: Option<f64>,
+    rtt: Duration,
+    loss: Option<Percent>,
 }
 
 impl PingSample {
+    /// Parses a ping result in the units measurement sources report: RTT in
+    /// milliseconds, loss in percent.
+    ///
     /// # Errors
     ///
     /// Returns `InvalidPingSample` when the RTT is negative or not finite, or
     /// the loss is not a finite percentage in `0..=100`.
-    pub fn new(
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "TryFromFloatSecsError only repeats that the RTT is \
+                  negative, non-finite or too large; Rtt keeps the value"
+    )]
+    pub fn from_millis(
         rtt_ms: f64,
         loss_pct: Option<f64>,
     ) -> Result<Self, InvalidPingSample> {
-        if !rtt_ms.is_finite() || rtt_ms < 0.0 {
-            return Err(InvalidPingSample::Rtt(rtt_ms));
-        }
-        if let Some(loss) = loss_pct
-            && (!loss.is_finite() || !(0.0..=100.0).contains(&loss))
-        {
-            return Err(InvalidPingSample::Loss(loss));
-        }
-        Ok(Self { rtt_ms, loss_pct })
+        let rtt = units::duration_from_millis(rtt_ms)
+            .map_err(|_| InvalidPingSample::Rtt(rtt_ms))?;
+        let loss = loss_pct
+            .map(Percent::try_from)
+            .transpose()
+            .map_err(InvalidPingSample::Loss)?;
+        Ok(Self { rtt, loss })
     }
 
-    pub const fn rtt_ms(self) -> f64 {
-        self.rtt_ms
+    pub const fn rtt(self) -> Duration {
+        self.rtt
     }
 
-    pub const fn loss_pct(self) -> Option<f64> {
-        self.loss_pct
+    pub const fn loss(self) -> Option<Percent> {
+        self.loss
     }
 }
 
@@ -345,11 +413,8 @@ pub enum InvalidPingSample {
         "invalid ping sample: RTT must be finite and non-negative, got {0}"
     )]
     Rtt(f64),
-    #[error(
-        "invalid ping sample: loss must be finite and between 0 and 100 \
-         percent, got {0}"
-    )]
-    Loss(f64),
+    #[error("invalid ping sample: loss")]
+    Loss(#[source] InvalidPercent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -930,7 +995,7 @@ mod tests {
         #[case] rtt_ms: f64,
         #[case] loss_pct: Option<f64>,
     ) {
-        let error = PingSample::new(rtt_ms, loss_pct).unwrap_err();
+        let error = PingSample::from_millis(rtt_ms, loss_pct).unwrap_err();
 
         assert!(matches!(error, InvalidPingSample::Rtt(_)), "{error:?}");
     }
@@ -940,9 +1005,43 @@ mod tests {
     #[case::negative_loss(Some(-1.0))]
     #[case::nan_loss(Some(f64::NAN))]
     fn a_ping_with_an_unusable_loss_is_rejected(#[case] loss_pct: Option<f64>) {
-        let error = PingSample::new(10.0, loss_pct).unwrap_err();
+        let error = PingSample::from_millis(10.0, loss_pct).unwrap_err();
 
         assert!(matches!(error, InvalidPingSample::Loss(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_ping_rtt_in_milliseconds_becomes_a_duration() {
+        let sample = PingSample::from_millis(23.378, None).unwrap();
+
+        assert_eq!(sample.rtt(), Duration::from_micros(23_378));
+    }
+
+    #[rstest::rstest]
+    #[case::nan(f64::NAN)]
+    #[case::infinite(f64::INFINITY)]
+    fn a_non_finite_percent_is_rejected(#[case] value: f64) {
+        let error = Percent::try_from(value).unwrap_err();
+
+        assert!(matches!(error, InvalidPercent::NotFinite(_)), "{error:?}");
+    }
+
+    #[rstest::rstest]
+    #[case::below_zero(-1.0)]
+    #[case::above_one_hundred(100.1)]
+    fn a_percent_outside_zero_to_one_hundred_is_rejected(#[case] value: f64) {
+        let error = Percent::try_from(value).unwrap_err();
+
+        assert!(matches!(error, InvalidPercent::OutOfRange(_)), "{error:?}");
+    }
+
+    #[rstest::rstest]
+    #[case::zero(0.0)]
+    #[case::one_hundred(100.0)]
+    fn zero_and_one_hundred_are_valid_percents(#[case] value: f64) {
+        let result = Percent::try_from(value);
+
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]

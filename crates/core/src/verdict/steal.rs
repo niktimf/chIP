@@ -1,45 +1,48 @@
+use std::num::NonZeroU64;
+use std::time::Duration;
+
 use crate::Verdict;
-use crate::model::ProcStatSnapshot;
+use crate::model::{Percent, ProcStatSnapshot};
 
 const WARN_STEAL_PCT: f64 = 5.0;
 
 /// Share of elapsed CPU ticks the kernel itself attributes to steal time
-/// (`/proc/stat` field 8) over the interval between two snapshots.
-// `steal_delta` and `total_delta` are cumulative tick counts since boot,
-// clamped to u64::MAX; converting to f64 never loses precision within the
-// representable tick range (centuries of uptime).
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "tick deltas stay far below 2^52 for any realistic uptime"
-)]
-pub fn steal_pct(before: &ProcStatSnapshot, after: &ProcStatSnapshot) -> f64 {
+/// (`/proc/stat` field 8) over the interval between two snapshots. No
+/// elapsed ticks means no steal.
+pub fn steal_share(
+    before: &ProcStatSnapshot,
+    after: &ProcStatSnapshot,
+) -> Percent {
     let total_delta = after.total_ticks().saturating_sub(before.total_ticks());
-    if total_delta == 0 {
-        return 0.0;
-    }
     let steal_delta = after.steal_ticks().saturating_sub(before.steal_ticks());
-    steal_delta as f64 / total_delta as f64 * 100.0
+    NonZeroU64::new(total_delta).map_or(Percent::ZERO, |total| {
+        Percent::saturating_ratio(steal_delta, total)
+    })
 }
 
-pub fn judge_steal(pct: f64) -> Verdict {
+/// Judges the steal share measured between two snapshots taken `interval`
+/// apart.
+pub fn judge_steal(share: Percent, interval: Duration) -> Verdict {
+    let pct = share.get();
+    let seconds = interval.as_secs_f64();
     if pct >= WARN_STEAL_PCT {
         Verdict::warn(format!(
-            "~{pct:.1}% CPU steal over a 5s sample — host may be oversold"
+            "~{pct:.1}% CPU steal over a {seconds}s sample — host may be oversold"
         ))
     } else {
-        Verdict::ok(format!("~{pct:.1}% CPU steal over a 5s sample"))
+        Verdict::ok(format!("~{pct:.1}% CPU steal over a {seconds}s sample"))
     }
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::float_cmp,
-    reason = "these tick counts give the expected percentages exactly in f64"
-)]
 mod tests {
     use super::*;
     use crate::model::Severity;
     use pretty_assertions::assert_eq;
+
+    fn sample_interval() -> Duration {
+        Duration::from_secs(5)
+    }
 
     fn snap(steal: u64, total: u64) -> ProcStatSnapshot {
         ProcStatSnapshot::new(steal, total).unwrap()
@@ -65,9 +68,9 @@ mod tests {
     ) {
         let (before, after) = sut;
 
-        let actual = steal_pct(&before, &after);
+        let actual = steal_share(&before, &after);
 
-        assert_eq!(actual, expected);
+        assert_eq!(actual, Percent::try_from(expected).unwrap());
     }
 
     #[rstest::rstest]
@@ -78,9 +81,31 @@ mod tests {
         #[case] value: f64,
         #[case] expected: Severity,
     ) {
-        let verdict = judge_steal(value);
+        let verdict =
+            judge_steal(Percent::try_from(value).unwrap(), sample_interval());
 
         assert_eq!(verdict.severity, expected, "{}", verdict.detail);
+    }
+
+    #[test]
+    fn the_steal_detail_names_the_sample_interval() {
+        let share = Percent::try_from(20.0).unwrap();
+
+        let verdict = judge_steal(share, Duration::from_millis(2500));
+
+        assert_eq!(
+            verdict.detail,
+            "~20.0% CPU steal over a 2.5s sample — host may be oversold"
+        );
+    }
+
+    #[test]
+    fn a_five_second_sample_is_reported_as_5s() {
+        let share = Percent::try_from(3.0).unwrap();
+
+        let verdict = judge_steal(share, sample_interval());
+
+        assert_eq!(verdict.detail, "~3.0% CPU steal over a 5s sample");
     }
 
     #[test]
