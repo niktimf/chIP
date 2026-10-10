@@ -6,6 +6,7 @@ use openssh::{KnownHosts, Session, SessionBuilder, Stdio};
 use std::net::Ipv4Addr;
 use std::num::{NonZeroU16, NonZeroU64};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -82,12 +83,18 @@ impl SshConfig {
     }
 }
 
+/// An SSH connection to one candidate.
+///
+/// The session owns the candidate's credential files. The SOCKS tunnel
+/// started from it shares them, so under trust on first use the tunnel
+/// checks the host key this session accepted.
 #[derive(Debug)]
 pub struct SshSession {
     session: Session,
-    default_timeout: Duration,
+    address: Ipv4Addr,
+    config: SshConfig,
     pub(super) listener: ListenerSlot,
-    _credentials: SshCredentialFiles,
+    credentials: Arc<SshCredentialFiles>,
 }
 
 impl SshSession {
@@ -97,9 +104,9 @@ impl SshSession {
     /// SSH connection fails.
     pub async fn connect(
         address: Ipv4Addr,
-        config: &SshConfig,
+        config: SshConfig,
     ) -> Result<Self, SshError> {
-        let credentials = SshCredentialFiles::prepare(config)?;
+        let credentials = SshCredentialFiles::prepare(&config)?;
         let mut builder = SessionBuilder::default();
         if let Some(user) = &config.user {
             builder.user(user.clone());
@@ -128,10 +135,25 @@ impl SshSession {
             .map_err(SshError::Connect)?;
         Ok(Self {
             session,
-            default_timeout: config.command_timeout,
+            address,
+            config,
             listener: ListenerSlot::default(),
-            _credentials: credentials,
+            credentials: Arc::new(credentials),
         })
+    }
+
+    pub(super) const fn address(&self) -> Ipv4Addr {
+        self.address
+    }
+
+    pub(super) const fn config(&self) -> &SshConfig {
+        &self.config
+    }
+
+    /// The credential files of this session, for a second connection to
+    /// the same candidate.
+    pub(super) fn credentials(&self) -> Arc<SshCredentialFiles> {
+        Arc::clone(&self.credentials)
     }
 
     /// # Errors
@@ -195,7 +217,7 @@ impl SshSession {
     }
 
     pub const fn command_timeout(&self) -> Duration {
-        self.default_timeout
+        self.config.command_timeout
     }
 }
 

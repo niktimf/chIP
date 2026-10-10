@@ -631,7 +631,7 @@ async fn record_service_geo(
     country: &CountryCode,
     progress: &ScanProgress,
 ) {
-    /// The pause before the captcha retry; the verdict text says "~30s".
+    /// The pause before the captcha retry; the verdict detail names it.
     const CAPTCHA_RETRY_AFTER: Duration = Duration::from_secs(30);
 
     tokio::join!(
@@ -755,7 +755,7 @@ async fn start_listener(
             }
             Err(error) => {
                 progress
-                    .add([CheckResult::new(gate::REACH, ssh_failure(error))]);
+                    .add([CheckResult::new(gate::REACH, error_verdict(error))]);
                 return None;
             }
         }
@@ -799,33 +799,16 @@ impl GlobalpingSetupError {
     }
 }
 
-/// An open SSH session and the config it was opened with; the SOCKS tunnel
-/// reuses the config for its own connection.
-struct SshConnection {
-    session: SshSession,
-    config: SshConfig,
-}
-
 /// What phase B has of the SSH access to the candidate.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "a scan holds one value in its phase B future, so the unused \
-              space of the small variants costs nothing worth a box"
-)]
 enum SshState {
     /// `--no-ssh`: the SSH gates are reported as skipped.
     Disabled,
     /// SSH is enabled but no session is open: connecting failed, and its
     /// error rows are recorded, or the phase deadline cancelled it.
     Unavailable,
-    Connected {
-        connection: SshConnection,
-        /// The temporary listener port verified from the runner, the port
-        /// the reach gate measures; `None` when no listener became
-        /// reachable. The session keeps its own record of the port to clean
-        /// up, which a listener that failed verification also leaves.
-        listener: Option<NonZeroU16>,
-    },
+    /// The open session; it also records the temporary listener port that
+    /// still needs cleanup.
+    Connected(SshSession),
 }
 
 impl SshState {
@@ -836,22 +819,30 @@ impl SshState {
         }
     }
 
-    const fn connection(&self) -> Option<&SshConnection> {
+    const fn session(&self) -> Option<&SshSession> {
         match self {
-            Self::Connected { connection, .. } => Some(connection),
+            Self::Connected(session) => Some(session),
             Self::Disabled | Self::Unavailable => None,
         }
     }
 
-    const fn listener(&self) -> Option<NonZeroU16> {
+    /// Stores the open session and lends it back.
+    #[expect(
+        clippy::unreachable,
+        reason = "the state is set to `Connected` on the line above"
+    )]
+    fn connected(&mut self, session: SshSession) -> &SshSession {
+        *self = Self::Connected(session);
         match self {
-            Self::Connected { listener, .. } => *listener,
-            Self::Disabled | Self::Unavailable => None,
+            Self::Connected(session) => session,
+            Self::Disabled | Self::Unavailable => {
+                unreachable!("the state was just set to `Connected`")
+            }
         }
     }
 
     async fn stop_listener(&self) -> Option<CheckResult> {
-        stop_listener(&self.connection()?.session).await
+        stop_listener(self.session()?).await
     }
 }
 
@@ -884,11 +875,6 @@ fn skipped_ssh_results() -> Vec<CheckResult> {
     gate::ssh_gates()
         .map(|gate| CheckResult::skipped(gate, REASON))
         .collect()
-}
-
-fn ssh_failure(error: impl Into<anyhow::Error>) -> Verdict {
-    // Formatting belongs to the CLI boundary; the adapter retains typed causes.
-    error_verdict(error)
 }
 
 fn unavailable_ssh_results(error: chip_io::ssh::SshError) -> Vec<CheckResult> {
@@ -953,6 +939,11 @@ fn ssh_config(settings: &SshSettings) -> SshConfig {
     }
 }
 
+/// Connects to the candidate and starts the temporary listener.
+///
+/// Returns the listener port verified from the runner, the port the reach
+/// gate measures; `None` when SSH is disabled or unavailable or no listener
+/// became reachable.
 #[tracing::instrument(
     name = "scan.prepare_ssh",
     level = "debug",
@@ -963,35 +954,22 @@ async fn prepare_ssh(
     command: &ScanCommand,
     ssh: &mut SshState,
     progress: &ScanProgress,
-) {
+) -> Option<NonZeroU16> {
     let SshAccess::Enabled(settings) = command.ssh_access() else {
-        return;
+        return None;
     };
-    let config = ssh_config(settings);
-    let session = match SshSession::connect(command.ip(), &config).await {
-        Ok(session) => session,
-        Err(error) => {
-            progress.add(unavailable_ssh_results(error));
-            return;
-        }
-    };
+    let session =
+        match SshSession::connect(command.ip(), ssh_config(settings)).await {
+            Ok(session) => session,
+            Err(error) => {
+                progress.add(unavailable_ssh_results(error));
+                return None;
+            }
+        };
     // Store the owner before any remote listener can be created. The session
     // records a pending port before starting the mutating remote command.
-    *ssh = SshState::Connected {
-        connection: SshConnection { session, config },
-        listener: None,
-    };
-    // Borrows the state just stored, so the `else` never runs; it stands in
-    // for an `expect` the lints forbid.
-    let SshState::Connected {
-        connection,
-        listener,
-    } = ssh
-    else {
-        return;
-    };
-    *listener =
-        start_listener(&connection.session, command.ip(), progress).await;
+    let session = ssh.connected(session);
+    start_listener(session, command.ip(), progress).await
 }
 
 async fn run_globalping_branch(
@@ -1025,7 +1003,7 @@ async fn run_globalping_branch(
 
 async fn run_socks_checks(
     command: &ScanCommand,
-    connection: &SshConnection,
+    session: &SshSession,
     progress: &ScanProgress,
 ) {
     let port = match pick_free_port() {
@@ -1038,16 +1016,10 @@ async fn run_socks_checks(
             return;
         }
     };
-    let tunnel = match SocksTunnel::start(
-        command.ip(),
-        &connection.config,
-        port,
-    )
-    .await
-    {
+    let tunnel = match SocksTunnel::start(session, port).await {
         Ok(tunnel) => tunnel,
         Err(error) => {
-            progress.add(tunnel_results(&ssh_failure(error)));
+            progress.add(tunnel_results(&error_verdict(error)));
             return;
         }
     };
@@ -1076,14 +1048,14 @@ async fn run_steal_check(session: &SshSession, progress: &ScanProgress) {
             session
                 .steal_snapshot()
                 .await
-                .map_or_else(ssh_failure, |after| {
+                .map_or_else(error_verdict, |after| {
                     judge_steal(
                         after.steal_share_since(before),
                         SAMPLE_INTERVAL,
                     )
                 })
         }
-        Err(error) => ssh_failure(error),
+        Err(error) => error_verdict(error),
     };
     progress.add([CheckResult::new(gate::STEAL, verdict)]);
 }
@@ -1093,12 +1065,12 @@ async fn run_ssh_checks(
     ssh: &SshState,
     progress: &ScanProgress,
 ) {
-    let Some(connection) = ssh.connection() else {
+    let Some(session) = ssh.session() else {
         return;
     };
     tokio::join!(
-        run_socks_checks(command, connection, progress),
-        run_steal_check(&connection.session, progress),
+        run_socks_checks(command, session, progress),
+        run_steal_check(session, progress),
     );
 }
 
@@ -1168,12 +1140,12 @@ pub async fn run_phase_b(
         }));
     }
     let work = async {
-        let (sources, ()) = tokio::join!(
+        let (sources, listener) = tokio::join!(
             prepare_globalping(command, http),
             prepare_ssh(command, &mut ssh, &progress),
         );
         tokio::join!(
-            run_globalping_branch(sources, command, ssh.listener(), &progress),
+            run_globalping_branch(sources, command, listener, &progress),
             run_ssh_checks(command, &ssh, &progress),
             run_neighbor_checks(command, &progress),
         );

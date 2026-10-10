@@ -80,7 +80,7 @@ fn port_is_open(ip: Ipv4Addr, port: NonZeroU16) -> bool {
 async fn the_candidate_carries_what_a_scan_needs_over_ssh() {
     let ip = candidate();
 
-    let sut = SshSession::connect(ip, &config())
+    let sut = SshSession::connect(ip, config())
         .await
         .expect("the candidate accepts our key");
     let readiness = sut
@@ -102,7 +102,10 @@ async fn the_candidate_carries_what_a_scan_needs_over_ssh() {
 async fn traffic_through_the_tunnel_leaves_from_the_candidate() {
     let ip = candidate();
 
-    let tunnel = SocksTunnel::start(ip, &config(), free_local_port())
+    let session = SshSession::connect(ip, config())
+        .await
+        .expect("the candidate accepts our key");
+    let tunnel = SocksTunnel::start(&session, free_local_port())
         .await
         .expect("ssh -D opens a SOCKS proxy into the candidate");
     let sut = TunnelClient::new(tunnel.local_addr(), Duration::from_secs(20))
@@ -122,7 +125,7 @@ async fn the_temporary_listener_opens_its_port_and_stopping_closes_it() {
     let ip = candidate();
     let port = listener_port();
 
-    let sut = SshSession::connect(ip, &config())
+    let sut = SshSession::connect(ip, config())
         .await
         .expect("the candidate accepts our key");
     let outcome = sut.start_listener(port).await.expect("ssh answered");

@@ -22,11 +22,13 @@ pub(super) fn secret_file(content: &str) -> std::io::Result<NamedTempFile> {
     Ok(file)
 }
 
-/// The temporary files one ssh connection reads: the private key, when the
-/// config has one, and the known-hosts files.
+/// The temporary files the ssh connections to one candidate read: the
+/// private key, when the config has one, and the known-hosts files.
 ///
-/// The files are removed when this value is dropped, so its owner keeps it
-/// as long as the ssh process runs.
+/// The session and its SOCKS tunnel share one set, so a host key the first
+/// connection accepted is the key the second one checks. The files are
+/// removed when this value is dropped, so its owners keep it as long as
+/// their ssh processes run.
 #[derive(Debug)]
 pub(super) struct SshCredentialFiles {
     key: Option<NamedTempFile>,

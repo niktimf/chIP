@@ -1,9 +1,10 @@
 use super::credential_files::SshCredentialFiles;
 use super::known_hosts::HostKeyPolicy;
-use super::session::{SshConfig, SshError};
+use super::session::{SshConfig, SshError, SshSession};
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroU16;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,45 +21,50 @@ pub enum SocksError {
 
 /// A dedicated `ssh -N -D` child process: a SOCKS5 proxy into the candidate.
 ///
-/// It is independent of the `SshSession` used for commands. DNS for anything
-/// dialed through it resolves on the candidate's side (`socks5h`), so services see the
-/// candidate's egress, not the runner's.
+/// It is a second ssh process next to the `SshSession` used for commands
+/// and reads the session's credential files: under trust on first use it
+/// accepts only the host key the session accepted. DNS for anything dialed
+/// through it resolves on the candidate's side (`socks5h`), so services see
+/// the candidate's egress, not the runner's.
 #[derive(Debug)]
 pub struct SocksTunnel {
     child: Child,
     local_port: NonZeroU16,
-    _credentials: SshCredentialFiles,
-}
-
-struct PreparedTunnelCommand {
-    command: Command,
-    credentials: SshCredentialFiles,
+    _credentials: Arc<SshCredentialFiles>,
 }
 
 impl SocksTunnel {
+    /// Opens a tunnel to the candidate of `session` with its config and
+    /// credential files.
+    ///
     /// # Errors
     ///
     /// Returns `SocksError::NotReady` when the SOCKS port does not answer a
-    /// handshake in time, and `SocksError::Ssh` when the credential files
-    /// cannot be written or `ssh` cannot be spawned or exits.
+    /// handshake in time, and `SocksError::Ssh` when `ssh` cannot be spawned
+    /// or exits.
     pub async fn start(
-        address: Ipv4Addr,
-        config: &SshConfig,
+        session: &SshSession,
         local_port: NonZeroU16,
     ) -> Result<Self, SocksError> {
-        Self::start_with_program("ssh", address, config, local_port).await
+        Self::start_with_program(
+            "ssh",
+            session.address(),
+            session.config(),
+            session.credentials(),
+            local_port,
+        )
+        .await
     }
 
     async fn start_with_program(
         program: &str,
         address: Ipv4Addr,
         config: &SshConfig,
+        credentials: Arc<SshCredentialFiles>,
         local_port: NonZeroU16,
     ) -> Result<Self, SocksError> {
-        let PreparedTunnelCommand {
-            mut command,
-            credentials,
-        } = prepare_tunnel_command(program, address, config, local_port)?;
+        let mut command =
+            tunnel_command(program, address, config, &credentials, local_port);
         let mut child =
             command.spawn().map_err(|e| SshError::io("spawn ssh", e))?;
         wait_for_socks(&mut child, local_port, config.socks_ready_timeout())
@@ -88,15 +94,15 @@ impl SocksTunnel {
     }
 }
 
-fn prepare_tunnel_command(
+fn tunnel_command(
     program: &str,
     address: Ipv4Addr,
     config: &SshConfig,
+    credentials: &SshCredentialFiles,
     local_port: NonZeroU16,
-) -> Result<PreparedTunnelCommand, SshError> {
-    let credentials = SshCredentialFiles::prepare(config)?;
+) -> Command {
     let mut command = base_tunnel_command(program, config, local_port);
-    configure_authentication(&mut command, config, &credentials);
+    configure_authentication(&mut command, config, credentials);
     command
         .arg("--")
         .arg(address.to_string())
@@ -104,10 +110,7 @@ fn prepare_tunnel_command(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    Ok(PreparedTunnelCommand {
-        command,
-        credentials,
-    })
+    command
 }
 
 fn base_tunnel_command(
@@ -271,15 +274,39 @@ mod tests {
         )
     }
 
+    /// Credential files as `SshSession::connect` prepares them.
+    fn session_credentials(config: &SshConfig) -> Arc<SshCredentialFiles> {
+        Arc::new(SshCredentialFiles::prepare(config).unwrap())
+    }
+
     async fn start_stub(
         program: &str,
         config: &SshConfig,
         local_port: NonZeroU16,
     ) -> Result<SocksTunnel, SocksError> {
+        start_stub_with(
+            program,
+            config,
+            session_credentials(config),
+            local_port,
+        )
+        .await
+    }
+
+    async fn start_stub_with(
+        program: &str,
+        config: &SshConfig,
+        credentials: Arc<SshCredentialFiles>,
+        local_port: NonZeroU16,
+    ) -> Result<SocksTunnel, SocksError> {
         let address = "203.0.113.5".parse().unwrap();
         for _ in 0..50 {
             match SocksTunnel::start_with_program(
-                program, address, config, local_port,
+                program,
+                address,
+                config,
+                Arc::clone(&credentials),
+                local_port,
             )
             .await
             {
@@ -403,26 +430,27 @@ mod tests {
     }
 
     #[test]
-    fn trust_on_first_use_appends_to_a_private_file_and_checks_the_users() {
+    fn the_tunnel_appends_to_the_sessions_learned_file_and_checks_the_users() {
         let tofu_config = SshConfig {
             host_keys: HostKeyPolicy::TrustOnFirstUse {
                 user_known_hosts: Some("/home/a user/.ssh/known_hosts".into()),
             },
             ..config()
         };
+        let session_files = session_credentials(&tofu_config);
 
-        let sut = prepare_tunnel_command(
+        let sut = tunnel_command(
             "ssh",
             "203.0.113.5".parse().unwrap(),
             &tofu_config,
+            &session_files,
             NonZeroU16::new(47080).unwrap(),
-        )
-        .unwrap();
+        );
 
-        let arguments = args(&sut.command);
+        let arguments = args(&sut);
         let expected = format!(
             r#"UserKnownHostsFile="{}" "/home/a user/.ssh/known_hosts""#,
-            sut.credentials.known_hosts().learned().display()
+            session_files.known_hosts().learned().display()
         );
         assert!(arguments.contains(&expected), "{arguments:?}");
         assert!(
@@ -431,23 +459,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_tunnel_ssh_checks_the_host_key_the_session_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = stub(
+            dir.path(),
+            r#"for argument
+do
+  case $argument in
+    UserKnownHostsFile=*)
+      first=${argument#UserKnownHostsFile=\"}
+      first=${first%%\"*}
+      echo "reads $first" >&2
+      cat "$first" >&2
+      ;;
+  esac
+done
+exit 255"#,
+        );
+        let session_files = session_credentials(&config());
+        let learned = session_files.known_hosts().learned().to_owned();
+        std::fs::write(&learned, "203.0.113.5 ssh-ed25519 AAAAsession\n")
+            .unwrap();
+
+        let result =
+            start_stub_with(&program, &config(), session_files, free_port())
+                .await;
+
+        let Err(SocksError::Ssh(SshError::Exit { output, .. })) = result else {
+            panic!("expected an ssh exit, got {result:?}");
+        };
+        assert!(
+            output.contains(&format!("reads {}\n", learned.display())),
+            "{output}"
+        );
+        assert!(output.contains("ssh-ed25519 AAAAsession"), "{output}");
+    }
+
     #[test]
     fn a_sub_second_connect_timeout_still_reaches_ssh_as_one_second() {
         let mut short_config = config();
         short_config.connect_timeout = Duration::from_millis(250);
 
-        let sut = prepare_tunnel_command(
+        let sut = tunnel_command(
             "ssh",
             "203.0.113.5".parse().unwrap(),
             &short_config,
+            &session_credentials(&short_config),
             NonZeroU16::new(47080).unwrap(),
-        )
-        .unwrap();
+        );
 
         assert!(
-            args(&sut.command).contains(&"ConnectTimeout=1".to_owned()),
+            args(&sut).contains(&"ConnectTimeout=1".to_owned()),
             "{:?}",
-            args(&sut.command)
+            args(&sut)
         );
     }
 
