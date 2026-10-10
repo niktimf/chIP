@@ -1,3 +1,4 @@
+use super::listener::ListenerSlot;
 use crate::credentials::SshPrivateKey;
 use openssh::{KnownHosts, Session, SessionBuilder, Stdio};
 use std::io::Write as _;
@@ -127,7 +128,7 @@ impl SshConfig {
 pub struct SshSession {
     session: Session,
     default_timeout: Duration,
-    pub(super) listener_port: std::sync::atomic::AtomicU16,
+    pub(super) listener: ListenerSlot,
     _key_file: Option<NamedTempFile>,
     _known_hosts_file: NamedTempFile,
 }
@@ -175,7 +176,7 @@ impl SshSession {
         Ok(Self {
             session,
             default_timeout: config.command_timeout,
-            listener_port: std::sync::atomic::AtomicU16::new(0),
+            listener: ListenerSlot::default(),
             _key_file: key_file,
             _known_hosts_file: known_hosts_file,
         })
@@ -238,10 +239,7 @@ impl SshSession {
 
     /// Port whose remote startup or listener still needs cleanup.
     pub fn listener_port(&self) -> Option<NonZeroU16> {
-        NonZeroU16::new(
-            self.listener_port
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
+        self.listener.owned()
     }
 
     pub const fn command_timeout(&self) -> Duration {

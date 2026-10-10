@@ -727,7 +727,7 @@ async fn start_listener(
                         // final cleanup retries it and reports
                         // `LISTENER_CLEANUP` once; here it is only logged.
                         let _logged: Option<CheckResult> =
-                            stop_listener(session, port).await;
+                            stop_listener(session).await;
                         progress.add([CheckResult::new(
                             gate::REACH,
                             error_verdict(anyhow::Error::new(error).context(
@@ -792,19 +792,15 @@ impl SshSetup {
     }
 
     async fn stop_listener(&self) -> Option<CheckResult> {
-        let session = &self.connection.as_ref()?.session;
-        let port = session.listener_port()?;
-        stop_listener(session, port).await
+        stop_listener(&self.connection.as_ref()?.session).await
     }
 }
 
 /// Stops the temporary listener; a failure becomes a `LISTENER_CLEANUP` row,
 /// because the candidate may keep a stray listener and firewall rule.
-async fn stop_listener(
-    session: &SshSession,
-    port: NonZeroU16,
-) -> Option<CheckResult> {
-    match session.stop_listener(port).await {
+async fn stop_listener(session: &SshSession) -> Option<CheckResult> {
+    let port = session.listener_port()?;
+    match session.stop_listener().await {
         Ok(()) => {
             tracing::debug!(port = port.get(), "temporary listener stopped");
             None

@@ -2,6 +2,7 @@ use super::session::{SshError, SshSession};
 use chip_core::model::ProcStatSnapshot;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU16;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +41,47 @@ fn listener_preflight_script(port: NonZeroU16) -> String {
          LISTENERS=$(ss -H -ltn 'sport = :{port}') || exit; \
          if [ -z \"$LISTENERS\" ]; then echo READY; else echo BUSY; fi"
     )
+}
+
+/// The port of the remote listener this session has to clean up.
+///
+/// A port is claimed before the start command runs and released only after
+/// a stop command succeeded, so a lost or failed command leaves it claimed
+/// for the next cleanup.
+#[derive(Debug, Default)]
+pub(super) struct ListenerSlot(Mutex<Option<NonZeroU16>>);
+
+impl ListenerSlot {
+    pub(super) fn owned(&self) -> Option<NonZeroU16> {
+        *self.lock()
+    }
+
+    fn claim(&self, port: NonZeroU16) -> Result<(), SshError> {
+        let mut owned = self.lock();
+        if let Some(current) = *owned {
+            return Err(SshError::ListenerAlreadyStarted {
+                port: current.get(),
+            });
+        }
+        *owned = Some(port);
+        drop(owned);
+        Ok(())
+    }
+
+    /// Releases `port` only while it is still the claimed one: a concurrent
+    /// stop may have released it already and a newer start claimed another.
+    fn release(&self, port: NonZeroU16) {
+        let mut owned = self.lock();
+        if *owned == Some(port) {
+            *owned = None;
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<NonZeroU16>> {
+        // The guarded value is a plain `Copy` port, so a panic while it was
+        // held cannot leave it half-written.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 fn parse_proc_stat(text: &str) -> Option<ProcStatSnapshot> {
@@ -126,7 +168,7 @@ impl SshSession {
         &self,
         port: NonZeroU16,
     ) -> Result<ListenerOutcome, SshError> {
-        if let Some(owned) = self.listener_port() {
+        if let Some(owned) = self.listener.owned() {
             return Err(SshError::ListenerAlreadyStarted { port: owned.get() });
         }
         match self.listener_readiness(port).await? {
@@ -146,20 +188,10 @@ impl SshSession {
             }
         }
         let timeout = self.command_timeout();
-        let port = port.get();
-        let script = listener_start_script(port);
+        let script = listener_start_script(port.get());
         // Ownership is registered before awaiting a command that can create
         // remote state, including when its response is lost or cancelled.
-        self.listener_port
-            .compare_exchange(
-                0,
-                port,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .map_err(|owned| SshError::ListenerAlreadyStarted {
-                port: owned,
-            })?;
+        self.listener.claim(port)?;
         // Give the remote startup shell an identity so cleanup can stop it
         // before removing state, even if the SSH response was cancelled.
         let tag = format!("chip-listener-start-{port}");
@@ -173,28 +205,21 @@ impl SshSession {
         }
     }
 
+    /// Stops the listener this session started and removes its remote
+    /// state. Without a started listener nothing runs on the candidate. The
+    /// port stays registered until the stop command succeeds, so a failed
+    /// stop can be retried.
+    ///
     /// # Errors
     ///
     /// Returns `SshError` when the stop command fails.
-    pub async fn stop_listener(
-        &self,
-        port: NonZeroU16,
-    ) -> Result<(), SshError> {
-        let timeout = self.command_timeout();
+    pub async fn stop_listener(&self) -> Result<(), SshError> {
+        let Some(port) = self.listener.owned() else {
+            return Ok(());
+        };
         let script = listener_stop_script(port.get());
-        self.run_shell(&script, timeout).await?;
-        #[expect(
-            clippy::let_underscore_must_use,
-            reason = "a stop for a port this session does not own leaves the \
-                      owned port registered; tracked: IO1-S18 in \
-                      docs/notes/2026-10-10-playbook-review.md"
-        )]
-        let _ = self.listener_port.compare_exchange(
-            port.get(),
-            0,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.run_shell(&script, self.command_timeout()).await?;
+        self.listener.release(port);
         Ok(())
     }
 
@@ -364,6 +389,56 @@ mod tests {
         #[case] expected: ListenerReadiness,
     ) {
         assert_eq!(ListenerReadiness::parse(response).unwrap(), expected);
+    }
+
+    fn port(value: u16) -> NonZeroU16 {
+        NonZeroU16::new(value).unwrap()
+    }
+
+    fn slot_owning(value: u16) -> ListenerSlot {
+        let slot = ListenerSlot::default();
+        slot.claim(port(value)).unwrap();
+        slot
+    }
+
+    #[test]
+    fn a_session_without_a_started_listener_has_nothing_to_stop() {
+        let sut = ListenerSlot::default();
+
+        let actual = sut.owned();
+
+        assert_eq!(actual, None);
+    }
+
+    #[test]
+    fn a_second_listener_is_refused_while_the_first_is_owned() {
+        let sut = slot_owning(443);
+
+        let actual = sut.claim(port(8443));
+
+        assert!(matches!(
+            actual,
+            Err(SshError::ListenerAlreadyStarted { port: 443 })
+        ));
+        assert_eq!(sut.owned(), Some(port(443)));
+    }
+
+    #[test]
+    fn a_stopped_listener_leaves_nothing_to_clean_up() {
+        let sut = slot_owning(443);
+
+        sut.release(port(443));
+
+        assert_eq!(sut.owned(), None);
+    }
+
+    #[test]
+    fn stopping_another_port_keeps_the_owned_listener_for_cleanup() {
+        let sut = slot_owning(8443);
+
+        sut.release(port(443));
+
+        assert_eq!(sut.owned(), Some(port(8443)));
     }
 
     #[test]
