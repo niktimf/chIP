@@ -580,6 +580,8 @@ impl CalibrateCommand {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use chip_core::{Verdict, gate};
 
     use super::*;
@@ -843,10 +845,11 @@ mod tests {
 
         assert_eq!(
             sut.gate_overrides().escalate,
-            ["service:claude", "neighbors", "reputation:operator"]
-                .into_iter()
-                .map(|id| id.parse().unwrap())
-                .collect()
+            HashSet::from([
+                gate::SERVICE_CLAUDE,
+                gate::NEIGHBORS,
+                gate::REPUTATION_OPERATOR,
+            ])
         );
     }
 

@@ -1203,6 +1203,8 @@ pub async fn run_scan(command: &ScanCommand) -> Report {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use chip_core::Severity;
 
     use super::*;
@@ -1310,11 +1312,12 @@ mod tests {
     }
 
     #[test]
-    fn network_24_normalizes_the_host_part() {
-        assert_eq!(
-            network_24(Ipv4Addr::new(203, 0, 113, 42)).to_string(),
-            "203.0.113.0/24"
-        );
+    fn host_bits_are_dropped_from_the_swept_network() {
+        let candidate = Ipv4Addr::new(203, 0, 113, 42);
+
+        let network = network_24(candidate);
+
+        assert_eq!(network.to_string(), "203.0.113.0/24");
     }
 
     #[test]
@@ -1337,87 +1340,133 @@ mod tests {
 
         let skipped = sut.skipped(gate::tunnel_gates());
 
-        let gates: Vec<_> = skipped
-            .iter()
-            .map(|result| result.gate().as_str())
-            .collect();
-        let expected: Vec<_> = gate::tunnel_gates()
-            .filter(|&gate| gate != gate::TAMPERING)
-            .map(GateId::as_str)
-            .collect();
-        assert_eq!(gates, expected);
+        let gates: HashSet<GateId> =
+            skipped.iter().map(CheckResult::gate).collect();
+        assert_eq!(
+            gates,
+            HashSet::from([
+                gate::SERVICE_CHATGPT_WEB,
+                gate::SERVICE_CHATGPT_APP,
+                gate::SERVICE_GEMINI,
+                gate::SERVICE_YOUTUBE_PREMIUM,
+                gate::SERVICE_NETFLIX,
+                gate::SERVICE_CLAUDE,
+                gate::SERVICE_TIKTOK,
+                gate::SERVICE_NOTEBOOKLM,
+                gate::SERVICE_GEO,
+                gate::SERVICE_GEO_CAPTCHA,
+                gate::SERVICE_GEO_CDN,
+                gate::AI_OPENAI,
+                gate::AI_ANTHROPIC,
+                gate::AI_GEMINI,
+                gate::AI_DEEPSEEK,
+            ])
+        );
     }
 
     #[test]
-    fn globalping_budget_matches_the_documented_full_scan() {
-        assert_eq!(globalping_budget(8, 4), 84);
+    fn a_full_scan_of_8_eyeball_and_4_datacenter_probes_needs_84_tests() {
+        let budget = globalping_budget(8, 4);
+
+        assert_eq!(budget, 84);
     }
 
-    #[tokio::test]
-    async fn deadline_keeps_completed_failures_and_marks_only_missing_gates() {
-        let progress = ScanProgress::default();
-        let work = async {
-            tokio::join!(
-                async {
-                    progress.add([CheckResult::new(
-                        gate::REACH,
-                        Verdict::fail("blocked"),
-                    )]);
-                },
-                std::future::pending::<()>(),
-            );
-        };
-        assert!(
-            tokio::time::timeout(Duration::from_millis(1), work)
-                .await
-                .is_err()
-        );
-        progress.deadline(Duration::from_secs(1));
-        let report = Report {
-            results: progress.finish(),
-        };
+    #[test]
+    fn deadline_keeps_completed_failures_and_marks_only_missing_gates() {
+        let sut = ScanProgress::default();
+        sut.add([CheckResult::new(gate::REACH, Verdict::fail("blocked"))]);
 
-        assert_eq!(report.exit_code(), 1);
-        let reach: Vec<_> = report
-            .results
+        sut.deadline(Duration::from_secs(1));
+
+        let results = sut.finish();
+        let reach: Vec<_> = results
             .iter()
             .filter(|result| result.gate() == gate::REACH)
+            .map(CheckResult::severity)
             .collect();
-        assert_eq!(reach.len(), 1);
-        assert_eq!(reach[0].severity(), Severity::Fail);
-        assert!(
-            report
-                .results
-                .iter()
-                .any(|result| result.gate() == gate::LATENCY
-                    && result.severity() == Severity::Error)
-        );
+        let latency: Vec<_> = results
+            .iter()
+            .filter(|result| result.gate() == gate::LATENCY)
+            .map(CheckResult::severity)
+            .collect();
+        assert_eq!(reach, [Severity::Fail]);
+        assert_eq!(latency, [Severity::Error]);
     }
 
-    #[rstest::rstest]
-    #[case::skipped_failure(Verdict::fail("blocked"), true, false)]
-    #[case::escalated_warning(Verdict::warn("suspicious"), false, true)]
-    fn fail_fast_uses_the_same_rules_as_the_final_report(
-        #[case] verdict: Verdict,
-        #[case] skip: bool,
-        #[case] expected_stop: bool,
-    ) {
-        let mut overrides = chip_core::GateOverrides::default();
-        if skip {
-            overrides.skip.insert(gate::REPUTATION);
-        } else {
-            overrides.escalate.insert(gate::REPUTATION);
-        }
-        let results = apply_rules(
+    fn reputation_result(
+        verdict: Verdict,
+        overrides: &chip_core::GateOverrides,
+    ) -> Vec<CheckResult> {
+        apply_rules(
             ScanProfile::Exit,
-            &overrides,
+            overrides,
             vec![CheckResult::new(gate::REPUTATION, verdict)],
+        )
+    }
+
+    fn skipping(id: GateId) -> chip_core::GateOverrides {
+        let mut overrides = chip_core::GateOverrides::default();
+        overrides.skip.insert(id);
+        overrides
+    }
+
+    fn escalating(id: GateId) -> chip_core::GateOverrides {
+        let mut overrides = chip_core::GateOverrides::default();
+        overrides.escalate.insert(id);
+        overrides
+    }
+
+    #[test]
+    fn a_skipped_failure_does_not_stop_a_fail_fast_scan() {
+        let sut = FailurePolicy::FailFast;
+        let results = reputation_result(
+            Verdict::fail("blocked"),
+            &skipping(gate::REPUTATION),
         );
-        assert_eq!(
-            FailurePolicy::FailFast.stops_after(&results),
-            expected_stop
+
+        let stops = sut.stops_after(&results);
+
+        assert!(!stops);
+    }
+
+    #[test]
+    fn a_skipped_failure_does_not_fail_the_report() {
+        let sut = Report {
+            results: reputation_result(
+                Verdict::fail("blocked"),
+                &skipping(gate::REPUTATION),
+            ),
+        };
+
+        let code = sut.exit_code();
+
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn an_escalated_warning_stops_a_fail_fast_scan() {
+        let sut = FailurePolicy::FailFast;
+        let results = reputation_result(
+            Verdict::warn("suspicious"),
+            &escalating(gate::REPUTATION),
         );
-        let report = Report { results };
-        assert_eq!(report.exit_code() == 1, expected_stop);
+
+        let stops = sut.stops_after(&results);
+
+        assert!(stops);
+    }
+
+    #[test]
+    fn an_escalated_warning_fails_the_report() {
+        let sut = Report {
+            results: reputation_result(
+                Verdict::warn("suspicious"),
+                &escalating(gate::REPUTATION),
+            ),
+        };
+
+        let code = sut.exit_code();
+
+        assert_eq!(code, 1);
     }
 }
