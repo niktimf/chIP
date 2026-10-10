@@ -2,6 +2,7 @@ mod calibrate;
 mod config;
 mod scan;
 
+use std::io::Write as _;
 use std::process::ExitCode;
 
 use clap::Parser as _;
@@ -12,12 +13,20 @@ use tokio::io::AsyncWriteExt as _;
 async fn main() -> ExitCode {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    if let Err(error) =
+        tracing_subscriber::fmt().with_env_filter(filter).try_init()
+    {
+        print_error(format_args!(
+            "warning: could not install the log subscriber: {error}"
+        ));
+    }
 
     let command = match Cli::parse().into_command() {
         Ok(command) => command,
         Err(error) => {
-            eprintln!("error: invalid configuration: {error:#}");
+            print_error(format_args!(
+                "error: invalid configuration: {error:#}"
+            ));
             return ExitCode::from(2);
         }
     };
@@ -27,9 +36,64 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Writes the command's output to stdout.
+///
+/// A reader that stopped early (`chip scan ... | head`) closes the pipe; that
+/// is not worth a message, but the output is incomplete, so it still ends the
+/// run with exit code 2 like any other write failure.
+fn print_output(text: &str) -> Result<(), ExitCode> {
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{text}")
+        .and_then(|()| stdout.flush())
+        .map_err(|error| {
+            if error.kind() != std::io::ErrorKind::BrokenPipe {
+                print_error(format_args!(
+                    "error: could not write output: {error}"
+                ));
+            }
+            ExitCode::from(2)
+        })
+}
+
+/// Writes a diagnostic line to stderr.
+#[expect(
+    clippy::let_underscore_must_use,
+    reason = "stderr is the last channel left: a failed write here has \
+              nowhere to be reported, and the exit code still carries the \
+              failure"
+)]
+fn print_error(message: std::fmt::Arguments<'_>) {
+    let _: std::io::Result<()> =
+        writeln!(std::io::stderr().lock(), "{message}");
+}
+
+/// Appends the Markdown report to the GitHub Actions step summary, if the
+/// run has one. A failure only warns: the report is already on stdout.
+async fn append_step_summary(report: &chip_core::Report) {
+    let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") else {
+        return;
+    };
+    let write_result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        file.write_all(report.markdown().as_bytes()).await
+    }
+    .await;
+    if let Err(error) = write_result {
+        print_error(format_args!(
+            "warning: could not write GITHUB_STEP_SUMMARY {path}: {error}"
+        ));
+    }
+}
+
 async fn run_scan_command(command: config::ScanCommand) -> ExitCode {
     let report = scan::run_scan(&command).await;
-    println!("{}", report.table());
+    if let Err(code) = print_output(&report.table()) {
+        return code;
+    }
 
     if let Some(path) = command.json_path() {
         let document = serde_json::json!({
@@ -37,53 +101,41 @@ async fn run_scan_command(command: config::ScanCommand) -> ExitCode {
             "overall": report.overall().to_string(),
             "exit_code": report.exit_code(),
             "results": report.results.iter().map(|result| serde_json::json!({
-                "gate": result.gate.as_str(),
+                "gate": result.gate().as_str(),
                 "severity": result.severity().to_string(),
                 "skipped": result.is_skipped(),
-                "detail": result.detail,
+                "detail": result.detail(),
             })).collect::<Vec<_>>(),
         });
         let encoded = match serde_json::to_vec_pretty(&document) {
             Ok(encoded) => encoded,
             Err(error) => {
-                eprintln!("error: could not encode JSON report: {error}");
+                print_error(format_args!(
+                    "error: could not encode JSON report: {error}"
+                ));
                 return ExitCode::from(2);
             }
         };
         if let Err(error) = tokio::fs::write(path, encoded).await {
-            eprintln!("error: could not write {}: {error}", path.display());
+            print_error(format_args!(
+                "error: could not write {}: {error}",
+                path.display()
+            ));
             return ExitCode::from(2);
         }
     }
 
-    if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") {
-        let write_result = async {
-            let mut file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .await?;
-            file.write_all(report.markdown().as_bytes()).await
-        }
-        .await;
-        if let Err(error) = write_result {
-            eprintln!(
-                "warning: could not write GITHUB_STEP_SUMMARY {path}: {error}"
-            );
-        }
-    }
+    append_step_summary(&report).await;
 
     ExitCode::from(u8::try_from(report.exit_code()).unwrap_or(2))
 }
 
 async fn run_calibrate_command(command: &config::CalibrateCommand) -> ExitCode {
     match calibrate::run_calibrate(command).await {
-        Ok(rows) => {
-            println!("{}", calibrate::render_calibration(&rows));
-            ExitCode::SUCCESS
-        }
+        Ok(rows) => print_output(&calibrate::render_calibration(&rows))
+            .map_or_else(|code| code, |()| ExitCode::SUCCESS),
         Err(error) => {
-            eprintln!("error: {error:#}");
+            print_error(format_args!("error: {error:#}"));
             ExitCode::from(2)
         }
     }

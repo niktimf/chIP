@@ -17,7 +17,7 @@ pub enum GlobalpingError {
     #[error("globalping found no suitable probes for this request")]
     NoSuitableProbes,
     #[error("measurement did not finish within the deadline")]
-    Timeout,
+    Timeout(#[source] tokio::time::error::Elapsed),
     #[error("globalping returned an empty measurement id")]
     EmptyMeasurementId,
     #[error(transparent)]
@@ -47,8 +47,10 @@ impl std::fmt::Display for MeasurementId {
     }
 }
 
+#[derive(Debug)]
 pub struct MeasurementKind(MeasurementKindInner);
 
+#[derive(Debug)]
 enum MeasurementKindInner {
     Ping { target: Ipv4Addr },
     Https { target: Ipv4Addr, port: NonZeroU16 },
@@ -77,8 +79,10 @@ impl MeasurementKind {
     }
 }
 
+#[derive(Debug)]
 pub struct Locations(LocationsInner);
 
+#[derive(Debug)]
 enum LocationsInner {
     Ru {
         eyeball_limit: u8,
@@ -88,6 +92,9 @@ enum LocationsInner {
 }
 
 impl Locations {
+    /// # Errors
+    ///
+    /// Returns `InvalidProbeDistribution` when both limits are zero.
     pub const fn ru(
         eyeball_limit: u8,
         datacenter_limit: u8,
@@ -132,7 +139,7 @@ pub struct Limits {
     pub remaining: u32,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct GlobalpingClient {
     http: reqwest::Client,
     base_url: String,
@@ -155,6 +162,11 @@ impl GlobalpingClient {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns `GlobalpingError` when the request fails, the API answers with
+    /// a rate limit, no suitable probes or another non-success status, or the
+    /// measurement id is empty.
     pub async fn create(
         &self,
         kind: &MeasurementKind,
@@ -174,23 +186,35 @@ impl GlobalpingClient {
             )
             .send()
             .await?;
-        match resp.status() {
-            reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                return Err(GlobalpingError::RateLimited);
-            }
-            reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
-                return Err(GlobalpingError::NoSuitableProbes);
-            }
-            s if !s.is_success() => {
-                return Err(GlobalpingError::Http(format!(
-                    "create measurement: HTTP {s}"
-                )));
-            }
-            _ => {}
-        }
-        MeasurementId::new(resp.json::<Created>().await?.id)
+        let created: Created =
+            Self::checked(resp, "create measurement")?.json().await?;
+        MeasurementId::new(created.id)
     }
 
+    /// Turns a non-success status into a typed error before the body is
+    /// decoded, so a 429 or 5xx does not surface as a JSON decode error.
+    fn checked(
+        resp: reqwest::Response,
+        operation: &str,
+    ) -> Result<reqwest::Response, GlobalpingError> {
+        match resp.status() {
+            reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                Err(GlobalpingError::RateLimited)
+            }
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+                Err(GlobalpingError::NoSuitableProbes)
+            }
+            status if !status.is_success() => Err(GlobalpingError::Http(
+                format!("{operation}: HTTP {status}"),
+            )),
+            _ => Ok(resp),
+        }
+    }
+
+    /// # Errors
+    ///
+    /// Returns `GlobalpingError::Timeout` when the measurement does not finish
+    /// before `deadline`, and the request errors of `create` otherwise.
     pub async fn poll_until_finished(
         &self,
         id: &MeasurementId,
@@ -198,7 +222,7 @@ impl GlobalpingClient {
     ) -> Result<RawMeasurement, GlobalpingError> {
         tokio::time::timeout(deadline, self.poll(id))
             .await
-            .map_err(|_| GlobalpingError::Timeout)?
+            .map_err(GlobalpingError::Timeout)?
     }
 
     async fn poll(
@@ -206,15 +230,15 @@ impl GlobalpingClient {
         id: &MeasurementId,
     ) -> Result<RawMeasurement, GlobalpingError> {
         loop {
-            let measurement: RawMeasurement = self
+            let resp = self
                 .request(
                     self.http
                         .get(format!("{}/v1/measurements/{id}", self.base_url)),
                 )
                 .send()
-                .await?
-                .json()
                 .await?;
+            let measurement: RawMeasurement =
+                Self::checked(resp, "poll measurement")?.json().await?;
             if measurement.status != "in-progress" {
                 return Ok(measurement);
             }
@@ -222,6 +246,10 @@ impl GlobalpingClient {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns `GlobalpingError` when the request fails, the API answers with
+    /// a non-success status, or the body cannot be decoded.
     pub async fn limits(&self) -> Result<Limits, GlobalpingError> {
         #[derive(Deserialize)]
         struct Body {
@@ -240,7 +268,8 @@ impl GlobalpingClient {
             .request(self.http.get(format!("{}/v1/limits", self.base_url)))
             .send()
             .await?;
-        Ok(resp.json::<Body>().await?.rate_limit.measurements.create)
+        let body: Body = Self::checked(resp, "read limits")?.json().await?;
+        Ok(body.rate_limit.measurements.create)
     }
 }
 
@@ -481,7 +510,43 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, GlobalpingError::Timeout), "{err:?}");
+        assert!(matches!(err, GlobalpingError::Timeout(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_429_while_polling_maps_to_rate_limited() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/measurements/meas-1"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        let sut = client_against(&server);
+
+        let err = sut
+            .poll_until_finished(
+                &measurement_id("meas-1"),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, GlobalpingError::RateLimited), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_server_error_from_limits_is_an_http_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/limits"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let sut = client_against(&server);
+
+        let err = sut.limits().await.unwrap_err();
+
+        assert!(matches!(err, GlobalpingError::Http(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -562,6 +627,6 @@ mod tests {
                 Duration::from_millis(50),
             )
             .await;
-        assert!(matches!(result, Err(GlobalpingError::Timeout)));
+        assert!(matches!(result, Err(GlobalpingError::Timeout(_))));
     }
 }

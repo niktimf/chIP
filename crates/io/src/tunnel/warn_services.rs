@@ -10,13 +10,10 @@ use http::{HeaderName, HeaderValue};
 
 use super::client::TunnelClient;
 use super::services::{ACCEPT_LANGUAGE_EN, BROWSER_HEADERS, BROWSER_UA};
+use super::unavailable;
 
 const NETFLIX_LICENSED_TITLE: &str = "70143836";
 const NETFLIX_ORIGINAL_TITLE: &str = "80197526";
-
-fn unavailable(error: impl std::fmt::Display) -> ServiceState {
-    ServiceState::Unavailable(error.to_string())
-}
 
 async fn probe_netflix_at(
     client: &TunnelClient,
@@ -35,7 +32,7 @@ async fn probe_netflix_at(
                 original: original.status,
             })
         }
-        (Err(error), _) | (_, Err(error)) => unavailable(error),
+        (Err(error), _) | (_, Err(error)) => unavailable(&error),
     }
 }
 
@@ -82,7 +79,7 @@ async fn probe_claude_at(client: &TunnelClient, url: &str) -> ServiceState {
             &response.body,
             claude_unavailable_markers(),
         ),
-        Err(error) => unavailable(error),
+        Err(error) => unavailable(&error),
     }
 }
 
@@ -108,7 +105,7 @@ async fn probe_tiktok_at(client: &TunnelClient, url: &str) -> ServiceState {
         .await
     {
         Ok(response) => classify_tiktok(response.status, &response.body),
-        Err(error) => unavailable(error),
+        Err(error) => unavailable(&error),
     }
 }
 
@@ -138,7 +135,7 @@ async fn probe_notebooklm_at(client: &TunnelClient, url: &str) -> ServiceState {
             &response.final_url,
             &response.body,
         ),
-        Err(error) => unavailable(error),
+        Err(error) => unavailable(&error),
     }
 }
 

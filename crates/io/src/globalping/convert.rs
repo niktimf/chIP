@@ -1,7 +1,7 @@
 use super::types::{RawMeasurement, RawProbeResult};
 use chip_core::model::{
     AnchorSeries, HttpProbeOutcome, PingSample, PingSweepFacts,
-    ProbeAlignmentError, ReachFacts, ReachProbe,
+    ProbeAlignmentError, ReachFacts,
 };
 
 fn extract_ping(results: &[RawProbeResult]) -> Vec<Option<PingSample>> {
@@ -25,6 +25,10 @@ fn extract_http(result: &RawProbeResult) -> HttpProbeOutcome {
     }
 }
 
+/// # Errors
+///
+/// Returns `ProbeAlignmentError` when an anchor measurement has a different
+/// probe count than the candidate's.
 pub fn ping_sweep_facts(
     candidate: &RawMeasurement,
     anchors: &[(String, RawMeasurement)],
@@ -39,24 +43,18 @@ pub fn ping_sweep_facts(
     PingSweepFacts::new(candidate, city_anchors)
 }
 
+/// # Errors
+///
+/// Returns `ProbeAlignmentError` when the two measurements have different
+/// probe counts.
 pub fn reach_facts(
     candidate: &RawMeasurement,
     control: &RawMeasurement,
-) -> ReachFacts {
-    ReachFacts {
-        probes: candidate
-            .results
-            .iter()
-            .enumerate()
-            .map(|(index, candidate)| ReachProbe {
-                candidate: extract_http(candidate),
-                control: control
-                    .results
-                    .get(index)
-                    .map_or(HttpProbeOutcome::Failed, extract_http),
-            })
-            .collect(),
-    }
+) -> Result<ReachFacts, ProbeAlignmentError> {
+    ReachFacts::new(
+        candidate.results.iter().map(extract_http).collect(),
+        control.results.iter().map(extract_http).collect(),
+    )
 }
 
 #[cfg(test)]
@@ -192,7 +190,7 @@ mod tests {
             measurement(vec![http_result("Moscow", "finished", Some(200))]);
         let control =
             measurement(vec![http_result("Moscow", "finished", Some(200))]);
-        let facts = reach_facts(&candidate, &control);
+        let facts = reach_facts(&candidate, &control).unwrap();
         assert_eq!(facts.probes.len(), 1);
         assert_eq!(
             facts.probes[0].candidate,
@@ -210,7 +208,7 @@ mod tests {
             measurement(vec![http_result("Moscow", "failed", None)]);
         let control =
             measurement(vec![http_result("Moscow", "finished", Some(200))]);
-        let facts = reach_facts(&candidate, &control);
+        let facts = reach_facts(&candidate, &control).unwrap();
         assert_eq!(
             facts.probes[0].candidate,
             chip_core::model::HttpProbeOutcome::Failed
@@ -235,5 +233,24 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("short-anchor"));
+    }
+
+    /// A control probe missing from the reply used to read as `Failed`,
+    /// which the reach gate takes for "the control was unreachable too".
+    #[test]
+    fn reach_rejects_a_control_with_fewer_probes_than_the_candidate() {
+        let candidate = measurement(vec![
+            http_result("Moscow", "finished", Some(200)),
+            http_result("Kursk", "failed", None),
+        ]);
+        let control =
+            measurement(vec![http_result("Moscow", "finished", Some(200))]);
+
+        let error = reach_facts(&candidate, &control).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "anchor 'control' returned 1 probe samples, expected 2"
+        );
     }
 }

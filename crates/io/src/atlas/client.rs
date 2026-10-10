@@ -30,10 +30,13 @@ impl RawAnchor {
 
 #[derive(Debug, Error)]
 pub enum AtlasError {
-    #[error("RIPE Atlas request failed: {0}")]
+    #[error("RIPE Atlas request failed")]
     Http(#[from] reqwest::Error),
+    #[error("RIPE Atlas anchor list did not end within {limit} pages")]
+    TooManyPages { limit: usize },
 }
 
+#[derive(Debug)]
 pub struct AnchorClient {
     http: reqwest::Client,
     base_url: String,
@@ -52,7 +55,15 @@ impl AnchorClient {
         Self { http, base_url }
     }
 
+    /// # Errors
+    ///
+    /// Returns `AtlasError::Http` when a page request or its decoding fails,
+    /// and `AtlasError::TooManyPages` when the list does not end within the
+    /// page limit.
     pub async fn anchors(&self) -> Result<Vec<Anchor>, AtlasError> {
+        // About 800 anchors exist, two pages at this page size. The bound
+        // stops a `next` link that keeps pointing back at a served page.
+        const MAX_PAGES: usize = 20;
         #[derive(serde::Deserialize)]
         struct Page {
             results: Vec<RawAnchor>,
@@ -63,17 +74,24 @@ impl AnchorClient {
             self.base_url
         );
         let mut out = Vec::new();
-        loop {
-            let page: Page = self.http.get(&url).send().await?.json().await?;
+        for _ in 0..MAX_PAGES {
+            let page: Page = self
+                .http
+                .get(&url)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
             out.extend(
                 page.results.into_iter().filter_map(RawAnchor::into_active),
             );
             match page.next {
                 Some(next) => url = next,
-                None => break,
+                None => return Ok(out),
             }
         }
-        Ok(out)
+        Err(AtlasError::TooManyPages { limit: MAX_PAGES })
     }
 }
 
@@ -119,5 +137,54 @@ mod tests {
             anchors.iter().map(|a| a.fqdn.as_str()).collect::<Vec<_>>(),
             vec!["fi-hel-as1", "de-fra-as4"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_server_error_is_reported_with_its_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/anchors"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let sut = AnchorClient::with_base_url(
+            reqwest::Client::new(),
+            format!("{}/anchors", server.uri()),
+        );
+
+        let err = sut.anchors().await.unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                AtlasError::Http(ref source)
+                    if source.status()
+                        == Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_next_link_that_never_ends_stops_with_too_many_pages() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/loop"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "results": [],
+                    "next": format!("{}/loop", server.uri())
+                }),
+            ))
+            .mount(&server)
+            .await;
+        let sut = AnchorClient::with_base_url(
+            reqwest::Client::new(),
+            format!("{}/loop", server.uri()),
+        );
+
+        let err = sut.anchors().await.unwrap_err();
+
+        assert!(matches!(err, AtlasError::TooManyPages { .. }), "{err:?}");
     }
 }

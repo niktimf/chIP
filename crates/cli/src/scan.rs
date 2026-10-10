@@ -36,22 +36,24 @@ use chip_io::blocklists::BlockListsClient;
 use chip_io::geoip::GeoIpClient;
 use chip_io::globalping::{
     GlobalpingClient, Locations, MeasurementId, MeasurementKind,
-    ping_sweep_facts, reach_facts,
+    RawMeasurement, ping_sweep_facts, reach_facts,
 };
 use chip_io::neighbors::{SweepConfig, sweep};
 use chip_io::proxycheck::ProxycheckClient;
 use chip_io::ripestat::RipestatClient;
 use chip_io::rkn_registry::{RknRegistryClient, RknRegistryError};
 use chip_io::ssh::{
-    ListenerOutcome, SocksTunnel, SshConfig, SshSession, verify_listener,
+    HostKeyPolicy, ListenerOutcome, SocksTunnel, SshConfig, SshSession,
+    verify_listener,
 };
 use chip_io::tunnel::{
-    TunnelClient, probe_ai_endpoints, probe_cdn_edges, probe_chatgpt_app,
-    probe_chatgpt_web, probe_claude, probe_country_votes, probe_gemini,
-    probe_netflix, probe_notebooklm, probe_portal_endpoints,
-    probe_search_captcha, probe_tiktok, probe_youtube_premium,
+    TunnelClient, probe_ai_endpoints, probe_chatgpt_app, probe_chatgpt_web,
+    probe_claude, probe_gemini, probe_netflix, probe_notebooklm,
+    probe_portal_endpoints, probe_search_captcha, probe_service_geo,
+    probe_tiktok, probe_youtube_premium,
 };
 use ipnet::Ipv4Net;
+use itertools::{Either, Itertools as _};
 
 use crate::config::ScanCommand;
 
@@ -66,6 +68,11 @@ const GLOBALPING_DEADLINE: Duration = Duration::from_secs(90);
 struct ScanProgress(Mutex<Vec<CheckResult>>);
 
 impl ScanProgress {
+    #[expect(
+        clippy::expect_used,
+        reason = "the lock is held only for a push or extend that cannot \
+                  panic, so the mutex cannot be poisoned"
+    )]
     fn add(&self, results: impl IntoIterator<Item = CheckResult>) {
         self.0
             .lock()
@@ -73,12 +80,22 @@ impl ScanProgress {
             .extend(results);
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the lock is held only for a push or extend that cannot \
+                  panic, so the mutex cannot be poisoned"
+    )]
     fn finish(self) -> Vec<CheckResult> {
         self.0
             .into_inner()
             .expect("result collector cannot be poisoned")
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the lock is held only for a push or extend that cannot \
+                  panic, so the mutex cannot be poisoned"
+    )]
     fn deadline(&self, duration: Duration) {
         let detail = format!(
             "phase B exceeded the {}s overall deadline",
@@ -87,7 +104,7 @@ impl ScanProgress {
         let mut results =
             self.0.lock().expect("result collector cannot be poisoned");
         for gate in gate::phase_b_gates() {
-            if !results.iter().any(|result| result.gate == gate) {
+            if !results.iter().any(|result| result.gate() == gate) {
                 results.push(CheckResult::new(gate, Verdict::error(&detail)));
             }
         }
@@ -109,6 +126,10 @@ fn apply_rules(
         .collect()
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "24 is a constant prefix length within 0..=32"
+)]
 pub fn network_24(ip: Ipv4Addr) -> Ipv4Net {
     Ipv4Net::new(ip, 24)
         .expect("24 is a valid IPv4 prefix length")
@@ -135,12 +156,25 @@ pub fn pick_free_port() -> std::io::Result<NonZeroU16> {
     })
 }
 
+/// Renders an error for a verdict detail with its whole `source()` chain.
+///
+/// The io error types keep their cause out of their own message, so
+/// `to_string()` would show only the top layer. Context for the operation is
+/// added with `anyhow::Context` before the call.
+fn error_detail(error: impl Into<anyhow::Error>) -> String {
+    format!("{:#}", error.into())
+}
+
+fn error_verdict(error: impl Into<anyhow::Error>) -> Verdict {
+    Verdict::error(error_detail(error))
+}
+
 fn reputation_results(
-    reputation: Result<ReputationFacts, impl std::fmt::Display>,
+    reputation: Result<ReputationFacts, impl Into<anyhow::Error>>,
 ) -> Vec<CheckResult> {
     let (flags, operator) = reputation.map_or_else(
         |error| {
-            let detail = error.to_string();
+            let detail = error_detail(error);
             (Verdict::error(detail.clone()), Verdict::error(detail))
         },
         |facts| (judge_reputation(&facts), judge_reputation_operator(&facts)),
@@ -156,11 +190,10 @@ fn rkn_registry_verdict(
     ip: Ipv4Addr,
 ) -> Verdict {
     match registry {
-        Ok(registry) => registry.check(ip).map_or_else(
-            |error| Verdict::error(error.to_string()),
-            |facts| judge_rkn_registry(&facts),
-        ),
-        Err(error) => Verdict::error(error.to_string()),
+        Ok(registry) => registry
+            .check(ip)
+            .map_or_else(error_verdict, |facts| judge_rkn_registry(&facts)),
+        Err(error) => error_verdict(error),
     }
 }
 
@@ -204,10 +237,8 @@ pub async fn run_phase_a(
         ),
         CheckResult::new(
             gate::PROVENANCE,
-            provenance.map_or_else(
-                |error| Verdict::error(error.to_string()),
-                |routing| judge_routing(&routing),
-            ),
+            provenance
+                .map_or_else(error_verdict, |routing| judge_routing(&routing)),
         ),
         geo,
     ]);
@@ -221,7 +252,11 @@ async fn geo_result(
     match command.profile().scope(gate::GEO) {
         GateScope::Judged => {
             let verdict = geo_client.consensus(command.ip()).await.map_or_else(
-                |error| Verdict::error(format!("GeoIP task failed: {error}")),
+                |error| {
+                    error_verdict(
+                        anyhow::Error::new(error).context("GeoIP task failed"),
+                    )
+                },
                 |facts| judge_geo(&facts, command.country()),
             );
             CheckResult::new(gate::GEO, verdict)
@@ -247,14 +282,68 @@ impl From<&Anchor> for PingTarget {
     }
 }
 
+/// An anchor ping that produced no measurement, kept so the latency verdict
+/// can say which anchors it was computed without.
+struct SkippedAnchor {
+    label: String,
+    cause: anyhow::Error,
+}
+
+/// The anchor pings of the latency gate, split into measured and skipped
+/// anchors and ordered by label.
+struct AnchorRuns {
+    measured: Vec<(String, RawMeasurement)>,
+    skipped: Vec<SkippedAnchor>,
+}
+
+impl FromIterator<(String, anyhow::Result<RawMeasurement>)> for AnchorRuns {
+    fn from_iter<I>(runs: I) -> Self
+    where
+        I: IntoIterator<Item = (String, anyhow::Result<RawMeasurement>)>,
+    {
+        let (measured, skipped): (Vec<_>, Vec<_>) = runs
+            .into_iter()
+            .sorted_by(|left, right| left.0.cmp(&right.0))
+            .partition_map(|(label, run)| match run {
+                Ok(measurement) => Either::Left((label, measurement)),
+                Err(cause) => Either::Right(SkippedAnchor { label, cause }),
+            });
+        Self { measured, skipped }
+    }
+}
+
+impl AnchorRuns {
+    /// Judges the measured anchors with `judge` and names the skipped ones.
+    /// With nothing measured there is no latency to judge, so the verdict is
+    /// an error carrying every cause.
+    fn verdict(
+        &self,
+        judge: impl FnOnce(&[(String, RawMeasurement)]) -> Verdict,
+    ) -> Verdict {
+        let skipped = self
+            .skipped
+            .iter()
+            .map(|anchor| format!("{} ({:#})", anchor.label, anchor.cause))
+            .join(", ");
+        if self.measured.is_empty() && !self.skipped.is_empty() {
+            return Verdict::error(format!(
+                "every anchor measurement failed: {skipped}"
+            ));
+        }
+        let verdict = judge(&self.measured);
+        if self.skipped.is_empty() {
+            return verdict;
+        }
+        let detail = format!("{}; skipped anchors: {skipped}", verdict.detail);
+        Verdict { detail, ..verdict }
+    }
+}
+
 async fn anchor_measurements(
     client: &GlobalpingClient,
     first_measurement_id: &MeasurementId,
     targets: &[PingTarget],
-) -> Result<
-    Vec<(String, chip_io::globalping::RawMeasurement)>,
-    tokio::task::JoinError,
-> {
+) -> Result<AnchorRuns, tokio::task::JoinError> {
     let client = Arc::new(client.clone());
     let mut tasks = tokio::task::JoinSet::new();
     for target in targets {
@@ -263,28 +352,32 @@ async fn anchor_measurements(
         let label = target.label.clone();
         let target = target.ip;
         tasks.spawn(async move {
-            let id = client
-                .create(
-                    &MeasurementKind::ping(target),
-                    &Locations::reuse(sample),
-                )
-                .await
-                .ok()?;
-            let measurement = client
-                .poll_until_finished(&id, GLOBALPING_DEADLINE)
-                .await
-                .ok()?;
-            Some((label, measurement))
+            let measurement: anyhow::Result<RawMeasurement> = async {
+                let id = client
+                    .create(
+                        &MeasurementKind::ping(target),
+                        &Locations::reuse(sample),
+                    )
+                    .await?;
+                Ok(client.poll_until_finished(&id, GLOBALPING_DEADLINE).await?)
+            }
+            .await;
+            (label, measurement)
         });
     }
-    let mut measurements = Vec::new();
-    while let Some(result) = tasks.join_next().await {
-        if let Some(measurement) = result? {
-            measurements.push(measurement);
+    let mut runs = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        let (label, measurement) = joined?;
+        if let Err(error) = &measurement {
+            tracing::warn!(
+                anchor = %label,
+                error = %format!("{error:#}"),
+                "anchor measurement skipped"
+            );
         }
+        runs.push((label, measurement));
     }
-    measurements.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(measurements)
+    Ok(runs.into_iter().collect())
 }
 
 async fn reach_verdict(
@@ -301,7 +394,7 @@ async fn reach_verdict(
     let candidate_kind = MeasurementKind::https(candidate, candidate_port);
     let control_kind = MeasurementKind::https(
         control,
-        NonZeroU16::new(443).expect("443 is non-zero"),
+        const { NonZeroU16::new(443).expect("443 is non-zero") },
     );
     let (candidate_id, control_id) = tokio::join!(
         client.create(&candidate_kind, &locations),
@@ -310,7 +403,7 @@ async fn reach_verdict(
     let (candidate_id, control_id) = match (candidate_id, control_id) {
         (Ok(candidate_id), Ok(control_id)) => (candidate_id, control_id),
         (Err(error), _) | (_, Err(error)) => {
-            return Verdict::error(error.to_string());
+            return error_verdict(error);
         }
     };
     let (candidate, control) = tokio::join!(
@@ -318,10 +411,9 @@ async fn reach_verdict(
         client.poll_until_finished(&control_id, GLOBALPING_DEADLINE)
     );
     match (candidate, control) {
-        (Ok(candidate), Ok(control)) => {
-            judge_reach(&reach_facts(&candidate, &control))
-        }
-        (Err(error), _) | (_, Err(error)) => Verdict::error(error.to_string()),
+        (Ok(candidate), Ok(control)) => reach_facts(&candidate, &control)
+            .map_or_else(error_verdict, |facts| judge_reach(&facts)),
+        (Err(error), _) | (_, Err(error)) => error_verdict(error),
     }
 }
 
@@ -329,7 +421,7 @@ async fn record_latency(
     client: &GlobalpingClient,
     command: &ScanCommand,
     candidate_id: &MeasurementId,
-    candidate: &chip_io::globalping::RawMeasurement,
+    candidate: &RawMeasurement,
     city_targets: &[PingTarget],
     progress: &ScanProgress,
 ) {
@@ -337,23 +429,27 @@ async fn record_latency(
         progress.add(command.profile().skipped([gate::LATENCY]));
         return;
     }
-    let anchors =
+    let runs =
         match anchor_measurements(client, candidate_id, city_targets).await {
-            Ok(anchors) => anchors,
+            Ok(runs) => runs,
             Err(error) => {
                 progress.add([CheckResult::new(
                     gate::LATENCY,
-                    Verdict::error(format!("anchor task failed: {error}")),
+                    error_verdict(
+                        anyhow::Error::new(error).context("anchor task failed"),
+                    ),
                 )]);
                 return;
             }
         };
-    let latency = ping_sweep_facts(candidate, &anchors).map_or_else(
-        |error| Verdict::error(error.to_string()),
-        |facts: PingSweepFacts| {
-            judge_latency(&facts, command.latency_thresholds())
-        },
-    );
+    let latency = runs.verdict(|anchors| {
+        ping_sweep_facts(candidate, anchors).map_or_else(
+            error_verdict,
+            |facts: PingSweepFacts| {
+                judge_latency(&facts, command.latency_thresholds())
+            },
+        )
+    });
     progress.add([CheckResult::new(gate::LATENCY, latency)]);
 }
 
@@ -374,7 +470,7 @@ async fn run_globalping_measurements(
     let locations = match Locations::ru(probes.eyeball(), probes.datacenter()) {
         Ok(locations) => locations,
         Err(error) => {
-            progress.add(unavailable_globalping_results(&error, listener));
+            progress.add(unavailable_globalping_results(error, listener));
             return;
         }
     };
@@ -384,7 +480,7 @@ async fn run_globalping_measurements(
     {
         Ok(id) => id,
         Err(error) => {
-            progress.add(unavailable_globalping_results(&error, listener));
+            progress.add(unavailable_globalping_results(error, listener));
             return;
         }
     };
@@ -394,7 +490,7 @@ async fn run_globalping_measurements(
     {
         Ok(measurement) => measurement,
         Err(error) => {
-            progress.add(unavailable_globalping_results(&error, listener));
+            progress.add(unavailable_globalping_results(error, listener));
             return;
         }
     };
@@ -416,10 +512,10 @@ async fn run_globalping_measurements(
 }
 
 fn unavailable_globalping_results(
-    error: &impl ToString,
+    error: impl Into<anyhow::Error>,
     listener: Option<NonZeroU16>,
 ) -> Vec<CheckResult> {
-    let detail = error.to_string();
+    let detail = error_detail(error);
     let mut results = vec![CheckResult::new(
         gate::LATENCY,
         Verdict::error(detail.clone()),
@@ -448,7 +544,11 @@ async fn record_service(
 
 async fn record_portal(client: &TunnelClient, progress: &ScanProgress) {
     let verdict = probe_portal_endpoints(client).await.map_or_else(
-        |error| Verdict::error(format!("portal task failed: {error}")),
+        |error| {
+            error_verdict(
+                anyhow::Error::new(error).context("portal task failed"),
+            )
+        },
         |(https, http)| judge_tampering(&https, &http),
     );
     progress.add([CheckResult::new(gate::TAMPERING, verdict)]);
@@ -544,24 +644,23 @@ async fn record_service_geo(
 ) {
     tokio::join!(
         async {
-            let votes = probe_country_votes(client).await;
-            progress.add([CheckResult::new(
-                gate::SERVICE_GEO,
-                judge_service_country(&votes, country),
-            )]);
+            let observations = probe_service_geo(client).await;
+            progress.add([
+                CheckResult::new(
+                    gate::SERVICE_GEO,
+                    judge_service_country(&observations.votes, country),
+                ),
+                CheckResult::new(
+                    gate::SERVICE_GEO_CDN,
+                    judge_cdn_edge(&observations.edges),
+                ),
+            ]);
         },
         async {
             let (first, retry) = probe_search_captcha(client).await;
             progress.add([CheckResult::new(
                 gate::SERVICE_GEO_CAPTCHA,
                 judge_search_captcha(&first, &retry),
-            )]);
-        },
-        async {
-            let edges = probe_cdn_edges(client).await;
-            progress.add([CheckResult::new(
-                gate::SERVICE_GEO_CDN,
-                judge_cdn_edge(&edges),
             )]);
         },
         async {
@@ -633,11 +732,15 @@ async fn start_listener(
                 match verify_listener(ip, port).await {
                     Ok(()) => return Some(port),
                     Err(error) => {
-                        let _ = session.stop_listener(port).await;
+                        // A failed stop keeps the port in the session, so the
+                        // final cleanup retries it and reports
+                        // `LISTENER_CLEANUP` once; here it is only logged.
+                        let _logged: Option<CheckResult> =
+                            stop_listener(session, port).await;
                         progress.add([CheckResult::new(
                             gate::REACH,
-                            Verdict::error(format!(
-                                "temporary TLS listener is not reachable from the runner: {error}"
+                            error_verdict(anyhow::Error::new(error).context(
+                                "temporary TLS listener is not reachable from the runner",
                             )),
                         )]);
                         return None;
@@ -695,25 +798,32 @@ impl SshSetup {
     async fn stop_listener(&self) -> Option<CheckResult> {
         let session = self.session.as_ref()?;
         let port = session.listener_port()?;
-        match session.stop_listener(port).await {
-            Ok(()) => {
-                tracing::debug!(
-                    port = port.get(),
-                    "temporary listener stopped"
-                );
-                None
-            }
-            Err(error) => {
-                tracing::warn!(
-                    port = port.get(),
-                    error = %error,
-                    "temporary listener cleanup failed"
-                );
-                Some(CheckResult::new(
-                    gate::LISTENER_CLEANUP,
-                    ssh_failure(error),
-                ))
-            }
+        stop_listener(session, port).await
+    }
+}
+
+/// Stops the temporary listener; a failure becomes a `LISTENER_CLEANUP` row,
+/// because the candidate may keep a stray listener and firewall rule.
+async fn stop_listener(
+    session: &SshSession,
+    port: NonZeroU16,
+) -> Option<CheckResult> {
+    match session.stop_listener(port).await {
+        Ok(()) => {
+            tracing::debug!(port = port.get(), "temporary listener stopped");
+            None
+        }
+        Err(error) => {
+            let detail = error_detail(error);
+            tracing::warn!(
+                port = port.get(),
+                error = %detail,
+                "temporary listener cleanup failed"
+            );
+            Some(CheckResult::new(
+                gate::LISTENER_CLEANUP,
+                Verdict::error(detail),
+            ))
         }
     }
 }
@@ -727,11 +837,12 @@ fn skipped_ssh_results() -> Vec<CheckResult> {
 
 fn ssh_failure(error: chip_io::ssh::SshError) -> Verdict {
     // Formatting belongs to the CLI boundary; the adapter retains typed causes.
-    Verdict::error(format!("{:#}", anyhow::Error::new(error)))
+    error_verdict(error)
 }
 
 fn unavailable_ssh_results(error: chip_io::ssh::SshError) -> Vec<CheckResult> {
-    let detail = format!("SSH unavailable: {:#}", anyhow::Error::new(error));
+    let detail =
+        error_detail(anyhow::Error::new(error).context("SSH unavailable"));
     std::iter::once(CheckResult::new(gate::SSH, Verdict::error(detail.clone())))
         .chain(
             gate::ssh_gates().map(|gate| {
@@ -773,7 +884,10 @@ async fn prepare_globalping(
         Err(error) => {
             return Err(GlobalpingSetupError {
                 gate: gate::GLOBALPING_QUOTA,
-                detail: format!("could not read Globalping quota: {error}"),
+                detail: error_detail(
+                    anyhow::Error::new(error)
+                        .context("could not read Globalping quota"),
+                ),
             });
         }
         Ok(_) => {}
@@ -785,7 +899,10 @@ async fn prepare_globalping(
             .await
             .map_err(|error| GlobalpingSetupError {
                 gate: gate::LATENCY,
-                detail: format!("could not load RIPE Atlas anchors: {error}"),
+                detail: error_detail(
+                    anyhow::Error::new(error)
+                        .context("could not load RIPE Atlas anchors"),
+                ),
             })?;
     let (city_targets, control) = select_targets(command, &anchors);
     Ok(GlobalpingSources {
@@ -800,7 +917,11 @@ fn ssh_config(command: &ScanCommand) -> SshConfig {
         user: Some(command.ssh_user().to_owned()),
         port: command.ssh_port(),
         private_key: command.ssh_private_key().cloned(),
-        known_hosts: command.ssh_known_hosts().map(str::to_owned),
+        host_keys: command
+            .ssh_known_hosts()
+            .map_or(HostKeyPolicy::TrustOnFirstUse, |known_hosts| {
+                HostKeyPolicy::Pinned(known_hosts.to_owned())
+            }),
         connect_timeout: Duration::from_secs(15),
         command_timeout: Duration::from_secs(20),
     }
@@ -884,9 +1005,10 @@ async fn run_socks_checks(
     let port = match pick_free_port() {
         Ok(port) => port,
         Err(error) => {
-            progress.add(tunnel_results(&Verdict::error(format!(
-                "could not reserve a local SOCKS port: {error}"
-            ))));
+            progress.add(tunnel_results(&error_verdict(
+                anyhow::Error::new(error)
+                    .context("could not reserve a local SOCKS port"),
+            )));
             return;
         }
     };
@@ -909,7 +1031,7 @@ async fn run_socks_checks(
             .await;
         }
         Err(error) => {
-            progress.add(tunnel_results(&Verdict::error(error.to_string())));
+            progress.add(tunnel_results(&error_verdict(error)));
         }
     }
     tunnel.stop().await;
@@ -959,7 +1081,9 @@ async fn run_neighbor_checks(command: &ScanCommand, progress: &ScanProgress) {
     let probes = match sweep(network_24(ip), &SweepConfig::default()).await {
         Ok(probes) => probes,
         Err(error) => {
-            let detail = format!("neighbor task failed: {error}");
+            let detail = error_detail(
+                anyhow::Error::new(error).context("neighbor task failed"),
+            );
             progress.add(gate::neighbor_gates().map(|gate| {
                 CheckResult::new(gate, Verdict::error(detail.clone()))
             }));
@@ -1056,7 +1180,7 @@ pub async fn run_scan(command: &ScanCommand) -> Report {
             return Report {
                 results: vec![CheckResult::new(
                     gate::HTTP_CLIENT,
-                    Verdict::error(error.to_string()),
+                    error_verdict(error),
                 )],
             };
         }
@@ -1085,6 +1209,107 @@ pub async fn run_scan(command: &ScanCommand) -> Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct RegistryDownloadFailed(std::io::Error);
+
+    impl std::fmt::Display for RegistryDownloadFailed {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("registry download failed")
+        }
+    }
+
+    impl std::error::Error for RegistryDownloadFailed {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn an_error_verdict_names_the_cause_below_the_top_message() {
+        let sut = RegistryDownloadFailed(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ));
+
+        let verdict = error_verdict(sut);
+
+        assert_eq!(verdict.severity, Severity::Error);
+        assert_eq!(
+            verdict.detail,
+            "registry download failed: connection refused"
+        );
+    }
+
+    fn measured(label: &str) -> (String, anyhow::Result<RawMeasurement>) {
+        let measurement = RawMeasurement {
+            id: format!("ping-{label}"),
+            status: "finished".to_string(),
+            results: Vec::new(),
+        };
+        (label.to_string(), Ok(measurement))
+    }
+
+    fn failed(
+        label: &str,
+        cause: &str,
+    ) -> (String, anyhow::Result<RawMeasurement>) {
+        let error = anyhow::anyhow!(cause.to_string())
+            .context("globalping request failed");
+        (label.to_string(), Err(error))
+    }
+
+    fn latency_ok(_: &[(String, RawMeasurement)]) -> Verdict {
+        Verdict::ok("excess 3 ms")
+    }
+
+    #[test]
+    fn every_anchor_failing_is_an_error_naming_each_cause() {
+        let sut: AnchorRuns = [
+            failed("hel.anchor", "HTTP 429"),
+            failed("ams.anchor", "timed out"),
+        ]
+        .into_iter()
+        .collect();
+
+        let verdict = sut.verdict(latency_ok);
+
+        assert_eq!(verdict.severity, Severity::Error);
+        assert_eq!(
+            verdict.detail,
+            "every anchor measurement failed: \
+             ams.anchor (globalping request failed: timed out), \
+             hel.anchor (globalping request failed: HTTP 429)"
+        );
+    }
+
+    #[test]
+    fn a_failed_anchor_is_named_beside_the_verdict_of_the_measured_ones() {
+        let sut: AnchorRuns =
+            [measured("ams.anchor"), failed("hel.anchor", "HTTP 429")]
+                .into_iter()
+                .collect();
+
+        let verdict = sut.verdict(latency_ok);
+
+        assert_eq!(verdict.severity, Severity::Ok);
+        assert_eq!(
+            verdict.detail,
+            "excess 3 ms; skipped anchors: \
+             hel.anchor (globalping request failed: HTTP 429)"
+        );
+    }
+
+    #[test]
+    fn the_verdict_is_unchanged_when_every_anchor_was_measured() {
+        let sut: AnchorRuns = [measured("ams.anchor"), measured("hel.anchor")]
+            .into_iter()
+            .collect();
+
+        let verdict = sut.verdict(latency_ok);
+
+        assert_eq!(verdict, Verdict::ok("excess 3 ms"));
+    }
 
     #[test]
     fn network_24_normalizes_the_host_part() {
@@ -1130,8 +1355,10 @@ mod tests {
 
         let skipped = sut.skipped(gate::tunnel_gates());
 
-        let gates: Vec<_> =
-            skipped.iter().map(|result| result.gate.as_str()).collect();
+        let gates: Vec<_> = skipped
+            .iter()
+            .map(|result| result.gate().as_str())
+            .collect();
         let expected: Vec<_> = gate::tunnel_gates()
             .filter(|&gate| gate != gate::TAMPERING)
             .map(GateId::as_str)
@@ -1172,7 +1399,7 @@ mod tests {
         let reach: Vec<_> = report
             .results
             .iter()
-            .filter(|result| result.gate == gate::REACH)
+            .filter(|result| result.gate() == gate::REACH)
             .collect();
         assert_eq!(reach.len(), 1);
         assert_eq!(reach[0].severity(), Severity::Fail);
@@ -1180,7 +1407,7 @@ mod tests {
             report
                 .results
                 .iter()
-                .any(|result| result.gate == gate::LATENCY
+                .any(|result| result.gate() == gate::LATENCY
                     && result.severity() == Severity::Error)
         );
     }

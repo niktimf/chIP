@@ -1,5 +1,6 @@
 use crate::credentials::ProxycheckApiKey;
 use chip_core::model::{ReputationFacts, RiskScore};
+use serde::Deserialize;
 use std::net::Ipv4Addr;
 use thiserror::Error;
 
@@ -9,10 +10,71 @@ pub enum ProxycheckError {
     QuotaExceeded,
     #[error("proxycheck.io error: {0}")]
     Api(String),
+    #[error("proxycheck.io response has no entry for {ip}")]
+    MissingEntry { ip: Ipv4Addr },
+    #[error("proxycheck.io entry for {ip} does not match the v3 shape")]
+    MalformedEntry {
+        ip: Ipv4Addr,
+        source: serde_json::Error,
+    },
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
 }
 
+/// One address's entry in a v3 answer. The detection flags are required:
+/// an entry without them is a changed or broken response, and reading the
+/// gap as `false` would pass the address as clean.
+#[derive(Deserialize)]
+struct RawEntry {
+    detections: RawDetections,
+    operator: Option<RawOperator>,
+}
+
+#[derive(Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "mirrors the independent detection flags of the v3 wire format"
+)]
+struct RawDetections {
+    vpn: bool,
+    proxy: bool,
+    tor: bool,
+    compromised: bool,
+    anonymous: bool,
+    scraper: bool,
+    risk: Option<u64>,
+}
+
+/// v3 answers with an object (`{"name": …, "url": …, "anonymity": …}`),
+/// not a bare string: reading it as a string silently dropped every
+/// operator proxycheck ever named.
+#[derive(Deserialize)]
+struct RawOperator {
+    name: Option<String>,
+}
+
+impl From<RawEntry> for ReputationFacts {
+    fn from(entry: RawEntry) -> Self {
+        let RawEntry {
+            detections,
+            operator,
+        } = entry;
+        Self {
+            vpn: detections.vpn,
+            proxy: detections.proxy,
+            tor: detections.tor,
+            compromised: detections.compromised,
+            anonymous: detections.anonymous,
+            scraper: detections.scraper,
+            risk: detections
+                .risk
+                .and_then(|risk| RiskScore::try_from(risk).ok()),
+            operator: operator.and_then(|operator| operator.name),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct ProxycheckClient {
     http: reqwest::Client,
     api_key: Option<ProxycheckApiKey>,
@@ -31,11 +93,15 @@ impl ProxycheckClient {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns `ProxycheckError` when the request fails, the API reports an
+    /// exhausted quota or another error, or the answer has no well-formed
+    /// entry for `ip`.
     pub async fn lookup(
         &self,
         ip: Ipv4Addr,
     ) -> Result<ReputationFacts, ProxycheckError> {
-        let ip_text = ip.to_string();
         let url = format!("{}/v3/{ip}", self.base_url);
         let mut request = self.http.get(&url);
         if let Some(key) = &self.api_key {
@@ -44,7 +110,7 @@ impl ProxycheckClient {
         // reqwest errors print the URL, which carries the key: strip it.
         let response =
             request.send().await.map_err(reqwest::Error::without_url)?;
-        let body: serde_json::Value =
+        let mut body: serde_json::Value =
             response.json().await.map_err(reqwest::Error::without_url)?;
         match body["status"].as_str() {
             Some("denied") => return Err(ProxycheckError::QuotaExceeded),
@@ -58,30 +124,13 @@ impl ProxycheckClient {
             }
             _ => {}
         }
-        if !body[&ip_text].is_object() {
-            return Err(ProxycheckError::Api(format!(
-                "no entry for {ip} in the response"
-            )));
-        }
-        let entry = &body[&ip_text];
-        let detections = &entry["detections"];
-        let get_bool =
-            |field: &str| detections[field].as_bool().unwrap_or(false);
-        Ok(ReputationFacts {
-            vpn: get_bool("vpn"),
-            proxy: get_bool("proxy"),
-            tor: get_bool("tor"),
-            compromised: get_bool("compromised"),
-            anonymous: get_bool("anonymous"),
-            scraper: get_bool("scraper"),
-            risk: detections["risk"]
-                .as_u64()
-                .and_then(|risk| RiskScore::try_from(risk).ok()),
-            // v3 answers with an object ({"name": …, "url": …, "anonymity":
-            // …}), not a bare string: reading it as a string silently
-            // dropped every operator proxycheck ever named.
-            operator: entry["operator"]["name"].as_str().map(str::to_string),
-        })
+        let entry = body
+            .get_mut(ip.to_string())
+            .ok_or(ProxycheckError::MissingEntry { ip })?
+            .take();
+        serde_json::from_value::<RawEntry>(entry)
+            .map(ReputationFacts::from)
+            .map_err(|source| ProxycheckError::MalformedEntry { ip, source })
     }
 }
 
@@ -239,7 +288,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_response_without_an_entry_for_the_ip_is_an_api_error() {
+    async fn a_response_without_an_entry_for_the_ip_is_a_missing_entry_error() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v3/203.0.113.7"))
@@ -263,9 +312,59 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ProxycheckError::Api(ref detail)
-                    if detail == "no entry for 203.0.113.7 in the response"
+                ProxycheckError::MissingEntry { ip }
+                    if ip == Ipv4Addr::new(203, 0, 113, 7)
             ),
+            "{err:?}"
+        );
+    }
+
+    /// Without `detections` the flags used to default to `false`, and the
+    /// address passed every reputation gate as clean.
+    #[tokio::test]
+    async fn an_entry_without_detections_is_a_malformed_response() {
+        let server = MockServer::start().await;
+        let sut = client_against(
+            &server,
+            "203.0.113.8",
+            r#"{"status": "ok", "203.0.113.8": {"operator": null}}"#,
+        )
+        .await;
+
+        let err = sut
+            .lookup("203.0.113.8".parse().unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                ProxycheckError::MalformedEntry { ip, .. }
+                    if ip == Ipv4Addr::new(203, 0, 113, 8)
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_detection_flag_missing_from_the_entry_is_a_malformed_response() {
+        let server = MockServer::start().await;
+        let sut = client_against(
+            &server,
+            "203.0.113.8",
+            r#"{"status": "ok", "203.0.113.8": {"detections": {
+                "proxy": false, "vpn": true, "compromised": false,
+                "scraper": false, "anonymous": false, "risk": 10}}}"#,
+        )
+        .await;
+
+        let err = sut
+            .lookup("203.0.113.8".parse().unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ProxycheckError::MalformedEntry { .. }),
             "{err:?}"
         );
     }

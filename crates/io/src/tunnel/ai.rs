@@ -4,6 +4,7 @@ use http::header::USER_AGENT;
 use http::{HeaderName, HeaderValue, StatusCode};
 
 use super::client::TunnelClient;
+use super::unavailable;
 
 const API_UA: HeaderValue = HeaderValue::from_static("curl/8.5.0");
 
@@ -39,7 +40,7 @@ impl AiEndpoint {
                 self.region_markers,
                 self.auth_statuses,
             ),
-            Err(error) => ServiceState::Unavailable(error.to_string()),
+            Err(error) => unavailable(&error),
         }
     }
 }

@@ -85,6 +85,8 @@ impl Verdict {
 pub struct CountryCode(RegistryCountryCode);
 
 impl CountryCode {
+    pub const RU: Self = Self(RegistryCountryCode::RU);
+
     pub fn as_str(&self) -> &str {
         self.0.as_ref()
     }
@@ -100,6 +102,11 @@ pub struct InvalidCountryCode(String);
 impl TryFrom<&str> for CountryCode {
     type Error = InvalidCountryCode;
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "the upstream error is a String that only repeats the input \
+                  already kept in InvalidCountryCode"
+    )]
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         value
             .parse::<RegistryCountryCode>()
@@ -187,6 +194,18 @@ impl CheckResult {
         }
     }
 
+    pub const fn gate(&self) -> GateId {
+        self.gate
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    pub fn into_detail(self) -> String {
+        self.detail
+    }
+
     pub const fn severity(&self) -> Severity {
         match self.outcome {
             CheckOutcome::Judged(severity) => severity,
@@ -236,6 +255,20 @@ pub enum CaptchaObservation {
     Unavailable(String),
 }
 
+/// What one CDN edge probe showed.
+///
+/// An edge that answered without a country and an edge that could not be
+/// reached are separate states: only the second leaves the gate unable to
+/// tell whether that edge sits in Russia.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeObservation {
+    Country(CountryCode),
+    /// The edge answered, but the response named no recognizable location.
+    Silent,
+    /// The edge could not be fetched; the string is the transport cause.
+    Unavailable(String),
+}
+
 /// HTTPS reachability of the candidate's temporary listener, and of a known-
 /// good control anchor, measured by the same Globalping probe set.
 #[derive(Debug, Clone)]
@@ -249,6 +282,35 @@ pub struct ReachFacts {
     pub probes: Vec<ReachProbe>,
 }
 
+impl ReachFacts {
+    /// Pairs the candidate and control outcomes probe by probe. Both series
+    /// come from the same Globalping probe set, so index `i` must mean the
+    /// same probe in each; a series of a different length cannot be paired.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProbeAlignmentError` when the two series differ in length.
+    pub fn new(
+        candidate: Vec<HttpProbeOutcome>,
+        control: Vec<HttpProbeOutcome>,
+    ) -> Result<Self, ProbeAlignmentError> {
+        const CONTROL_ID: &str = "control";
+        if control.len() != candidate.len() {
+            return Err(ProbeAlignmentError {
+                anchor_id: CONTROL_ID.to_owned(),
+                expected: candidate.len(),
+                actual: control.len(),
+            });
+        }
+        let probes = candidate
+            .into_iter()
+            .zip(control)
+            .map(|(candidate, control)| ReachProbe { candidate, control })
+            .collect();
+        Ok(Self { probes })
+    }
+}
+
 /// One usable ping result. An absent result is represented by
 /// `Option<PingSample>` at the call site; a present sample always has a
 /// finite, non-negative RTT and an optional loss percentage in `0..=100`.
@@ -259,6 +321,10 @@ pub struct PingSample {
 }
 
 impl PingSample {
+    /// # Errors
+    ///
+    /// Returns `InvalidPingSample` when the RTT is negative or not finite, or
+    /// the loss is not a finite percentage in `0..=100`.
     pub fn new(
         rtt_ms: f64,
         loss_pct: Option<f64>,
@@ -343,6 +409,10 @@ pub struct PingSweepFacts {
 }
 
 impl PingSweepFacts {
+    /// # Errors
+    ///
+    /// Returns `ProbeAlignmentError` for the first anchor whose series length
+    /// differs from the candidate's.
     pub fn new(
         candidate: Vec<Option<PingSample>>,
         city_anchors: Vec<AnchorSeries>,
@@ -374,7 +444,10 @@ impl PingSweepFacts {
 }
 
 #[derive(Debug, Clone, Default)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "tracked: CORE-S12 in docs/notes/2026-10-10-playbook-review.md"
+)]
 pub struct ReputationFacts {
     pub vpn: bool,
     pub proxy: bool,
@@ -390,6 +463,9 @@ pub struct ReputationFacts {
 pub struct RiskScore(u8);
 
 impl RiskScore {
+    /// # Errors
+    ///
+    /// Returns `InvalidRiskScore` when `value` exceeds 100.
     pub fn new(value: u8) -> Result<Self, InvalidRiskScore> {
         if value <= 100 {
             Ok(Self(value))
@@ -411,9 +487,9 @@ impl TryFrom<u64> for RiskScore {
     type Error = InvalidRiskScore;
 
     fn try_from(value: u64) -> Result<Self, Self::Error> {
-        let value_u8 =
-            u8::try_from(value).map_err(|_| InvalidRiskScore(value))?;
-        Self::new(value_u8).map_err(|_| InvalidRiskScore(value))
+        // `TryFromIntError` carries no data; `InvalidRiskScore` keeps the
+        // rejected value, and `new` rejects 101..=255 with the same value.
+        u8::try_from(value).map_or(Err(InvalidRiskScore(value)), Self::new)
     }
 }
 
@@ -517,6 +593,10 @@ pub struct RknRegistryFacts {
 }
 
 impl RknRegistryFacts {
+    /// # Errors
+    ///
+    /// Returns `InvalidRknRegistryFacts` when the `/24` holds more listed
+    /// neighbors than the `/16` around it.
     pub fn new(
         listing: RknListing,
         neighbors_24: u8,
@@ -660,6 +740,10 @@ pub struct RoutingFacts {
 }
 
 impl RoutingFacts {
+    /// # Errors
+    ///
+    /// Returns `InvalidRoutingFacts` when more peers see the prefix than
+    /// exist in total.
     pub const fn new(
         ris_peers_seeing: u32,
         total_ris_peers: NonZeroU32,
@@ -709,6 +793,9 @@ pub struct ProcStatSnapshot {
 }
 
 impl ProcStatSnapshot {
+    /// # Errors
+    ///
+    /// Returns `InvalidProcStatSnapshot` when the steal ticks exceed the total.
     pub const fn new(
         steal_ticks: u64,
         total_ticks: u64,

@@ -97,6 +97,10 @@ fn listener_stop_script(port: u16) -> String {
 }
 
 impl SshSession {
+    /// # Errors
+    ///
+    /// Returns `SshError` when the preflight command fails or its output is
+    /// not a known readiness answer.
     pub async fn listener_readiness(
         &self,
         port: NonZeroU16,
@@ -112,12 +116,18 @@ impl SshSession {
     /// generating a throwaway self-signed cert in a private temporary
     /// directory. Opens the port in `ufw` if present; both the files and a
     /// rule added by this run are removed when the listener exits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SshError::ListenerAlreadyStarted` when this session already
+    /// owns a listener, and `SshError` when a remote command fails. A listener
+    /// that does not come up is an `Ok` outcome.
     pub async fn start_listener(
         &self,
         port: NonZeroU16,
     ) -> Result<ListenerOutcome, SshError> {
-        if self.listener_port().is_some() {
-            return Err(SshError::ListenerAlreadyStarted);
+        if let Some(owned) = self.listener_port() {
+            return Err(SshError::ListenerAlreadyStarted { port: owned.get() });
         }
         match self.listener_readiness(port).await? {
             ListenerReadiness::Ready => {}
@@ -147,7 +157,9 @@ impl SshSession {
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
             )
-            .map_err(|_| SshError::ListenerAlreadyStarted)?;
+            .map_err(|owned| SshError::ListenerAlreadyStarted {
+                port: owned,
+            })?;
         // Give the remote startup shell an identity so cleanup can stop it
         // before removing state, even if the SSH response was cancelled.
         let tag = format!("chip-listener-start-{port}");
@@ -161,6 +173,9 @@ impl SshSession {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns `SshError` when the stop command fails.
     pub async fn stop_listener(
         &self,
         port: NonZeroU16,
@@ -168,6 +183,12 @@ impl SshSession {
         let timeout = self.command_timeout();
         let script = listener_stop_script(port.get());
         self.run_shell(&script, timeout).await?;
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a stop for a port this session does not own leaves the \
+                      owned port registered; tracked: IO1-S18 in \
+                      docs/notes/2026-10-10-playbook-review.md"
+        )]
         let _ = self.listener_port.compare_exchange(
             port.get(),
             0,
@@ -177,6 +198,10 @@ impl SshSession {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns `SshError` when reading `/proc/stat` fails, and
+    /// `SshError::InvalidSnapshot` when its `cpu` line cannot be parsed.
     pub async fn steal_snapshot(&self) -> Result<ProcStatSnapshot, SshError> {
         let timeout = self.command_timeout();
         let text = self.run_command("cat", &["/proc/stat"], timeout).await?;
@@ -189,6 +214,11 @@ impl SshSession {
 /// Runs before any Globalping quota is spent on the listener. It serves a
 /// throwaway self-signed certificate, so certificate verification is off on
 /// purpose.
+///
+/// # Errors
+///
+/// Returns the `reqwest::Error` of building the client or of the request
+/// when the listener does not answer TLS.
 pub async fn verify_listener(
     ip: Ipv4Addr,
     port: NonZeroU16,
@@ -213,7 +243,10 @@ mod tests {
     const PROC_STAT_LINE: &str = "cpu  1200 30 450 90111 12 0 34 250 0 0\ncpu0 600 15 225 45055 6 0 17 125 0 0\n";
 
     #[test]
-    #[allow(clippy::identity_op)] // zeros mirror the /proc/stat fields
+    #[expect(
+        clippy::identity_op,
+        reason = "the zeros mirror the /proc/stat fields one to one"
+    )]
     fn parse_proc_stat_reads_the_aggregate_cpu_line_only() {
         let snap = parse_proc_stat(PROC_STAT_LINE).unwrap();
         // fields after "cpu": 1200 30 450 90111 12 0 34 250 0 0 - steal is

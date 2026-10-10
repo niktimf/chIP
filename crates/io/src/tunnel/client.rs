@@ -6,8 +6,24 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum TunnelError {
-    #[error(transparent)]
-    Http(#[from] reqwest::Error),
+    #[error("could not build the tunnel HTTP client")]
+    Build(#[source] reqwest::Error),
+    #[error("GET {url} failed")]
+    Request {
+        url: String,
+        #[source]
+        source: reqwest::Error,
+    },
+}
+
+impl TunnelError {
+    fn request(url: &str, source: reqwest::Error) -> Self {
+        // The message already names the URL; drop reqwest's copy of it.
+        Self::Request {
+            url: url.to_owned(),
+            source: source.without_url(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -17,22 +33,29 @@ pub struct TunnelResponse {
     pub body: String,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct TunnelClient {
     http: reqwest::Client,
 }
 
 impl TunnelClient {
     /// Builds a client using remote DNS resolution through the candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TunnelError::Build` when the proxy or the client cannot be
+    /// built.
     pub fn new(
         socks_addr: SocketAddr,
         request_timeout: Duration,
     ) -> Result<Self, TunnelError> {
-        let proxy = reqwest::Proxy::all(format!("socks5h://{socks_addr}"))?;
+        let proxy = reqwest::Proxy::all(format!("socks5h://{socks_addr}"))
+            .map_err(TunnelError::Build)?;
         let http = reqwest::Client::builder()
             .proxy(proxy)
             .timeout(request_timeout)
-            .build()?;
+            .build()
+            .map_err(TunnelError::Build)?;
         Ok(Self { http })
     }
 
@@ -41,6 +64,10 @@ impl TunnelClient {
         Self { http }
     }
 
+    /// # Errors
+    ///
+    /// Returns `TunnelError::Request` when the request or reading the body
+    /// fails.
     pub async fn get(
         &self,
         url: &str,
@@ -52,10 +79,14 @@ impl TunnelClient {
                 request.header(name, value)
             })
             .send()
-            .await?;
+            .await
+            .map_err(|error| TunnelError::request(url, error))?;
         let status = response.status();
         let final_url = response.url().clone();
-        let body = response.text().await?;
+        let body = response
+            .text()
+            .await
+            .map_err(|error| TunnelError::request(url, error))?;
         Ok(TunnelResponse {
             status,
             final_url,
@@ -106,18 +137,22 @@ mod tests {
             .and(path("/echo"))
             .and(header("x-test", "one"))
             .respond_with(ResponseTemplate::new(200))
+            .expect(1)
             .mount(&server)
             .await;
         let sut = TunnelClient::from_client(reqwest::Client::new());
 
-        sut.get(
-            &format!("{}/echo", server.uri()),
-            &[(
-                HeaderName::from_static("x-test"),
-                HeaderValue::from_static("one"),
-            )],
-        )
-        .await
-        .unwrap();
+        let response = sut
+            .get(
+                &format!("{}/echo", server.uri()),
+                &[(
+                    HeaderName::from_static("x-test"),
+                    HeaderValue::from_static("one"),
+                )],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, StatusCode::OK);
     }
 }

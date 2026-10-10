@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use rstest::rstest;
 
@@ -102,4 +102,50 @@ fn calibrate_does_not_read_scan_only_secrets() {
     assert!(stderr.contains("expected IP=City"), "{stderr}");
     assert!(!stderr.contains("SSH_PRIVATE_KEY"), "{stderr}");
     assert!(!stderr.contains("PROXYCHECK_API_KEY"), "{stderr}");
+}
+
+/// A scan that never leaves the machine: every HTTP request goes to a proxy
+/// on a loopback port with no listener, and SSH and the /24 sweep are off.
+fn offline_scan() -> Command {
+    let mut command = chip();
+    for proxy in ["ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY"] {
+        command.env(proxy, "http://127.0.0.1:1");
+    }
+    for variable in [
+        "NO_PROXY",
+        "no_proxy",
+        "GITHUB_STEP_SUMMARY",
+        "GLOBALPING_TOKEN",
+        "PROXYCHECK_API_KEY",
+        "SSH_PRIVATE_KEY",
+    ] {
+        command.env_remove(variable);
+    }
+    command.env("RUST_LOG", "off").args([
+        "scan",
+        "203.0.113.1",
+        "--country",
+        "FI",
+        "--no-ssh",
+        "--no-neighbors",
+    ]);
+    command
+}
+
+#[test]
+fn a_reader_closing_the_pipe_early_ends_the_scan_with_exit_two_not_a_panic() {
+    let mut sut = offline_scan()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Closing the read end before the report is written is what
+    // `chip scan ... | head` does once it has its lines.
+    drop(sut.stdout.take());
+
+    let output = sut.wait_with_output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
 }

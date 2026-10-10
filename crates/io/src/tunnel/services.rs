@@ -7,6 +7,7 @@ use http::header::{ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
 use http::{HeaderName, HeaderValue};
 
 use super::client::TunnelClient;
+use super::unavailable;
 
 pub(super) const BROWSER_UA: HeaderValue = HeaderValue::from_static(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
@@ -19,17 +20,13 @@ pub(super) const ACCEPT_LANGUAGE_EN: HeaderValue =
 pub(super) static BROWSER_HEADERS: [(HeaderName, HeaderValue); 1] =
     [(USER_AGENT, BROWSER_UA)];
 
-fn unavailable(error: impl std::fmt::Display) -> ServiceState {
-    ServiceState::Unavailable(error.to_string())
-}
-
 async fn probe_chatgpt_web_at(
     client: &TunnelClient,
     url: &str,
 ) -> ServiceState {
     match client.get(url, &BROWSER_HEADERS).await {
         Ok(response) => classify_chatgpt_web(&response.body),
-        Err(error) => unavailable(error),
+        Err(error) => unavailable(&error),
     }
 }
 
@@ -47,7 +44,7 @@ async fn probe_chatgpt_app_at(
 ) -> ServiceState {
     match client.get(url, &BROWSER_HEADERS).await {
         Ok(response) => classify_chatgpt_app(response.status, &response.body),
-        Err(error) => unavailable(error),
+        Err(error) => unavailable(&error),
     }
 }
 
@@ -70,7 +67,7 @@ async fn probe_youtube_premium_at(
         .await
     {
         Ok(response) => classify_youtube_premium(&response.body),
-        Err(error) => unavailable(error),
+        Err(error) => unavailable(&error),
     }
 }
 
@@ -96,7 +93,7 @@ async fn probe_gemini_at(client: &TunnelClient, url: &str) -> ServiceState {
         .await
     {
         Ok(response) => classify_gemini(response.status, &response.body),
-        Err(error) => unavailable(error),
+        Err(error) => unavailable(&error),
     }
 }
 
@@ -139,5 +136,21 @@ mod tests {
         let state = probe_chatgpt_web_at(&client, "http://127.0.0.1:1").await;
 
         assert!(matches!(state, ServiceState::Unavailable(_)), "{state:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_reports_the_operating_system_cause() {
+        let client = TunnelClient::from_client(reqwest::Client::new());
+
+        let state = probe_chatgpt_web_at(&client, "http://127.0.0.1:1").await;
+
+        assert!(
+            matches!(
+                &state,
+                ServiceState::Unavailable(detail)
+                    if detail.contains("Connection refused")
+            ),
+            "{state:?}"
+        );
     }
 }

@@ -14,12 +14,13 @@ const SUBNET_LIST_URL: &str = "https://antifilter.download/list/subnet.lst";
 
 #[derive(Debug, Error)]
 pub enum RknRegistryError {
-    #[error("could not fetch the RKN registry from {url}: {source}")]
+    #[error("could not fetch the RKN registry from {url}")]
     Fetch { url: String, source: reqwest::Error },
     #[error("the RKN registry export at {url} has no IPv4 entries")]
     Empty { url: String },
 }
 
+#[derive(Debug)]
 pub struct RknRegistryClient {
     http: reqwest::Client,
     address_list_url: String,
@@ -35,6 +36,15 @@ impl RknRegistryClient {
         }
     }
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "EmptyList is a unit marker, and Empty { url } states the \
+                  same fact with the URL added"
+    )]
+    /// # Errors
+    ///
+    /// Returns `RknRegistryError::Fetch` when a list cannot be downloaded, and
+    /// `RknRegistryError::Empty` when a list has no IPv4 entries.
     pub async fn fetch(&self) -> Result<RknRegistry, RknRegistryError> {
         let (addresses, subnets) = tokio::join!(
             self.get_text(&self.address_list_url),

@@ -194,6 +194,7 @@ dependencies = [
  "chip-io",
  "clap",
  "ipnet",
+ "itertools",
  "pretty_assertions",
  "reqwest",
  "rstest",

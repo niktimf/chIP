@@ -16,7 +16,9 @@ pub fn judge_tampering(
         ));
     }
     let https_ok = https.iter().filter(|o| **o == PortalOutcome::Ok).count();
-    let http_dead = http.iter().all(|o| *o == PortalOutcome::Unreachable);
+    // With no plain HTTP probe at all there is no evidence of a block.
+    let http_dead = !http.is_empty()
+        && http.iter().all(|o| *o == PortalOutcome::Unreachable);
     if http_dead && https_ok > 0 {
         return Verdict::fail(
             "plain HTTP is unreachable while HTTPS is clean: the host blocks outbound HTTP",
@@ -50,6 +52,16 @@ mod tests {
         let v = judge_tampering(&https, &http);
         assert_eq!(v.severity, Severity::Fail, "{}", v.detail);
         assert!(v.detail.contains("HTTP"), "{}", v.detail);
+    }
+
+    #[test]
+    fn no_plain_http_probes_are_no_evidence_of_an_http_block() {
+        let https = vec![PortalOutcome::Ok; 3];
+        let http = Vec::new();
+
+        let verdict = judge_tampering(&https, &http);
+
+        assert_eq!(verdict.severity, Severity::Ok, "{}", verdict.detail);
     }
 
     #[rstest::rstest]

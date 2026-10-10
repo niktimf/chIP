@@ -1,13 +1,15 @@
 use std::time::Duration;
 
 use chip_core::model::{
-    CaptchaObservation, CountryCode, ServiceCountryVote, ServiceGeoSource,
+    CaptchaObservation, CountryCode, EdgeObservation, ServiceCountryVote,
+    ServiceGeoSource,
 };
 use http::StatusCode;
 use http::header::{ACCEPT_LANGUAGE, USER_AGENT};
 use regex::regex;
 
-use super::client::{TunnelClient, TunnelResponse};
+use super::client::{TunnelClient, TunnelError, TunnelResponse};
+use super::describe_error;
 use super::services::{ACCEPT_LANGUAGE_EN, BROWSER_HEADERS, BROWSER_UA};
 
 const FAST_API_URL: &str = "https://api.fast.com/netflix/speedtest/v2?https=true&token=YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm&urlCount=1";
@@ -95,7 +97,9 @@ struct CountryResponses {
     youtube: Option<TunnelResponse>,
     apple: Option<TunnelResponse>,
     spotify: Option<TunnelResponse>,
-    netflix: Option<TunnelResponse>,
+    /// Kept with its error: the CDN-edge gate reads the same response and
+    /// must tell an unreachable edge from a silent one.
+    netflix: Result<TunnelResponse, TunnelError>,
     tiktok: Option<TunnelResponse>,
     bing: Option<TunnelResponse>,
 }
@@ -107,7 +111,7 @@ impl CountryResponses {
             response(client, "https://www.youtube.com"),
             response(client, "https://gspe1-ssl.ls.apple.com/pep/gcc"),
             response(client, "https://accounts.spotify.com/status"),
-            response(client, FAST_API_URL),
+            client.get(FAST_API_URL, &BROWSER_HEADERS),
             response(
                 client,
                 "https://www.tiktok.com/api/v1/web-cookie-privacy/config?appId=1988"
@@ -125,7 +129,7 @@ impl CountryResponses {
         }
     }
 
-    fn into_votes(self) -> Vec<ServiceCountryVote> {
+    fn votes(&self) -> Vec<ServiceCountryVote> {
         let google = self
             .google
             .as_ref()
@@ -150,7 +154,10 @@ impl CountryResponses {
             ),
             vote(
                 ServiceGeoSource::Netflix,
-                json_country(self.netflix.as_ref(), "/client/location/country"),
+                json_country(
+                    self.netflix.as_ref().ok(),
+                    "/client/location/country",
+                ),
             ),
             vote(
                 ServiceGeoSource::Tiktok,
@@ -180,10 +187,39 @@ fn json_country(
         .and_then(|value| country(&value))
 }
 
-pub async fn probe_country_votes(
+/// Service country votes and CDN edges, read from one set of requests.
+#[derive(Debug)]
+pub struct ServiceGeoObservations {
+    pub votes: Vec<ServiceCountryVote>,
+    pub edges: Vec<(&'static str, EdgeObservation)>,
+}
+
+/// Probes the services' country votes and the CDN edges together. The
+/// fast.com API answers both questions, so it is fetched once.
+pub async fn probe_service_geo(
     client: &TunnelClient,
-) -> Vec<ServiceCountryVote> {
-    CountryResponses::fetch(client).await.into_votes()
+) -> ServiceGeoObservations {
+    let (countries, cloudflare, youtube) = tokio::join!(
+        CountryResponses::fetch(client),
+        client
+            .get("https://www.cloudflare.com/cdn-cgi/trace", &BROWSER_HEADERS),
+        client.get(
+            "https://redirector.googlevideo.com/report_mapping?di=no",
+            &BROWSER_HEADERS
+        ),
+    );
+    let edges = vec![
+        ("cloudflare", edge_observation(&cloudflare, cloudflare_country)),
+        ("youtube_ggc", edge_observation(&youtube, ggc_country)),
+        (
+            "netflix_oca",
+            edge_observation(&countries.netflix, netflix_oca_country),
+        ),
+    ];
+    ServiceGeoObservations {
+        votes: countries.votes(),
+        edges,
+    }
 }
 
 async fn captcha_observation(
@@ -200,7 +236,7 @@ async fn captcha_observation(
         )
         .await
     {
-        Err(error) => CaptchaObservation::Unavailable(error.to_string()),
+        Err(error) => CaptchaObservation::Unavailable(describe_error(&error)),
         Ok(response)
             if response.status == StatusCode::TOO_MANY_REQUESTS
                 || regex!(
@@ -289,42 +325,28 @@ fn iata_country(code: &str) -> Option<CountryCode> {
     country(mapped)
 }
 
-pub async fn probe_cdn_edges(
-    client: &TunnelClient,
-) -> Vec<(&'static str, Option<CountryCode>)> {
-    let (cloudflare, youtube, netflix) = tokio::join!(
-        response(client, "https://www.cloudflare.com/cdn-cgi/trace"),
-        response(
-            client,
-            "https://redirector.googlevideo.com/report_mapping?di=no"
-        ),
-        response(client, FAST_API_URL)
-    );
-    vec![
-        (
-            "cloudflare",
-            cloudflare
-                .as_ref()
-                .and_then(|item| value_from_lines(&item.body, "colo"))
-                .and_then(|code| iata_country(&code)),
-        ),
-        (
-            "youtube_ggc",
-            youtube
-                .as_ref()
-                .and_then(|item| ggc_iata(&item.body))
-                .and_then(|code| iata_country(&code)),
-        ),
-        (
-            "netflix_oca",
-            netflix
-                .as_ref()
-                .and_then(|item| {
-                    json_string(&item.body, "/targets/0/location/country")
-                })
-                .and_then(|value| country(&value)),
-        ),
-    ]
+fn edge_observation(
+    response: &Result<TunnelResponse, TunnelError>,
+    locate: fn(&str) -> Option<CountryCode>,
+) -> EdgeObservation {
+    match response {
+        Ok(response) => locate(&response.body)
+            .map_or(EdgeObservation::Silent, EdgeObservation::Country),
+        Err(error) => EdgeObservation::Unavailable(describe_error(error)),
+    }
+}
+
+fn cloudflare_country(body: &str) -> Option<CountryCode> {
+    value_from_lines(body, "colo").and_then(|code| iata_country(&code))
+}
+
+fn ggc_country(body: &str) -> Option<CountryCode> {
+    ggc_iata(body).and_then(|code| iata_country(&code))
+}
+
+fn netflix_oca_country(body: &str) -> Option<CountryCode> {
+    json_string(body, "/targets/0/location/country")
+        .and_then(|value| country(&value))
 }
 
 #[cfg(test)]
@@ -378,5 +400,38 @@ mod tests {
     #[test]
     fn an_unknown_airport_code_is_no_country_rather_than_a_guess() {
         assert!(iata_country("ZZZ").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_edge_that_cannot_be_reached_is_unavailable_with_its_cause() {
+        // Port 1 on loopback has no listener, so the request is refused
+        // without leaving the machine.
+        let client = TunnelClient::from_client(reqwest::Client::new());
+        let response = client.get("http://127.0.0.1:1/", &[]).await;
+
+        let sut = edge_observation(&response, cloudflare_country);
+
+        let EdgeObservation::Unavailable(cause) = sut else {
+            panic!("expected an unavailable edge, got {sut:?}");
+        };
+        assert!(
+            cause.starts_with("GET http://127.0.0.1:1/ failed: "),
+            "{cause}"
+        );
+    }
+
+    #[test]
+    fn an_edge_that_answered_without_a_location_is_silent() {
+        let response = Ok(TunnelResponse {
+            status: StatusCode::OK,
+            final_url: "https://www.cloudflare.com/cdn-cgi/trace"
+                .parse()
+                .unwrap(),
+            body: "fl=1\nh=www.cloudflare.com\n".to_string(),
+        });
+
+        let sut = edge_observation(&response, cloudflare_country);
+
+        assert_eq!(sut, EdgeObservation::Silent);
     }
 }

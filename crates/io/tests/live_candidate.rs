@@ -9,6 +9,11 @@
 //!
 //! With `CHIP_LIVE_IP` unset each test returns without asserting, so
 //! `--ignored` on a machine with no candidate is quiet rather than red.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helpers fail fast on broken setup"
+)]
 
 use std::net::{Ipv4Addr, TcpStream};
 use std::num::NonZeroU16;
@@ -16,7 +21,8 @@ use std::time::Duration;
 
 use chip_io::credentials::SshPrivateKey;
 use chip_io::ssh::{
-    ListenerOutcome, ListenerReadiness, SocksTunnel, SshConfig, SshSession,
+    HostKeyPolicy, ListenerOutcome, ListenerReadiness, SocksTunnel, SshConfig,
+    SshSession,
 };
 use chip_io::tunnel::TunnelClient;
 
@@ -43,7 +49,8 @@ fn config() -> SshConfig {
         private_key: std::env::var("SSH_PRIVATE_KEY")
             .ok()
             .and_then(|key| SshPrivateKey::try_from(key).ok()),
-        known_hosts: std::env::var("SSH_KNOWN_HOSTS").ok(),
+        host_keys: std::env::var("SSH_KNOWN_HOSTS")
+            .map_or(HostKeyPolicy::TrustOnFirstUse, HostKeyPolicy::Pinned),
         connect_timeout: Duration::from_secs(15),
         command_timeout: Duration::from_secs(20),
     }
