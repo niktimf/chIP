@@ -98,11 +98,30 @@ async fn handshake(ip: Ipv4Addr, timeout: Duration) -> TlsHandshake {
         Ok(Err(error)) => {
             TlsHandshake::Unavailable(format!("openssl could not run: {error}"))
         }
-        Ok(Ok(output)) => {
-            parse_cert_block(&String::from_utf8_lossy(&output.stdout))
-                .map_or(TlsHandshake::NoCertificate, TlsHandshake::Presented)
-        }
+        Ok(Ok(output)) => handshake_from_openssl(&output),
     }
+}
+
+/// Reads what `openssl s_client` printed, without any I/O of its own. A
+/// certificate in the output counts whatever the exit status; without one, a
+/// failed run (refused connection, reset, TLS alert) is reported by its first
+/// stderr line, and only a successful run means the handshake gave no
+/// certificate.
+fn handshake_from_openssl(output: &Output) -> TlsHandshake {
+    if let Some(facts) =
+        parse_cert_block(&String::from_utf8_lossy(&output.stdout))
+    {
+        return TlsHandshake::Presented(facts);
+    }
+    if output.status.success() {
+        return TlsHandshake::NoCertificate;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let reason = first_nonempty_line(&stderr).map_or_else(
+        || format!("openssl exited with {}", output.status),
+        str::to_owned,
+    );
+    TlsHandshake::Unavailable(reason)
 }
 
 async fn reverse_dns(ip: Ipv4Addr, timeout: Duration) -> PtrLookup {
@@ -217,9 +236,9 @@ mod tests {
         assert!(parse_cert_block("connect: Connection refused\n").is_none());
     }
 
-    /// What dig printed, as `Command::output` returns it. `exit_code` is
-    /// shifted into the wait status the way the kernel reports an exit.
-    fn dig_output(exit_code: i32, stdout: &str, stderr: &str) -> Output {
+    /// What a command printed, as `Command::output` returns it. `exit_code`
+    /// is shifted into the wait status the way the kernel reports an exit.
+    fn command_output(exit_code: i32, stdout: &str, stderr: &str) -> Output {
         Output {
             status: std::process::ExitStatus::from_raw(exit_code << 8),
             stdout: stdout.as_bytes().to_vec(),
@@ -229,7 +248,7 @@ mod tests {
 
     #[test]
     fn a_failed_dig_is_unavailable_for_its_first_stderr_line() {
-        let output = dig_output(
+        let output = command_output(
             9,
             "",
             "\n;; communications error to 192.0.2.53#53: timed out\n\
@@ -249,7 +268,7 @@ mod tests {
 
     #[test]
     fn a_successful_dig_without_names_finds_no_ptr() {
-        let output = dig_output(0, "\n", "");
+        let output = command_output(0, "\n", "");
 
         let lookup = ptr_from_dig(&output);
 
@@ -258,13 +277,79 @@ mod tests {
 
     #[test]
     fn a_name_of_only_the_root_dot_leaves_the_lookup_unavailable() {
-        let output = dig_output(0, ".\n", "");
+        let output = command_output(0, ".\n", "");
 
         let lookup = ptr_from_dig(&output);
 
         assert_eq!(
             lookup,
             PtrLookup::Unavailable("resolver returned an empty PTR".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_failed_handshake_without_a_certificate_is_unavailable_for_its_first_stderr_line()
+     {
+        let output = command_output(
+            1,
+            "CONNECTED(00000003)\n---\nno peer certificate available\n",
+            "\n40C7E1B4:error:0A000410:SSL routines:ssl3_read_bytes:\
+             sslv3 alert handshake failure\n",
+        );
+
+        let handshake = handshake_from_openssl(&output);
+
+        let TlsHandshake::Unavailable(reason) = handshake else {
+            panic!("expected an unavailable handshake, got {handshake:?}");
+        };
+        assert_eq!(
+            reason,
+            "40C7E1B4:error:0A000410:SSL routines:ssl3_read_bytes:\
+             sslv3 alert handshake failure"
+        );
+    }
+
+    #[test]
+    fn a_failed_run_with_a_silent_stderr_is_unavailable_for_its_exit_status() {
+        let output = command_output(1, "", "");
+
+        let handshake = handshake_from_openssl(&output);
+
+        let TlsHandshake::Unavailable(reason) = handshake else {
+            panic!("expected an unavailable handshake, got {handshake:?}");
+        };
+        assert_eq!(reason, "openssl exited with exit status: 1");
+    }
+
+    #[test]
+    fn a_successful_handshake_without_a_certificate_presents_none() {
+        let output = command_output(
+            0,
+            "CONNECTED(00000003)\n---\nno peer certificate available\n",
+            "",
+        );
+
+        let handshake = handshake_from_openssl(&output);
+
+        assert!(
+            matches!(handshake, TlsHandshake::NoCertificate),
+            "{handshake:?}"
+        );
+    }
+
+    #[test]
+    fn a_certificate_counts_even_when_openssl_exits_with_an_error() {
+        let stdout = format!(
+            "CONNECTED(00000003)\n{}\n---\n",
+            include_str!("testdata/neighbor-cert.pem")
+        );
+        let output = command_output(1, &stdout, "read:errno=104\n");
+
+        let handshake = handshake_from_openssl(&output);
+
+        assert!(
+            matches!(handshake, TlsHandshake::Presented(_)),
+            "{handshake:?}"
         );
     }
 }

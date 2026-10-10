@@ -155,16 +155,13 @@ fn median(xs: &[f64]) -> f64 {
     }
 }
 
-/// The "exclusive"/R-6 interpolating quantile — the same method Python's
-/// `statistics.quantiles(xs, n=4)` uses, which is what the 2026-09-15
-/// calibration run's own analysis script called to arrive at "p75 8.96ms".
-/// A simpler nearest-rank formula (`sorted[ceil(n*0.75) - 1]`) does **not**
-/// reproduce that number — verified by hand: for this task's own 12-probe
-/// golden fixture it gives 8.05ms, off by 9x this test's tolerance, and for
-/// any `n` where `n*0.75` is a whole number (this fixture's 12, and the
-/// smaller 8-probe fixture below) it can drop the top quartile's spikes
-/// from the result entirely — on the 8-probe case it changes the verdict
-/// from Warn to Ok. Do not "simplify" this back to nearest-rank.
+/// The "exclusive"/R-6 interpolating quantile, the method of Python's
+/// `statistics.quantiles(xs, n=4)`. The analysis script of the 2026-09-15
+/// calibration run used it to report "p75 8.96ms" for the FI-1 vs Helsinki
+/// row. Nearest-rank (`sorted[ceil(n*0.75) - 1]`) gives 8.05ms on the same
+/// 12 probes. When `n*0.75` is a whole number, nearest-rank can also drop the
+/// top quartile's spikes: on the 8-probe `a_high_p75_with_an_ok_median` case
+/// it turns the verdict from Warn into Ok.
 #[expect(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -174,9 +171,6 @@ fn median(xs: &[f64]) -> f64 {
               wraps"
 )]
 fn percentile75(xs: &[f64]) -> f64 {
-    // `n` is a probe count (single/low-double digits in practice) — nowhere
-    // near f64's 52-bit mantissa limit, and `rank.floor()` is always in
-    // `[0.75, n+1]`, so the usize round-trip below never truncates or wraps.
     let mut sorted: Vec<f64> = xs.to_vec();
     sorted.sort_by(f64::total_cmp);
     let n = sorted.len();

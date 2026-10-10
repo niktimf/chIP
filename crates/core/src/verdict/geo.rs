@@ -1,5 +1,5 @@
 use crate::Verdict;
-use crate::model::{CountryCode, GeoConsensusFacts};
+use crate::model::{CountryCode, GeoConsensusFacts, GeoVote};
 
 const MIN_ANSWERS: usize = 5;
 // The two shares below were set with the first version of the gate and
@@ -15,27 +15,48 @@ const WARN_BELOW_SHARE: f64 = 0.8;
     reason = "vote counts are a handful of geo sources, far below 2^52"
 )]
 pub fn judge_geo(facts: &GeoConsensusFacts, expected: &CountryCode) -> Verdict {
-    let answered: Vec<CountryCode> =
-        facts.votes.iter().filter_map(|vote| vote.country).collect();
+    let total = facts.votes.len();
+    let answered: Vec<CountryCode> = facts
+        .votes
+        .iter()
+        .filter_map(|vote| match vote {
+            GeoVote::Country(country) => Some(*country),
+            GeoVote::NoCountryCode | GeoVote::NoAnswer => None,
+        })
+        .collect();
+    let silent = count(facts, GeoVote::NoAnswer);
+    let without_code = count(facts, GeoVote::NoCountryCode);
     if answered.len() < MIN_ANSWERS {
+        // "answered" would be false when a source answered without a code.
+        let counted = if without_code == 0 {
+            "answered"
+        } else {
+            "named a country"
+        };
         return Verdict::error(format!(
-            "only {} of {} geo sources answered (need >= {MIN_ANSWERS})",
-            answered.len(),
-            facts.votes.len()
+            "only {} of {total} geo sources {counted} (need >= {MIN_ANSWERS})",
+            answered.len()
         ));
     }
     let russia = CountryCode::RU;
     let matching = answered.iter().filter(|c| *c == expected).count();
     let share = matching as f64 / answered.len() as f64;
     let ru_seen = expected != &russia && answered.contains(&russia);
-    let silent = facts.votes.len() - answered.len();
+    let unnamed: Vec<String> = [
+        (silent, "did not answer"),
+        (without_code, "answered without a country code"),
+    ]
+    .into_iter()
+    .filter(|&(sources, _)| sources > 0)
+    .map(|(sources, what)| format!("{sources} of {total} {what}"))
+    .collect();
     let detail = format!(
         "{matching}/{} geo sources say {expected}{}",
         answered.len(),
-        if silent == 0 {
+        if unnamed.is_empty() {
             String::new()
         } else {
-            format!(" ({silent} of {} did not answer)", facts.votes.len())
+            format!(" ({})", unnamed.join(", "))
         }
     );
     if share < FAIL_BELOW_SHARE {
@@ -51,28 +72,28 @@ pub fn judge_geo(facts: &GeoConsensusFacts, expected: &CountryCode) -> Verdict {
     }
 }
 
+fn count(facts: &GeoConsensusFacts, kind: GeoVote) -> usize {
+    facts.votes.iter().filter(|&&vote| vote == kind).count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{GeoVote, Severity};
+    use crate::model::Severity;
 
     fn cc(code: &str) -> CountryCode {
         code.parse().unwrap()
     }
 
-    /// One vote per code, each from its own source.
+    /// One vote per entry: a country code, or `None` for a silent source.
     fn votes(codes: &[Option<&str>]) -> GeoConsensusFacts {
-        const SOURCES: [&str; 9] = [
-            "source-1", "source-2", "source-3", "source-4", "source-5",
-            "source-6", "source-7", "source-8", "source-9",
-        ];
         GeoConsensusFacts {
-            votes: SOURCES
-                .into_iter()
-                .zip(codes)
-                .map(|(source, code)| GeoVote {
-                    source,
-                    country: code.map(cc),
+            votes: codes
+                .iter()
+                .map(|code| {
+                    code.map_or(GeoVote::NoAnswer, |code| {
+                        GeoVote::Country(cc(code))
+                    })
                 })
                 .collect(),
         }
@@ -144,5 +165,51 @@ mod tests {
         let verdict = judge_geo(&sut, &cc("FI"));
 
         assert_eq!(verdict.detail, "5/5 geo sources say FI");
+    }
+
+    #[test]
+    fn the_detail_tells_a_source_without_a_country_code_from_a_silent_one() {
+        let sut = GeoConsensusFacts {
+            votes: vec![
+                GeoVote::Country(cc("FI")),
+                GeoVote::Country(cc("FI")),
+                GeoVote::Country(cc("FI")),
+                GeoVote::Country(cc("FI")),
+                GeoVote::Country(cc("FI")),
+                GeoVote::NoCountryCode,
+                GeoVote::NoAnswer,
+                GeoVote::NoAnswer,
+            ],
+        };
+
+        let verdict = judge_geo(&sut, &cc("FI"));
+
+        assert_eq!(
+            verdict.detail,
+            "5/5 geo sources say FI (2 of 8 did not answer, 1 of 8 answered \
+             without a country code)"
+        );
+    }
+
+    #[test]
+    fn too_few_named_countries_are_not_reported_as_too_few_answers() {
+        let sut = GeoConsensusFacts {
+            votes: vec![
+                GeoVote::Country(cc("FI")),
+                GeoVote::Country(cc("FI")),
+                GeoVote::Country(cc("FI")),
+                GeoVote::Country(cc("FI")),
+                GeoVote::NoCountryCode,
+                GeoVote::NoAnswer,
+            ],
+        };
+
+        let verdict = judge_geo(&sut, &cc("FI"));
+
+        assert_eq!(verdict.severity, Severity::Error);
+        assert_eq!(
+            verdict.detail,
+            "only 4 of 6 geo sources named a country (need >= 5)"
+        );
     }
 }

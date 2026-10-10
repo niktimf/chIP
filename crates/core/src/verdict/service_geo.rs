@@ -63,7 +63,10 @@ pub fn judge_search_captcha(probe: &CaptchaRetry) -> Verdict {
     use CaptchaObservation::{Clear, Triggered, Unavailable};
     match (&probe.first, &probe.retry) {
         (Triggered, Triggered) => {
-            Verdict::fail("Google Search served a captcha twice, ~30s apart")
+            let seconds = probe.interval.as_secs_f64();
+            Verdict::fail(format!(
+                "Google Search served a captcha twice, ~{seconds}s apart"
+            ))
         }
         (Unavailable(reason), _) | (_, Unavailable(reason)) => Verdict::error(
             format!("Google Search captcha check unavailable: {reason}"),
@@ -75,9 +78,87 @@ pub fn judge_search_captcha(probe: &CaptchaRetry) -> Verdict {
     }
 }
 
+/// Foreign location codes a CDN edge can carry, with the ISO 3166-1
+/// alpha-2 code of their country.
+const FOREIGN_AIRPORTS: &[(&str, &str)] = &[
+    ("HEL", "FI"),
+    ("FRA", "DE"),
+    ("BER", "DE"),
+    ("MUC", "DE"),
+    ("DUS", "DE"),
+    ("HAM", "DE"),
+    ("AMS", "NL"),
+    ("ARN", "SE"),
+    ("STO", "SE"),
+    ("GOT", "SE"),
+    ("LHR", "GB"),
+    ("LON", "GB"),
+    ("MAN", "GB"),
+    ("CDG", "FR"),
+    ("PAR", "FR"),
+    ("MRS", "FR"),
+    ("WAW", "PL"),
+    ("KTW", "PL"),
+    ("GDN", "PL"),
+    ("RIX", "LV"),
+    ("TLL", "EE"),
+    ("VNO", "LT"),
+    ("OSL", "NO"),
+    ("CPH", "DK"),
+    ("VIE", "AT"),
+    ("ZRH", "CH"),
+    ("GVA", "CH"),
+    ("MXP", "IT"),
+    ("MIL", "IT"),
+    ("FCO", "IT"),
+    ("ROM", "IT"),
+    ("MAD", "ES"),
+    ("BCN", "ES"),
+    ("LIS", "PT"),
+    ("PRG", "CZ"),
+    ("BUD", "HU"),
+    ("OTP", "RO"),
+    ("BUH", "RO"),
+    ("SOF", "BG"),
+    ("BEG", "RS"),
+    ("ZAG", "HR"),
+    ("ATH", "GR"),
+    ("DUB", "IE"),
+    ("BRU", "BE"),
+    ("IST", "TR"),
+    ("ISL", "TR"),
+    // Neighbours whose edges show up on Russian-facing routes; the gate
+    // does not fail on them, but naming the country beats "no country".
+    ("KBP", "UA"),
+    ("IEV", "UA"),
+    ("HRK", "UA"),
+    ("ODS", "UA"),
+    ("LWO", "UA"),
+    ("DNK", "UA"),
+    ("MSQ", "BY"),
+    ("ALA", "KZ"),
+    ("NQZ", "KZ"),
+    ("TSE", "KZ"),
+    ("TBS", "GE"),
+    ("EVN", "AM"),
+    ("GYD", "AZ"),
+    ("BAK", "AZ"),
+    ("TAS", "UZ"),
+    ("KIV", "MD"),
+];
+
 /// The country of a CDN edge from the airport code in its name, as
 /// Cloudflare's `colo` and Google's cache cluster names carry it. An unknown
 /// code is no country rather than a guess.
+///
+/// # Panics
+///
+/// Only on a broken invariant: a country in `FOREIGN_AIRPORTS` that is not an
+/// ISO 3166-1 alpha-2 code.
+#[expect(
+    clippy::expect_used,
+    reason = "the table holds only ISO 3166-1 alpha-2 codes"
+)]
 pub fn airport_country(code: &str) -> Option<CountryCode> {
     /// Russian location codes a CDN edge can carry, from the `OurAirports`
     /// dataset rather than a hand-picked list of large cities.
@@ -108,47 +189,13 @@ pub fn airport_country(code: &str) -> Option<CountryCode> {
     if RUSSIAN.contains(&code) {
         return Some(CountryCode::RU);
     }
-    let mapped = match code {
-        "HEL" => "FI",
-        "FRA" | "BER" | "MUC" | "DUS" | "HAM" => "DE",
-        "AMS" => "NL",
-        "ARN" | "STO" | "GOT" => "SE",
-        "LHR" | "LON" | "MAN" => "GB",
-        "CDG" | "PAR" | "MRS" => "FR",
-        "WAW" | "KTW" | "GDN" => "PL",
-        "RIX" => "LV",
-        "TLL" => "EE",
-        "VNO" => "LT",
-        "OSL" => "NO",
-        "CPH" => "DK",
-        "VIE" => "AT",
-        "ZRH" | "GVA" => "CH",
-        "MXP" | "MIL" | "FCO" | "ROM" => "IT",
-        "MAD" | "BCN" => "ES",
-        "LIS" => "PT",
-        "PRG" => "CZ",
-        "BUD" => "HU",
-        "OTP" | "BUH" => "RO",
-        "SOF" => "BG",
-        "BEG" => "RS",
-        "ZAG" => "HR",
-        "ATH" => "GR",
-        "DUB" => "IE",
-        "BRU" => "BE",
-        "IST" | "ISL" => "TR",
-        // Neighbours whose edges show up on Russian-facing routes; the gate
-        // does not fail on them, but naming the country beats "no country".
-        "KBP" | "IEV" | "HRK" | "ODS" | "LWO" | "DNK" => "UA",
-        "MSQ" => "BY",
-        "ALA" | "NQZ" | "TSE" => "KZ",
-        "TBS" => "GE",
-        "EVN" => "AM",
-        "GYD" | "BAK" => "AZ",
-        "TAS" => "UZ",
-        "KIV" => "MD",
-        _ => return None,
-    };
-    CountryCode::try_from(mapped).ok()
+    FOREIGN_AIRPORTS
+        .iter()
+        .find(|&&(airport, _)| airport == code)
+        .map(|&(_, country)| {
+            CountryCode::try_from(country)
+                .expect("the table holds only ISO 3166-1 alpha-2 codes")
+        })
 }
 
 /// Names the edges that `describe` picks out, in input order.
@@ -371,11 +418,31 @@ mod tests {
         #[case] retry: CaptchaObservation,
         #[case] expected: Severity,
     ) {
-        let sut = CaptchaRetry { first, retry };
+        let sut = CaptchaRetry {
+            first,
+            retry,
+            interval: std::time::Duration::from_secs(30),
+        };
 
         let verdict = judge_search_captcha(&sut);
 
         assert_eq!(verdict.severity, expected, "{}", verdict.detail);
+    }
+
+    #[test]
+    fn a_reproduced_captcha_names_the_pause_between_the_requests() {
+        let sut = CaptchaRetry {
+            first: CaptchaObservation::Triggered,
+            retry: CaptchaObservation::Triggered,
+            interval: std::time::Duration::from_secs(30),
+        };
+
+        let verdict = judge_search_captcha(&sut);
+
+        assert_eq!(
+            verdict.detail,
+            "Google Search served a captcha twice, ~30s apart"
+        );
     }
 
     #[rstest::rstest]
@@ -482,6 +549,17 @@ mod tests {
         let sut = airport_country(code);
 
         assert_eq!(sut, Some(cc(expected)));
+    }
+
+    #[test]
+    fn every_foreign_airport_in_the_table_names_a_country() {
+        let unnamed: Vec<&str> = FOREIGN_AIRPORTS
+            .iter()
+            .map(|&(airport, _)| airport)
+            .filter(|airport| airport_country(airport).is_none())
+            .collect();
+
+        assert_eq!(unnamed, Vec::<&str>::new());
     }
 
     #[test]

@@ -314,6 +314,11 @@ impl GlobalpingClient {
             .send()
             .await
             .map_err(GlobalpingError::request(OPERATION))?;
+        // Only here does 422 mean "no probe matches the locations"; for the
+        // other operations it is an ordinary failed status.
+        if resp.status() == StatusCode::UNPROCESSABLE_ENTITY {
+            return Err(GlobalpingError::NoSuitableProbes);
+        }
         let created: Created = Self::checked(resp, OPERATION)?
             .json()
             .await
@@ -329,9 +334,6 @@ impl GlobalpingClient {
     ) -> Result<reqwest::Response, GlobalpingError> {
         match resp.status() {
             StatusCode::TOO_MANY_REQUESTS => Err(GlobalpingError::RateLimited),
-            StatusCode::UNPROCESSABLE_ENTITY => {
-                Err(GlobalpingError::NoSuitableProbes)
-            }
             status if !status.is_success() => {
                 Err(GlobalpingError::Status { operation, status })
             }
@@ -740,12 +742,15 @@ mod tests {
         assert!(matches!(err, GlobalpingError::RateLimited), "{err:?}");
     }
 
+    #[rstest::rstest]
+    #[case::server_error(StatusCode::INTERNAL_SERVER_ERROR)]
+    #[case::unprocessable_entity(StatusCode::UNPROCESSABLE_ENTITY)]
     #[tokio::test]
-    async fn a_server_error_while_reading_limits_keeps_its_status() {
+    async fn a_failed_limits_read_keeps_its_status(#[case] status: StatusCode) {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/limits"))
-            .respond_with(ResponseTemplate::new(500))
+            .respond_with(ResponseTemplate::new(status.as_u16()))
             .mount(&server)
             .await;
         let sut = client_against(&server);
@@ -757,8 +762,8 @@ mod tests {
                 err,
                 GlobalpingError::Status {
                     operation: "read limits",
-                    status: StatusCode::INTERNAL_SERVER_ERROR
-                }
+                    status: received,
+                } if received == status
             ),
             "{err:?}"
         );

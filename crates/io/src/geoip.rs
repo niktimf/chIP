@@ -38,8 +38,8 @@ impl std::fmt::Debug for GeoSource {
     }
 }
 
-/// Why a source cast no vote. It goes to the log: the vote itself is only
-/// "no country".
+/// Why a source named no country. It goes to the log; the vote keeps only
+/// whether the source answered at all (see [`NoVote::vote`]).
 #[derive(Debug, thiserror::Error)]
 enum NoVote {
     #[error("no answer within {0:?}")]
@@ -54,6 +54,18 @@ enum NoVote {
     MissingField(String),
     #[error("answer has no country code")]
     Country(#[source] InvalidCountryCode),
+}
+
+impl NoVote {
+    const fn vote(&self) -> GeoVote {
+        match self {
+            Self::Timeout(_)
+            | Self::Request(_)
+            | Self::Status(_)
+            | Self::Body(_) => GeoVote::NoAnswer,
+            Self::MissingField(_) | Self::Country(_) => GeoVote::NoCountryCode,
+        }
+    }
 }
 
 /// Delegates the registry check to `CountryCode::try_from` rather than
@@ -166,23 +178,20 @@ impl GeoIpClient {
             let name = source.name;
             let pointer = source.pointer;
             tasks.spawn(async move {
-                let country = Self::query_one(&http, timeout, &url, pointer)
+                let vote = Self::query_one(&http, timeout, &url, pointer)
                     .await
-                    .inspect_err(|error| {
-                        tracing::debug!(
-                            source = name,
-                            error = %describe_error(error),
-                            "geo source cast no vote"
-                        );
-                    })
-                    .ok();
-                (
-                    index,
-                    GeoVote {
-                        source: name,
-                        country,
-                    },
-                )
+                    .map_or_else(
+                        |error| {
+                            tracing::debug!(
+                                source = name,
+                                error = %describe_error(&error),
+                                "geo source named no country"
+                            );
+                            error.vote()
+                        },
+                        GeoVote::Country,
+                    );
+                (index, vote)
             });
         }
         let votes = crate::tasks::collect(tasks)
@@ -290,17 +299,31 @@ mod tests {
 
         assert_eq!(
             facts.votes,
-            [
-                GeoVote {
-                    source: "first",
-                    country: Some(cc("FI")),
-                },
-                GeoVote {
-                    source: "second",
-                    country: None,
-                },
-            ]
+            [GeoVote::Country(cc("FI")), GeoVote::NoAnswer]
         );
+    }
+
+    #[tokio::test]
+    async fn a_full_country_name_counts_as_an_answer_without_a_country_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/name"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"country": "Germany"})),
+            )
+            .mount(&server)
+            .await;
+        let sut = GeoIpClient::with_sources(
+            reqwest::Client::new(),
+            std::time::Duration::from_secs(5),
+            vec![source_at("named", format!("{}/name", server.uri()))],
+        );
+
+        let facts =
+            sut.consensus("203.0.113.1".parse().unwrap()).await.unwrap();
+
+        assert_eq!(facts.votes, [GeoVote::NoCountryCode]);
     }
 
     fn source_at(name: &'static str, url: String) -> GeoSource {

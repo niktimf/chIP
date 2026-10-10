@@ -347,14 +347,37 @@ mod tests {
         assert_eq!(phase_b, expected);
     }
 
+    /// Rows about the scan itself, listed by hand.
+    const META: [GateId; 5] = [
+        SSH,
+        SCAN_DEADLINE,
+        GLOBALPING_QUOTA,
+        LISTENER_CLEANUP,
+        HTTP_CLIENT,
+    ];
+
     #[test]
     fn a_full_scan_owes_a_row_for_every_non_meta_gate() {
-        let scan: Vec<GateId> = scan_gates().collect();
+        let scan: HashSet<GateId> = scan_gates().collect();
 
-        assert!(scan.contains(&REPUTATION));
-        assert!(scan.contains(&SERVICE_CLAUDE));
-        assert!(!scan.contains(&SCAN_DEADLINE));
-        assert!(!scan.contains(&SSH));
+        let meta = HashSet::from(META);
+        let expected: HashSet<GateId> = GATES
+            .iter()
+            .copied()
+            .filter(|gate| !meta.contains(gate))
+            .collect();
+        assert_eq!(scan, expected);
+    }
+
+    #[test]
+    fn the_meta_rows_are_exactly_the_rows_about_the_scan_itself() {
+        let meta: HashSet<GateId> = GATES
+            .iter()
+            .copied()
+            .filter(|gate| gate.channel() == Channel::Meta)
+            .collect();
+
+        assert_eq!(meta, HashSet::from(META));
     }
 
     #[test]

@@ -245,6 +245,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "url",
  "wiremock",
  "x509-parser",
 ]

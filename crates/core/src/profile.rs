@@ -83,12 +83,15 @@ impl ScanProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gate::{GATES, LATENCY, SERVICE_NETFLIX, TAMPERING};
+    use crate::gate::{
+        AI_ANTHROPIC, AI_DEEPSEEK, AI_GEMINI, AI_OPENAI, GATES, GEO, LATENCY,
+        SERVICE_CHATGPT_APP, SERVICE_CHATGPT_WEB, SERVICE_CLAUDE,
+        SERVICE_GEMINI, SERVICE_GEO, SERVICE_GEO_CAPTCHA, SERVICE_GEO_CDN,
+        SERVICE_NETFLIX, SERVICE_NOTEBOOKLM, SERVICE_TIKTOK,
+        SERVICE_YOUTUBE_PREMIUM, TAMPERING,
+    };
     use crate::model::{Severity, Verdict};
-
-    fn gate(id: &str) -> GateId {
-        id.parse().unwrap()
-    }
+    use std::collections::HashSet;
 
     #[rstest::rstest]
     #[case::russia_in_any_case("ru", ScanProfile::RuBridge)]
@@ -104,36 +107,41 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    #[rstest::rstest]
-    #[case::geo("geo")]
-    #[case::latency("latency")]
-    #[case::service("service:chatgpt_web")]
-    #[case::service_geo("service-geo")]
-    #[case::service_geo_family("service-geo:cdn")]
-    #[case::ai("ai:openai")]
-    fn a_bridge_skips_gates_meant_for_a_foreign_exit(#[case] id: &str) {
+    /// The gates a Russian bridge does not judge, listed by hand. The list
+    /// follows the name rule that `ScanProfile::scope` used before the gate
+    /// registry: `geo`, `latency`, and every `service:`, `service-geo` and
+    /// `ai:` gate.
+    const FOREIGN_EXIT_ONLY: [GateId; 17] = [
+        GEO,
+        LATENCY,
+        SERVICE_CHATGPT_WEB,
+        SERVICE_CHATGPT_APP,
+        SERVICE_GEMINI,
+        SERVICE_YOUTUBE_PREMIUM,
+        SERVICE_NETFLIX,
+        SERVICE_CLAUDE,
+        SERVICE_TIKTOK,
+        SERVICE_NOTEBOOKLM,
+        SERVICE_GEO,
+        SERVICE_GEO_CAPTCHA,
+        SERVICE_GEO_CDN,
+        AI_OPENAI,
+        AI_ANTHROPIC,
+        AI_GEMINI,
+        AI_DEEPSEEK,
+    ];
+
+    #[test]
+    fn a_bridge_skips_exactly_the_gates_meant_for_a_foreign_exit() {
         let sut = ScanProfile::RuBridge;
 
-        let judged = sut.judges(gate(id));
+        let skipped: HashSet<GateId> = GATES
+            .iter()
+            .copied()
+            .filter(|&gate| !sut.judges(gate))
+            .collect();
 
-        assert!(!judged);
-    }
-
-    #[rstest::rstest]
-    #[case::reputation("reputation")]
-    #[case::blocklists("blocklists")]
-    #[case::rkn_registry("rkn-registry")]
-    #[case::reach("reach")]
-    #[case::provenance("provenance")]
-    #[case::tampering("tampering")]
-    #[case::steal("steal")]
-    #[case::neighbors("neighbors")]
-    fn a_bridge_judges_the_remaining_gates(#[case] id: &str) {
-        let sut = ScanProfile::RuBridge;
-
-        let judged = sut.judges(gate(id));
-
-        assert!(judged);
+        assert_eq!(skipped, HashSet::from(FOREIGN_EXIT_ONLY));
     }
 
     #[test]

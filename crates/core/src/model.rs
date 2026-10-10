@@ -12,8 +12,9 @@ use strum::{Display, IntoStaticStr};
 use crate::gate::GateId;
 use crate::units;
 
-/// How serious a single check's outcome is. Ordered least to most severe so
-/// `Vec<CheckResult>::sort()` (descending) puts the worst results first.
+/// How serious a single check's outcome is. Ordered least to most severe:
+/// [`Report`](crate::report::Report) lists rows worst first, and its
+/// maximum is the scan's overall severity.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Display, IntoStaticStr,
 )]
@@ -22,8 +23,9 @@ pub enum Severity {
     Ok,
     Warn,
     /// The check could not reach a verdict at all (quota exhausted, source
-    /// unreachable, SSH refused). Distinct from `Fail`: it never alone drives
-    /// exit code 1, only exit code 2 when nothing else failed outright.
+    /// unreachable, SSH refused). Distinct from `Fail`: when no row failed,
+    /// an ERROR makes the scan `Undetermined`, never `Failed` (see
+    /// [`ScanOutcome`](crate::report::ScanOutcome)).
     Error,
     Fail,
 }
@@ -251,6 +253,8 @@ pub enum CaptchaObservation {
 pub struct CaptchaRetry {
     pub first: CaptchaObservation,
     pub retry: CaptchaObservation,
+    /// The pause between the two requests; the verdict detail names it.
+    pub interval: Duration,
 }
 
 /// A CDN whose edge location the CDN-edge gate reads. `Display` gives the
@@ -610,15 +614,18 @@ pub struct GeoConsensusFacts {
     pub votes: Vec<GeoVote>,
 }
 
-/// The country one `GeoIP` source names for the candidate.
-///
-/// `country` is `None` when the source did not answer, including "answered
-/// with an unknown country code": the I/O boundary folds that case into
-/// `None` too.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GeoVote {
-    pub source: &'static str,
-    pub country: Option<CountryCode>,
+/// What one `GeoIP` source says about the candidate's country.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeoVote {
+    /// The source named this country.
+    Country(CountryCode),
+    /// The source answered, but its answer holds no ISO 3166-1 alpha-2 code:
+    /// the field is missing or holds something else, such as a full country
+    /// name.
+    NoCountryCode,
+    /// The source did not answer: timeout, failed request, HTTP error status
+    /// or a body that is not JSON.
+    NoAnswer,
 }
 
 /// One country voter behind the `service-geo` gate. A closed set: the

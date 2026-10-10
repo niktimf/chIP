@@ -36,15 +36,15 @@ impl RknRegistryClient {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns `RknRegistryError::Fetch` when a list cannot be downloaded, and
+    /// `RknRegistryError::Empty` when a list has no IPv4 entries.
     #[expect(
         clippy::map_err_ignore,
         reason = "EmptyList is a unit marker, and Empty { url } states the \
                   same fact with the URL added"
     )]
-    /// # Errors
-    ///
-    /// Returns `RknRegistryError::Fetch` when a list cannot be downloaded, and
-    /// `RknRegistryError::Empty` when a list has no IPv4 entries.
     pub async fn fetch(&self) -> Result<RknRegistry, RknRegistryError> {
         let (addresses, subnets) = tokio::join!(
             self.get_text(&self.address_list_url),

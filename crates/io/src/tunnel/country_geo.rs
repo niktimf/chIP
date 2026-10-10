@@ -298,7 +298,11 @@ async fn search_captcha_at(
     let first = captcha_observation(client, url).await;
     tokio::time::sleep(retry_after).await;
     let retry = captcha_observation(client, url).await;
-    CaptchaRetry { first, retry }
+    CaptchaRetry {
+        first,
+        retry,
+        interval: retry_after,
+    }
 }
 
 fn value_from_lines(body: &str, key: &str) -> Option<String> {
@@ -457,6 +461,7 @@ mod tests {
             CaptchaRetry {
                 first: CaptchaObservation::Triggered,
                 retry: CaptchaObservation::Clear,
+                interval: Duration::ZERO,
             }
         );
     }

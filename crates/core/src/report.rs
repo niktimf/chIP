@@ -64,8 +64,8 @@ pub struct Report {
 }
 
 impl Report {
-    /// A FAIL always wins over an ERROR: this order is fixed by the Global
-    /// Constraints.
+    /// A FAIL wins over an ERROR: a scan with both is `Failed`, not
+    /// `Undetermined`.
     pub fn outcome(&self) -> ScanOutcome {
         match self.overall() {
             Severity::Ok | Severity::Warn => ScanOutcome::Passed,

@@ -2,34 +2,49 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use http::{HeaderName, HeaderValue, StatusCode};
+use reqwest::Url;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum TunnelError {
     #[error("could not build the tunnel HTTP client")]
     Build(#[source] reqwest::Error),
+    #[error("the request URL cannot be parsed")]
+    InvalidUrl(#[source] url::ParseError),
+    /// `url` is the request URL without its query, fragment and credentials.
     #[error("GET {url} failed")]
     Request {
-        url: String,
+        url: Url,
         #[source]
         source: reqwest::Error,
     },
 }
 
 impl TunnelError {
-    fn request(url: &str, source: reqwest::Error) -> Self {
-        // The message already names the URL; drop reqwest's copy of it.
+    /// `shown` is the URL as `shown_url` gives it.
+    fn request(shown: &Url, source: reqwest::Error) -> Self {
+        // The message already names the URL; drop reqwest's copy of it, which
+        // still carries the query.
         Self::Request {
-            url: url.to_owned(),
+            url: shown.clone(),
             source: source.without_url(),
         }
     }
 }
 
-/// The URL up to its query string, for the request span. The fast.com API URL
-/// carries a token in its query; the span does not record it.
-fn without_query(url: &str) -> &str {
-    url.split_once('?').map_or(url, |(base, _)| base)
+/// The URL as the request span and `TunnelError` show it: without the query,
+/// the fragment and the credentials. The fast.com API URL carries a token in
+/// its query, and a request error reaches the verdict text and the JSON
+/// report.
+fn shown_url(url: &Url) -> Url {
+    let mut shown = url.clone();
+    shown.set_query(None);
+    shown.set_fragment(None);
+    // Both setters fail only for a URL that cannot hold credentials, so such
+    // a URL has none to drop.
+    shown.set_username("").unwrap_or(());
+    shown.set_password(None).unwrap_or(());
+    shown
 }
 
 #[derive(Debug)]
@@ -72,18 +87,21 @@ impl TunnelClient {
 
     /// # Errors
     ///
-    /// Returns `TunnelError::Request` when the request or reading the body
-    /// fails.
+    /// Returns `TunnelError::InvalidUrl` when `url` cannot be parsed, and
+    /// `TunnelError::Request` when the request or reading the body fails.
     #[tracing::instrument(
         level = "debug",
         skip_all,
-        fields(url = without_query(url))
+        fields(url = tracing::field::Empty)
     )]
     pub async fn get(
         &self,
         url: &str,
         headers: &[(HeaderName, HeaderValue)],
     ) -> Result<TunnelResponse, TunnelError> {
+        let url = Url::parse(url).map_err(TunnelError::InvalidUrl)?;
+        let shown = shown_url(&url);
+        tracing::Span::current().record("url", tracing::field::display(&shown));
         let response = headers
             .iter()
             .fold(self.http.get(url), |request, (name, value)| {
@@ -91,13 +109,13 @@ impl TunnelClient {
             })
             .send()
             .await
-            .map_err(|error| TunnelError::request(url, error))?;
+            .map_err(|error| TunnelError::request(&shown, error))?;
         let status = response.status();
         let final_url = response.url().clone();
         let body = response
             .text()
             .await
-            .map_err(|error| TunnelError::request(url, error))?;
+            .map_err(|error| TunnelError::request(&shown, error))?;
         Ok(TunnelResponse {
             status,
             final_url,
@@ -109,17 +127,37 @@ impl TunnelClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error_chain::describe_error;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
-    fn the_span_url_leaves_out_a_token_in_the_query() {
-        let url =
-            "https://api.fast.com/netflix/speedtest/v2?https=true&token=abc";
+    fn the_shown_url_leaves_out_query_fragment_and_credentials() {
+        let url: Url = "https://user:pass@api.fast.com/netflix/speedtest/v2\
+                        ?https=true&token=abc#top"
+            .parse()
+            .unwrap();
 
-        let recorded = without_query(url);
+        let shown = shown_url(&url);
 
-        assert_eq!(recorded, "https://api.fast.com/netflix/speedtest/v2");
+        assert_eq!(shown.as_str(), "https://api.fast.com/netflix/speedtest/v2");
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_does_not_reveal_the_token_in_its_query() {
+        // Port 1 on loopback has no listener, so the request is refused
+        // without leaving the machine.
+        let sut = TunnelClient::from_client(reqwest::Client::new());
+
+        let error = sut
+            .get("http://127.0.0.1:1/v2?https=true&token=secret", &[])
+            .await
+            .unwrap_err();
+
+        let shown = error.to_string();
+        let described = describe_error(&error);
+        assert_eq!(shown, "GET http://127.0.0.1:1/v2 failed");
+        assert!(!described.contains("secret"), "{described}");
     }
 
     #[tokio::test]
