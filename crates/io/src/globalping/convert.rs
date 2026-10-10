@@ -8,9 +8,20 @@ fn extract_ping(results: &[RawProbeResult]) -> Vec<Option<PingSample>> {
     results
         .iter()
         .map(|r| match (&r.result.stats, r.result.status.as_str()) {
-            (Some(stats), "finished") => stats
-                .min
-                .and_then(|rtt| PingSample::new(rtt, stats.loss).ok()),
+            (Some(stats), "finished") => stats.min.and_then(|rtt| {
+                PingSample::new(rtt, stats.loss)
+                    .inspect_err(|error| {
+                        tracing::warn!(
+                            city = r.probe.city.as_deref(),
+                            network = r.probe.network.as_deref(),
+                            rtt_ms = rtt,
+                            loss = stats.loss,
+                            %error,
+                            "invalid ping sample counted as no reply"
+                        );
+                    })
+                    .ok()
+            }),
             _ => None,
         })
         .collect()

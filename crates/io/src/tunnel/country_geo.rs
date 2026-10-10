@@ -9,8 +9,8 @@ use http::header::{ACCEPT_LANGUAGE, USER_AGENT};
 use regex::regex;
 
 use super::client::{TunnelClient, TunnelError, TunnelResponse};
-use super::describe_error;
 use super::services::{ACCEPT_LANGUAGE_EN, BROWSER_HEADERS, BROWSER_UA};
+use crate::error_chain::describe_error;
 
 const FAST_API_URL: &str = "https://api.fast.com/netflix/speedtest/v2?https=true&token=YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm&urlCount=1";
 
@@ -88,8 +88,20 @@ fn bing_country(body: &str) -> Option<CountryCode> {
     (value != "WW").then(|| country(value)).flatten()
 }
 
+/// A service that cannot be reached casts no country vote; the cause goes to
+/// the log, since the vote has no place for it.
 async fn response(client: &TunnelClient, url: &str) -> Option<TunnelResponse> {
-    client.get(url, &BROWSER_HEADERS).await.ok()
+    client
+        .get(url, &BROWSER_HEADERS)
+        .await
+        .inspect_err(|error| {
+            tracing::debug!(
+                url,
+                error = %describe_error(error),
+                "country vote source unreachable"
+            );
+        })
+        .ok()
 }
 
 struct CountryResponses {

@@ -92,11 +92,24 @@ async fn handshake(
         .args(["s_client", "-showcerts", "-connect", &format!("{ip}:443")])
         .stdin(Stdio::null())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(timeout, command.output())
-        .await
-        .ok()?
-        .ok()?;
-    parse_cert_block(&String::from_utf8_lossy(&output.stdout))
+    // `NeighborHttps::Open { handshake: None }` keeps no cause, so each
+    // reason for a missing certificate goes to the log.
+    let output = match tokio::time::timeout(timeout, command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            tracing::debug!(%ip, %error, "openssl could not run");
+            return None;
+        }
+        Err(elapsed) => {
+            tracing::debug!(%ip, error = %elapsed, "openssl handshake timed out");
+            return None;
+        }
+    };
+    let facts = parse_cert_block(&String::from_utf8_lossy(&output.stdout));
+    if facts.is_none() {
+        tracing::debug!(%ip, "openssl printed no readable certificate");
+    }
+    facts
 }
 
 async fn reverse_dns(ip: Ipv4Addr, timeout: Duration) -> PtrLookup {

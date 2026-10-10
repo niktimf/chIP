@@ -2,6 +2,7 @@ use chip_core::ip_lists::{BlockLists, FetchedList, NetworkList};
 use ipnet::Ipv4Net;
 use serde::Deserialize;
 
+use crate::error_chain::describe_error;
 use crate::netset;
 
 const SPAMHAUS_URL: &str = "https://www.spamhaus.org/drop/drop_v4.json";
@@ -32,25 +33,48 @@ impl BlockListsClient {
 
     pub async fn fetch(&self) -> BlockLists {
         let (spamhaus, firehol) = tokio::join!(
-            self.fetch_list(&self.spamhaus_url, Self::parse_spamhaus),
-            self.fetch_list(&self.firehol_url, netset::parse)
+            self.fetch_list(
+                "spamhaus",
+                &self.spamhaus_url,
+                Self::parse_spamhaus
+            ),
+            self.fetch_list("firehol", &self.firehol_url, netset::parse)
         );
         BlockLists { spamhaus, firehol }
     }
 
     /// A failed download and one that parsed to nothing both leave the list
-    /// unavailable rather than clean.
+    /// unavailable rather than clean. `FetchedList::Unavailable` has no
+    /// place for the cause, so it goes to the log.
     async fn fetch_list(
         &self,
+        list: &'static str,
         url: &str,
         parse: fn(&str) -> Vec<Ipv4Net>,
     ) -> FetchedList {
-        self.get_text(url)
-            .await
-            .map_or(FetchedList::Unavailable, |body| {
-                NetworkList::new(parse(&body))
-                    .map_or(FetchedList::Unavailable, FetchedList::Fetched)
-            })
+        let body = match self.get_text(url).await {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(
+                    list,
+                    error = %describe_error(&error),
+                    "block list download failed"
+                );
+                return FetchedList::Unavailable;
+            }
+        };
+        NetworkList::new(parse(&body)).map_or_else(
+            |error| {
+                tracing::warn!(
+                    list,
+                    url,
+                    %error,
+                    "block list parsed to no networks"
+                );
+                FetchedList::Unavailable
+            },
+            FetchedList::Fetched,
+        )
     }
 
     fn parse_spamhaus(body: &str) -> Vec<Ipv4Net> {

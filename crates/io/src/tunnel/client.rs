@@ -26,6 +26,12 @@ impl TunnelError {
     }
 }
 
+/// The URL up to its query string, for the request span. The fast.com API URL
+/// carries a token in its query; the span does not record it.
+fn without_query(url: &str) -> &str {
+    url.split_once('?').map_or(url, |(base, _)| base)
+}
+
 #[derive(Debug)]
 pub struct TunnelResponse {
     pub status: StatusCode,
@@ -68,6 +74,11 @@ impl TunnelClient {
     ///
     /// Returns `TunnelError::Request` when the request or reading the body
     /// fails.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(url = without_query(url))
+    )]
     pub async fn get(
         &self,
         url: &str,
@@ -100,6 +111,16 @@ mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn the_span_url_leaves_out_a_token_in_the_query() {
+        let url =
+            "https://api.fast.com/netflix/speedtest/v2?https=true&token=abc";
+
+        let recorded = without_query(url);
+
+        assert_eq!(recorded, "https://api.fast.com/netflix/speedtest/v2");
+    }
 
     #[tokio::test]
     async fn get_returns_status_body_and_final_url() {

@@ -243,6 +243,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
  "wiremock",
  "x509-parser",
 ]

@@ -1,4 +1,6 @@
-use chip_core::model::{CountryCode, GeoConsensusFacts};
+use chip_core::model::{CountryCode, GeoConsensusFacts, InvalidCountryCode};
+
+use crate::error_chain::describe_error;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
@@ -17,13 +19,37 @@ impl std::fmt::Debug for GeoSource {
     }
 }
 
+/// Why a source cast no vote. It goes to the log: the vote itself is only
+/// "no country".
+#[derive(Debug, thiserror::Error)]
+enum NoVote {
+    #[error("no answer within {0:?}")]
+    Timeout(Duration),
+    #[error("request failed")]
+    Request(#[source] reqwest::Error),
+    #[error("answered with HTTP {0}")]
+    Status(reqwest::StatusCode),
+    #[error("answer is not JSON")]
+    Body(#[source] reqwest::Error),
+    #[error("answer has no string at {0}")]
+    MissingField(String),
+    #[error("answer has no country code")]
+    Country(#[source] InvalidCountryCode),
+}
+
 /// Delegates the registry check to `CountryCode::try_from` rather than
 /// re-implementing it: a source's free tier answering with a full name
 /// (`"Germany"`) or anything else that isn't a valid code is exactly the
-/// case that constructor already turns into `Err`, which becomes `None`
-/// here — one no-vote path, not two.
-fn extract(value: &serde_json::Value, pointer: &str) -> Option<CountryCode> {
-    CountryCode::try_from(value.pointer(pointer)?.as_str()?).ok()
+/// case that constructor already rejects.
+fn extract(
+    value: &serde_json::Value,
+    pointer: &str,
+) -> Result<CountryCode, NoVote> {
+    let raw = value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| NoVote::MissingField(pointer.to_owned()))?;
+    CountryCode::try_from(raw).map_err(NoVote::Country)
 }
 
 fn default_sources() -> Vec<GeoSource> {
@@ -116,9 +142,19 @@ impl GeoIpClient {
             let http = self.http.clone();
             let timeout = self.timeout;
             let url = (source.url)(ip);
+            let name = source.name;
             let pointer = source.pointer;
             tasks.spawn(async move {
-                let vote = Self::query_one(&http, timeout, &url, pointer).await;
+                let vote = Self::query_one(&http, timeout, &url, pointer)
+                    .await
+                    .inspect_err(|error| {
+                        tracing::debug!(
+                            source = name,
+                            error = %describe_error(error),
+                            "geo source cast no vote"
+                        );
+                    })
+                    .ok();
                 (index, vote)
             });
         }
@@ -134,18 +170,20 @@ impl GeoIpClient {
         timeout: Duration,
         url: &str,
         pointer: &str,
-    ) -> Option<CountryCode> {
+    ) -> Result<CountryCode, NoVote> {
         tokio::time::timeout(timeout, async {
-            let response = http.get(url).send().await.ok()?;
-            if !response.status().is_success() {
-                return None;
+            let response =
+                http.get(url).send().await.map_err(NoVote::Request)?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(NoVote::Status(status));
             }
-            let value: serde_json::Value = response.json().await.ok()?;
+            let value: serde_json::Value =
+                response.json().await.map_err(NoVote::Body)?;
             extract(&value, pointer)
         })
         .await
-        .ok()
-        .flatten()
+        .unwrap_or(Err(NoVote::Timeout(timeout)))
     }
 }
 
@@ -187,7 +225,7 @@ mod tests {
         #[case] pointer: &str,
         #[case] expected: Option<&str>,
     ) {
-        let actual = extract(&sut, pointer);
+        let actual = extract(&sut, pointer).ok();
 
         assert_eq!(actual, expected.map(cc));
     }
@@ -269,6 +307,6 @@ mod tests {
         .await;
         release.send(()).unwrap();
         server.await.unwrap();
-        assert_eq!(result.unwrap(), None);
+        assert!(matches!(result.unwrap(), Err(NoVote::Timeout(_))));
     }
 }

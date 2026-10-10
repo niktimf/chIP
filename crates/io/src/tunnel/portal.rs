@@ -2,6 +2,7 @@ use chip_core::model::PortalOutcome;
 use http::StatusCode;
 
 use super::client::TunnelClient;
+use crate::error_chain::describe_error;
 
 #[derive(Debug, Clone, Copy)]
 struct PortalEndpoint {
@@ -56,8 +57,16 @@ async fn probe_at(
     expected_status: StatusCode,
     expected_body: Option<&str>,
 ) -> PortalOutcome {
-    let Ok(response) = client.get(url, &[]).await else {
-        return PortalOutcome::Unreachable;
+    let response = match client.get(url, &[]).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::debug!(
+                url,
+                error = %describe_error(&error),
+                "portal endpoint unreachable"
+            );
+            return PortalOutcome::Unreachable;
+        }
     };
     let body_matches = expected_body
         .is_none_or(|expected| response.body.trim() == expected.trim());

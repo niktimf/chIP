@@ -19,11 +19,34 @@ impl RawAnchor {
         if self.is_disabled || self.date_decommissioned.is_some() {
             return None;
         }
+        let ip_v4 = self
+            .ip_v4
+            .parse()
+            .inspect_err(|error| {
+                tracing::debug!(
+                    fqdn = %self.fqdn,
+                    ip_v4 = %self.ip_v4,
+                    %error,
+                    "active anchor dropped: invalid IPv4 address"
+                );
+            })
+            .ok()?;
+        let country = self
+            .country
+            .parse()
+            .inspect_err(|error| {
+                tracing::debug!(
+                    fqdn = %self.fqdn,
+                    %error,
+                    "active anchor dropped: unknown country"
+                );
+            })
+            .ok()?;
         Some(Anchor {
             fqdn: self.fqdn,
-            ip_v4: self.ip_v4.parse().ok()?,
+            ip_v4,
             city: self.city,
-            country: self.country.parse().ok()?,
+            country,
             as_v4: self.as_v4,
         })
     }

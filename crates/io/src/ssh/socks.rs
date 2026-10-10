@@ -68,14 +68,16 @@ impl SocksTunnel {
         SocketAddr::from(([127, 0, 0, 1], self.local_port.get()))
     }
 
-    #[expect(
-        clippy::let_underscore_must_use,
-        reason = "best-effort teardown: a tunnel whose ssh already exited \
-                  has nothing to kill, and the caller has no recovery"
-    )]
+    /// Best-effort teardown: the caller has no recovery, so a failed kill or
+    /// reap is logged and the tunnel is dropped anyway.
     pub async fn stop(mut self) {
-        let _ = self.child.kill().await;
-        let _ = self.child.wait().await;
+        let port = self.local_port.get();
+        if let Err(error) = self.child.kill().await {
+            tracing::warn!(port, %error, "ssh tunnel kill failed");
+        }
+        if let Err(error) = self.child.wait().await {
+            tracing::warn!(port, %error, "ssh tunnel reap failed");
+        }
     }
 }
 
@@ -173,13 +175,15 @@ async fn wait_for_socks(
             return Ok(());
         }
         if tokio::time::Instant::now() >= ready_deadline {
-            #[expect(
-                clippy::let_underscore_must_use,
-                reason = "kill fails only for an ssh that already exited, \
-                          which the wait below reaps; the readiness timeout \
-                          stays the reported error"
-            )]
-            let _ = child.kill().await;
+            // The readiness timeout stays the reported error; a failed kill
+            // is only logged, and the wait below still reaps the process.
+            if let Err(error) = child.kill().await {
+                tracing::warn!(
+                    port = local_port.get(),
+                    %error,
+                    "ssh tunnel kill after the readiness timeout failed"
+                );
+            }
             child
                 .wait()
                 .await

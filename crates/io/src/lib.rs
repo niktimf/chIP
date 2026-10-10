@@ -13,4 +13,5 @@ pub mod rkn_registry;
 pub mod ssh;
 pub mod tunnel;
 
+mod error_chain;
 mod tasks;
