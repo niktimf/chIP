@@ -186,6 +186,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_disagreement_names_each_service_and_the_country_it_saw() {
+        let sut = vec![
+            vote(ServiceGeoSource::Google, Some("FI")),
+            vote(ServiceGeoSource::Spotify, Some("DE")),
+            vote(ServiceGeoSource::Tiktok, Some("NL")),
+        ];
+
+        let verdict = judge_service_country(&sut, &cc("FI"));
+
+        assert_eq!(verdict.detail, "disagreement: spotify=DE, tiktok=NL");
+    }
+
     #[rstest::rstest]
     #[case::everyone_agreeing(
         vec![

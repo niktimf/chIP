@@ -13,6 +13,7 @@ http = { workspace = true }
 ipnet = { workspace = true }
 itertools = { workspace = true }
 regex = { workspace = true }
+strum = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
 

@@ -1,5 +1,6 @@
 use crate::Verdict;
 use crate::model::ReputationFacts;
+use itertools::Itertools as _;
 
 /// proxycheck risk score from which the gate warns. The free tier scores
 /// plain datacenter hosting around 33, so 50 keeps a clean hosting address
@@ -7,20 +8,15 @@ use crate::model::ReputationFacts;
 const WARN_RISK: u8 = 50;
 
 pub fn judge_reputation(facts: &ReputationFacts) -> Verdict {
-    let names = facts
-        .flags
-        .iter()
-        .map(|flag| flag.as_str())
-        .collect::<Vec<_>>();
     let detail = format!(
         "risk {}, {}",
         facts
             .risk
             .map_or_else(|| "?".to_string(), |r| r.to_string()),
-        if names.is_empty() {
+        if facts.flags.is_empty() {
             "no flags".to_string()
         } else {
-            format!("flags: {}", names.join(", "))
+            format!("flags: {}", facts.flags.iter().join(", "))
         },
     );
 
@@ -136,6 +132,15 @@ mod tests {
         let verdict = judge_reputation(&sut);
 
         assert_eq!(verdict.severity, expected, "{}", verdict.detail);
+    }
+
+    #[test]
+    fn the_detail_names_raised_flags_in_declaration_order() {
+        let sut = clean_with(&[ReputationFlag::Scraper, ReputationFlag::Vpn]);
+
+        let verdict = judge_reputation(&sut);
+
+        assert_eq!(verdict.detail, "risk 33, flags: vpn, scraper");
     }
 
     #[test]

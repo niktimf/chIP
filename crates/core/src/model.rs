@@ -6,12 +6,16 @@ use std::str::FromStr;
 
 use country_code_enum::CountryCode as RegistryCountryCode;
 use ipnet::Ipv4Net;
+use strum::{Display, IntoStaticStr};
 
 use crate::gate::GateId;
 
 /// How serious a single check's outcome is. Ordered least to most severe so
 /// `Vec<CheckResult>::sort()` (descending) puts the worst results first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Display, IntoStaticStr,
+)]
+#[strum(serialize_all = "UPPERCASE")]
 pub enum Severity {
     Ok,
     Warn,
@@ -20,23 +24,6 @@ pub enum Severity {
     /// exit code 1, only exit code 2 when nothing else failed outright.
     Error,
     Fail,
-}
-
-impl Severity {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Ok => "OK",
-            Self::Warn => "WARN",
-            Self::Error => "ERROR",
-            Self::Fail => "FAIL",
-        }
-    }
-}
-
-impl fmt::Display for Severity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 /// The result of judging one aspect of the candidate: a severity and the
@@ -226,10 +213,10 @@ impl CheckResult {
         self
     }
 
-    pub const fn label(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self.outcome {
             CheckOutcome::Skipped => "SKIP",
-            CheckOutcome::Judged(severity) => severity.as_str(),
+            CheckOutcome::Judged(severity) => severity.into(),
         }
     }
 }
@@ -447,8 +434,10 @@ impl PingSweepFacts {
 /// A proxycheck detection raised for an address.
 ///
 /// `Ord` follows declaration order, and the reputation verdict lists the
-/// flags of an address in that order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// flags of an address in that order. `Display` gives the flag's name in
+/// the verdict detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display)]
+#[strum(serialize_all = "lowercase")]
 pub enum ReputationFlag {
     Vpn,
     Proxy,
@@ -465,18 +454,6 @@ impl ReputationFlag {
         match self {
             Self::Vpn | Self::Proxy | Self::Tor | Self::Compromised => true,
             Self::Anonymous | Self::Scraper => false,
-        }
-    }
-
-    /// The flag's name in the verdict detail.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Vpn => "vpn",
-            Self::Proxy => "proxy",
-            Self::Tor => "tor",
-            Self::Compromised => "compromised",
-            Self::Anonymous => "anonymous",
-            Self::Scraper => "scraper",
         }
     }
 }
@@ -539,7 +516,8 @@ pub struct GeoConsensusFacts {
 /// One country voter behind the `service-geo` gate. A closed set: the
 /// judge's fail-or-warn split keys on the voter, so a voter the judge does
 /// not know cannot be constructed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+#[strum(serialize_all = "lowercase")]
 pub enum ServiceGeoSource {
     Google,
     Youtube,
@@ -555,24 +533,6 @@ impl ServiceGeoSource {
     /// disagreement is only a warning.
     pub const fn is_critical(self) -> bool {
         matches!(self, Self::Google | Self::Youtube)
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Google => "google",
-            Self::Youtube => "youtube",
-            Self::Apple => "apple",
-            Self::Spotify => "spotify",
-            Self::Netflix => "netflix",
-            Self::Tiktok => "tiktok",
-            Self::Bing => "bing",
-        }
-    }
-}
-
-impl fmt::Display for ServiceGeoSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
