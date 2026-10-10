@@ -16,22 +16,19 @@ fn help_names_both_subcommands() {
     assert!(stdout.contains("calibrate"), "{stdout}");
 }
 
-#[test]
-fn scan_help_explains_every_flag_and_names_the_secret_variables() {
+#[rstest]
+#[case::latency_threshold("excess over the best anchor")]
+#[case::probe_count("probes in Russian home networks")]
+#[case::gate_escalation("Promote a warning to a failure")]
+#[case::ssh_key_variable("SSH_PRIVATE_KEY")]
+#[case::globalping_token_variable("GLOBALPING_TOKEN")]
+#[case::proxycheck_key_variable("PROXYCHECK_API_KEY")]
+fn scan_help_explains_the_setting(#[case] expected: &str) {
     let output = chip().args(["scan", "--help"]).output().unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for expected in [
-        "excess over the best anchor",
-        "probes in Russian home networks",
-        "Promote a warning to a failure",
-        "SSH_PRIVATE_KEY",
-        "GLOBALPING_TOKEN",
-        "PROXYCHECK_API_KEY",
-    ] {
-        assert!(stdout.contains(expected), "{expected} missing:\n{stdout}");
-    }
+    assert!(stdout.contains(expected), "{expected} missing:\n{stdout}");
 }
 
 #[rstest]
@@ -57,10 +54,10 @@ fn scan_help_explains_every_flag_and_names_the_secret_variables() {
     "expected IP=City"
 )]
 fn invalid_input_exits_two_before_any_network_work(
-    #[case] sut: &[&str],
+    #[case] args: &[&str],
     #[case] expected_error: &str,
 ) {
-    let output = chip().args(sut).output().unwrap();
+    let output = chip().args(args).output().unwrap();
 
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -102,6 +99,21 @@ fn calibrate_does_not_read_scan_only_secrets() {
     assert!(stderr.contains("expected IP=City"), "{stderr}");
     assert!(!stderr.contains("SSH_PRIVATE_KEY"), "{stderr}");
     assert!(!stderr.contains("PROXYCHECK_API_KEY"), "{stderr}");
+}
+
+#[test]
+fn an_unparsable_rust_log_is_reported_instead_of_silently_replaced() {
+    let output = chip()
+        .env("RUST_LOG", "chip=loud")
+        .args(["calibrate", "not-a-target"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning: ignoring RUST_LOG and logging at info"),
+        "{stderr}"
+    );
 }
 
 /// A scan that never leaves the machine: every HTTP request goes to a proxy

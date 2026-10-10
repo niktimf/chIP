@@ -192,6 +192,8 @@ pub async fn sweep(
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+
     use super::*;
 
     #[test]
@@ -213,5 +215,56 @@ mod tests {
     #[test]
     fn text_without_a_certificate_is_not_a_handshake() {
         assert!(parse_cert_block("connect: Connection refused\n").is_none());
+    }
+
+    /// What dig printed, as `Command::output` returns it. `exit_code` is
+    /// shifted into the wait status the way the kernel reports an exit.
+    fn dig_output(exit_code: i32, stdout: &str, stderr: &str) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(exit_code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_failed_dig_is_unavailable_for_its_first_stderr_line() {
+        let output = dig_output(
+            9,
+            "",
+            "\n;; communications error to 192.0.2.53#53: timed out\n\
+             ;; no servers could be reached\n",
+        );
+
+        let lookup = ptr_from_dig(&output);
+
+        assert_eq!(
+            lookup,
+            PtrLookup::Unavailable(
+                ";; communications error to 192.0.2.53#53: timed out"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_successful_dig_without_names_finds_no_ptr() {
+        let output = dig_output(0, "\n", "");
+
+        let lookup = ptr_from_dig(&output);
+
+        assert_eq!(lookup, PtrLookup::NotFound);
+    }
+
+    #[test]
+    fn a_name_of_only_the_root_dot_leaves_the_lookup_unavailable() {
+        let output = dig_output(0, ".\n", "");
+
+        let lookup = ptr_from_dig(&output);
+
+        assert_eq!(
+            lookup,
+            PtrLookup::Unavailable("resolver returned an empty PTR".to_owned())
+        );
     }
 }

@@ -4,7 +4,7 @@ mod scan;
 
 use std::error::Error;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -14,13 +14,14 @@ use config::{Cli, Command};
 use itertools::Itertools as _;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt as _;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    if let Err(error) =
-        tracing_subscriber::fmt().with_env_filter(filter).try_init()
+    if let Err(error) = tracing_subscriber::fmt()
+        .with_env_filter(log_filter())
+        .try_init()
     {
         print_error(format_args!(
             "warning: could not install the log subscriber: {error}"
@@ -49,6 +50,20 @@ async fn main() -> ExitCode {
         }
     };
     ExitCode::from(code)
+}
+
+/// The log filter from `RUST_LOG`, at `info` when the variable is unset. A
+/// value that does not parse is reported and replaced by `info` as a whole,
+/// so a typo is visible instead of silently changing what is logged.
+fn log_filter() -> EnvFilter {
+    let builder =
+        EnvFilter::builder().with_default_directive(LevelFilter::INFO.into());
+    builder.from_env().unwrap_or_else(|error| {
+        print_error(format_args!(
+            "warning: ignoring RUST_LOG and logging at info: {error}"
+        ));
+        builder.parse_lossy("")
+    })
 }
 
 /// The HTTP client of a command's direct requests: every command sends the
@@ -89,7 +104,9 @@ enum CliError {
 }
 
 async fn run() -> Result<Completion, CliError> {
-    let command = Cli::parse().into_command().map_err(CliError::Config)?;
+    let command = Cli::parse()
+        .into_command(|name| std::env::var_os(name))
+        .map_err(CliError::Config)?;
     match command {
         Command::Scan(args) => {
             run_scan_command(*args).await.map(Completion::Scan)
@@ -120,24 +137,22 @@ fn print_error(message: std::fmt::Arguments<'_>) {
         writeln!(std::io::stderr().lock(), "{message}");
 }
 
-/// Appends the Markdown report to the GitHub Actions step summary, if the
-/// run has one. A failure only warns: the report is already on stdout.
-async fn append_step_summary(report: &Report) {
-    let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") else {
-        return;
-    };
+/// Appends the Markdown report to the GitHub Actions step summary. A
+/// failure only warns: the report is already on stdout.
+async fn append_step_summary(path: &Path, report: &Report) {
     let write_result = async {
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)
+            .open(path)
             .await?;
         file.write_all(report.markdown().as_bytes()).await
     }
     .await;
     if let Err(error) = write_result {
         print_error(format_args!(
-            "warning: could not write GITHUB_STEP_SUMMARY {path}: {error}"
+            "warning: could not write GITHUB_STEP_SUMMARY {}: {error}",
+            path.display()
         ));
     }
 }
@@ -220,7 +235,9 @@ async fn run_scan_command(
         })?;
     }
 
-    append_step_summary(&report).await;
+    if let Some(path) = command.step_summary_path() {
+        append_step_summary(path, &report).await;
+    }
 
     Ok(report.outcome())
 }

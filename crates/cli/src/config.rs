@@ -1,8 +1,7 @@
 use std::ffi::OsString;
-use std::fmt;
 use std::net::{AddrParseError, Ipv4Addr};
 use std::num::{NonZeroU16, NonZeroU64};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use chip_core::model::InvalidCityName;
@@ -18,29 +17,6 @@ use chip_io::credentials::{
 };
 use chip_io::ssh::HostKeyPolicy;
 use clap::{Args, Parser, Subcommand};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CandidateIp(Ipv4Addr);
-
-impl CandidateIp {
-    const fn as_ipv4(self) -> Ipv4Addr {
-        self.0
-    }
-}
-
-impl FromStr for CandidateIp {
-    type Err = std::net::AddrParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        value.parse().map(Self)
-    }
-}
-
-impl fmt::Display for CandidateIp {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
 
 #[derive(Parser)]
 #[command(
@@ -106,12 +82,12 @@ pub enum ConfigError {
 )]
 fn secret_from_env<T>(
     name: &'static str,
-    value: Option<OsString>,
+    environment: impl Fn(&str) -> Option<OsString>,
 ) -> Result<Option<T>, ConfigError>
 where
     T: TryFrom<String, Error = EmptySecret>,
 {
-    let Some(value) = value else {
+    let Some(value) = environment(name) else {
         return Ok(None);
     };
     let value = value
@@ -129,32 +105,38 @@ struct EnvironmentInputs {
     globalping_token: Option<GlobalpingToken>,
     proxycheck_api_key: Option<ProxycheckApiKey>,
     home: Option<PathBuf>,
+    /// The file GitHub Actions shows as the job summary. The path need not
+    /// be UTF-8, so the `OsString` from the environment becomes a `PathBuf`
+    /// unchanged.
+    step_summary: Option<PathBuf>,
 }
 
 impl EnvironmentInputs {
-    fn for_scan_environment() -> Result<Self, ConfigError> {
+    fn for_scan(
+        environment: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<Self, ConfigError> {
         Ok(Self {
-            ssh_private_key: secret_from_env(
-                "SSH_PRIVATE_KEY",
-                std::env::var_os("SSH_PRIVATE_KEY"),
-            )?,
+            ssh_private_key: secret_from_env("SSH_PRIVATE_KEY", &environment)?,
             globalping_token: secret_from_env(
                 "GLOBALPING_TOKEN",
-                std::env::var_os("GLOBALPING_TOKEN"),
+                &environment,
             )?,
             proxycheck_api_key: secret_from_env(
                 "PROXYCHECK_API_KEY",
-                std::env::var_os("PROXYCHECK_API_KEY"),
+                &environment,
             )?,
-            home: std::env::var_os("HOME").map(PathBuf::from),
+            home: environment("HOME").map(PathBuf::from),
+            step_summary: environment("GITHUB_STEP_SUMMARY").map(PathBuf::from),
         })
     }
 
-    fn for_calibrate_environment() -> Result<Self, ConfigError> {
+    fn for_calibrate(
+        environment: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<Self, ConfigError> {
         Ok(Self {
             globalping_token: secret_from_env(
                 "GLOBALPING_TOKEN",
-                std::env::var_os("GLOBALPING_TOKEN"),
+                &environment,
             )?,
             ..Self::default()
         })
@@ -172,35 +154,24 @@ impl EnvironmentInputs {
 }
 
 impl Cli {
-    pub fn into_command(self) -> Result<Command, ConfigError> {
+    /// Combines the flags with the variables `environment` looks up by name.
+    /// `main` passes the process environment, tests pass a fixed table, and
+    /// both take this one path.
+    pub fn into_command(
+        self,
+        environment: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<Command, ConfigError> {
         match self.command {
             CliCommand::Scan(args) => ScanCommand::try_from((
                 *args,
-                EnvironmentInputs::for_scan_environment()?,
+                EnvironmentInputs::for_scan(environment)?,
             ))
             .map(|command| Command::Scan(Box::new(command))),
             CliCommand::Calibrate(args) => CalibrateCommand::try_from((
                 args,
-                EnvironmentInputs::for_calibrate_environment()?,
+                EnvironmentInputs::for_calibrate(environment)?,
             ))
             .map(Command::Calibrate),
-        }
-    }
-
-    #[cfg(test)]
-    fn into_command_with(
-        self,
-        environment: EnvironmentInputs,
-    ) -> Result<Command, ConfigError> {
-        match self.command {
-            CliCommand::Scan(args) => {
-                ScanCommand::try_from((*args, environment))
-                    .map(|command| Command::Scan(Box::new(command)))
-            }
-            CliCommand::Calibrate(args) => {
-                CalibrateCommand::try_from((args, environment))
-                    .map(Command::Calibrate)
-            }
         }
     }
 }
@@ -212,7 +183,7 @@ impl Cli {
 )]
 struct ScanArgs {
     /// The candidate IPv4 address to vet.
-    ip: CandidateIp,
+    ip: Ipv4Addr,
     /// Country the address was ordered in; the geo gate fails when the public
     /// sources disagree with it.
     #[arg(long)]
@@ -412,6 +383,7 @@ pub struct ScanCommand {
     neighbor_sweep: NeighborSweep,
     failure_policy: FailurePolicy,
     json: Option<PathBuf>,
+    step_summary: Option<PathBuf>,
 }
 
 impl TryFrom<(ScanArgs, EnvironmentInputs)> for ScanCommand {
@@ -452,7 +424,7 @@ impl TryFrom<(ScanArgs, EnvironmentInputs)> for ScanCommand {
             FailurePolicy::FailFast
         };
         Ok(Self {
-            ip: args.ip.as_ipv4(),
+            ip: args.ip,
             country: args.country,
             city: args.city,
             ssh_access,
@@ -470,6 +442,7 @@ impl TryFrom<(ScanArgs, EnvironmentInputs)> for ScanCommand {
             neighbor_sweep,
             failure_policy,
             json: args.json,
+            step_summary: environment.step_summary,
         })
     }
 }
@@ -535,8 +508,12 @@ impl ScanCommand {
         self.failure_policy
     }
 
-    pub fn json_path(&self) -> Option<&std::path::Path> {
+    pub fn json_path(&self) -> Option<&Path> {
         self.json.as_deref()
+    }
+
+    pub fn step_summary_path(&self) -> Option<&Path> {
+        self.step_summary.as_deref()
     }
 }
 
@@ -660,11 +637,25 @@ mod tests {
             .unwrap()
     }
 
+    /// A lookup over a fixed table, standing in for the process environment.
+    fn environment<'a>(
+        variables: &'a [(&str, &str)],
+    ) -> impl Fn(&str) -> Option<OsString> + 'a {
+        |name| {
+            variables
+                .iter()
+                .find(|(variable, _)| *variable == name)
+                .map(|(_, value)| OsString::from(value))
+        }
+    }
+
     fn scan_command_with(
         args: &[&str],
-        environment: EnvironmentInputs,
+        variables: &[(&str, &str)],
     ) -> Result<Box<ScanCommand>, ConfigError> {
-        parse(args).into_command_with(environment).map(into_scan)
+        parse(args)
+            .into_command(environment(variables))
+            .map(into_scan)
     }
 
     fn into_scan(command: Command) -> Box<ScanCommand> {
@@ -675,7 +666,7 @@ mod tests {
     }
 
     fn scan_command(args: &[&str]) -> Result<Box<ScanCommand>, ConfigError> {
-        scan_command_with(args, EnvironmentInputs::default())
+        scan_command_with(args, &[])
     }
 
     fn ssh_settings(command: &ScanCommand) -> &SshSettings {
@@ -687,41 +678,39 @@ mod tests {
 
     #[test]
     fn scan_parses_domain_values_and_defaults() {
-        let sut =
+        let command =
             scan_command(&["scan", "203.0.113.1", "--country", "fi"]).unwrap();
 
-        assert_eq!(sut.ip(), Ipv4Addr::new(203, 0, 113, 1));
-        assert_eq!(sut.country().as_str(), "FI");
-        assert_eq!(ssh_settings(&sut).user(), "root");
-        assert_eq!(sut.reference_city().as_str(), "Helsinki");
-        assert_eq!((sut.probes().eyeball(), sut.probes().datacenter()), (8, 4));
-        assert_eq!(sut.neighbor_sweep(), NeighborSweep::Enabled);
-        assert_eq!(sut.failure_policy(), FailurePolicy::FailFast);
+        assert_eq!(command.ip(), Ipv4Addr::new(203, 0, 113, 1));
+        assert_eq!(command.country().as_str(), "FI");
+        assert_eq!(ssh_settings(&command).user(), "root");
+        assert_eq!(command.reference_city().as_str(), "Helsinki");
+        assert_eq!(
+            (command.probes().eyeball(), command.probes().datacenter()),
+            (8, 4)
+        );
+        assert_eq!(command.neighbor_sweep(), NeighborSweep::Enabled);
+        assert_eq!(command.failure_policy(), FailurePolicy::FailFast);
     }
 
     #[test]
     fn no_ssh_turns_off_every_ssh_connection() {
-        let sut = scan_command_with(
+        let command = scan_command_with(
             &["scan", "203.0.113.1", "--country", "FI", "--no-ssh"],
-            EnvironmentInputs {
-                ssh_private_key: Some(
-                    SshPrivateKey::try_from("key-value".to_owned()).unwrap(),
-                ),
-                ..EnvironmentInputs::default()
-            },
+            &[("SSH_PRIVATE_KEY", "key-value")],
         )
         .unwrap();
 
         assert!(
-            matches!(sut.ssh_access(), SshAccess::Disabled),
+            matches!(command.ssh_access(), SshAccess::Disabled),
             "{:?}",
-            sut.ssh_access()
+            command.ssh_access()
         );
     }
 
     #[test]
     fn ssh_settings_combine_the_flags_with_the_key_from_the_environment() {
-        let sut = scan_command_with(
+        let command = scan_command_with(
             &[
                 "scan",
                 "203.0.113.1",
@@ -732,16 +721,11 @@ mod tests {
                 "--ssh-port",
                 "2222",
             ],
-            EnvironmentInputs {
-                ssh_private_key: Some(
-                    SshPrivateKey::try_from("key-value".to_owned()).unwrap(),
-                ),
-                ..EnvironmentInputs::default()
-            },
+            &[("SSH_PRIVATE_KEY", "key-value")],
         )
         .unwrap();
 
-        let settings = ssh_settings(&sut);
+        let settings = ssh_settings(&command);
         assert_eq!(settings.user(), "admin");
         assert_eq!(settings.port().get(), 2222);
         assert!(settings.private_key().is_some());
@@ -749,7 +733,7 @@ mod tests {
 
     #[test]
     fn known_hosts_entries_pin_the_candidate_host_key() {
-        let sut = scan_command(&[
+        let command = scan_command(&[
             "scan",
             "203.0.113.1",
             "--country",
@@ -760,24 +744,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            ssh_settings(&sut).host_keys(),
+            ssh_settings(&command).host_keys(),
             &HostKeyPolicy::Pinned("203.0.113.1 ssh-ed25519 AAAA".to_owned())
         );
     }
 
     #[test]
     fn without_known_hosts_the_first_key_is_trusted_unless_home_records_it() {
-        let sut = scan_command_with(
+        let command = scan_command_with(
             &["scan", "203.0.113.1", "--country", "FI"],
-            EnvironmentInputs {
-                home: Some(PathBuf::from("/home/a user")),
-                ..EnvironmentInputs::default()
-            },
+            &[("HOME", "/home/a user")],
         )
         .unwrap();
 
         assert_eq!(
-            ssh_settings(&sut).host_keys(),
+            ssh_settings(&command).host_keys(),
             &HostKeyPolicy::TrustOnFirstUse {
                 user_known_hosts: Some(PathBuf::from(
                     "/home/a user/.ssh/known_hosts"
@@ -787,23 +768,20 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::no_home(None)]
-    #[case::empty_home(Some(""))]
-    #[case::relative_home(Some("home/user"))]
+    #[case::no_home(&[])]
+    #[case::empty_home(&[("HOME", "")])]
+    #[case::relative_home(&[("HOME", "home/user")])]
     fn without_a_usable_home_only_the_first_key_seen_is_trusted(
-        #[case] home: Option<&str>,
+        #[case] variables: &[(&str, &str)],
     ) {
-        let sut = scan_command_with(
+        let command = scan_command_with(
             &["scan", "203.0.113.1", "--country", "FI"],
-            EnvironmentInputs {
-                home: home.map(PathBuf::from),
-                ..EnvironmentInputs::default()
-            },
+            variables,
         )
         .unwrap();
 
         assert_eq!(
-            ssh_settings(&sut).host_keys(),
+            ssh_settings(&command).host_keys(),
             &HostKeyPolicy::TrustOnFirstUse {
                 user_known_hosts: None
             }
@@ -812,7 +790,7 @@ mod tests {
 
     #[test]
     fn no_fail_fast_runs_phase_b_after_a_failure() {
-        let sut = scan_command(&[
+        let command = scan_command(&[
             "scan",
             "203.0.113.1",
             "--country",
@@ -821,12 +799,12 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(sut.failure_policy(), FailurePolicy::RunAll);
+        assert_eq!(command.failure_policy(), FailurePolicy::RunAll);
     }
 
     #[test]
     fn no_neighbors_turns_off_the_neighbor_sweep() {
-        let sut = scan_command(&[
+        let command = scan_command(&[
             "scan",
             "203.0.113.1",
             "--country",
@@ -835,7 +813,7 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(sut.neighbor_sweep(), NeighborSweep::Disabled);
+        assert_eq!(command.neighbor_sweep(), NeighborSweep::Disabled);
     }
 
     #[rstest::rstest]
@@ -888,11 +866,11 @@ mod tests {
         "'raech' is not a known gate id"
     )]
     fn malformed_values_are_rejected_during_parsing(
-        #[case] sut: &[&str],
+        #[case] args: &[&str],
         #[case] expected_detail: &str,
     ) {
         let error = Cli::try_parse_from(
-            std::iter::once("chip").chain(sut.iter().copied()),
+            std::iter::once("chip").chain(args.iter().copied()),
         )
         .err()
         .expect("input must be rejected");
@@ -903,7 +881,7 @@ mod tests {
 
     #[test]
     fn repeated_and_comma_separated_gate_flags_accumulate() {
-        let sut = scan_command(&[
+        let command = scan_command(&[
             "scan",
             "203.0.113.1",
             "--country",
@@ -916,7 +894,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            sut.gate_overrides().escalate,
+            command.gate_overrides().escalate,
             HashSet::from([
                 gate::SERVICE_CLAUDE,
                 gate::NEIGHBORS,
@@ -927,7 +905,7 @@ mod tests {
 
     #[test]
     fn a_non_finite_latency_excess_threshold_is_rejected() {
-        let sut = [
+        let args = [
             "scan",
             "203.0.113.1",
             "--country",
@@ -936,7 +914,7 @@ mod tests {
             "NaN",
         ];
 
-        let error = scan_command(&sut).err().expect("input must be rejected");
+        let error = scan_command(&args).err().expect("input must be rejected");
 
         assert!(
             matches!(
@@ -951,7 +929,7 @@ mod tests {
 
     #[test]
     fn a_negative_loss_threshold_is_rejected() {
-        let sut = [
+        let args = [
             "scan",
             "203.0.113.1",
             "--country",
@@ -959,7 +937,7 @@ mod tests {
             "--max-loss-pct=-0.1",
         ];
 
-        let error = scan_command(&sut).err().expect("input must be rejected");
+        let error = scan_command(&args).err().expect("input must be rejected");
 
         assert!(
             matches!(
@@ -974,7 +952,7 @@ mod tests {
 
     #[test]
     fn a_scan_without_any_probes_is_rejected() {
-        let sut = [
+        let args = [
             "scan",
             "203.0.113.1",
             "--country",
@@ -985,7 +963,7 @@ mod tests {
             "0",
         ];
 
-        let error = scan_command(&sut).err().expect("input must be rejected");
+        let error = scan_command(&args).err().expect("input must be rejected");
 
         assert!(
             matches!(error, ConfigError::ProbeSelection(EmptyProbeSelection)),
@@ -1002,31 +980,34 @@ mod tests {
 
     #[test]
     fn datacenter_probes_alone_make_a_selection() {
-        let sut = ProbeSelection::new(0, 4).unwrap();
+        let selection = ProbeSelection::new(0, 4).unwrap();
 
-        assert_eq!((sut.eyeball(), sut.datacenter()), (0, 4));
+        assert_eq!((selection.eyeball(), selection.datacenter()), (0, 4));
     }
 
     #[test]
     fn calibration_targets_are_parsed_before_orchestration() {
         let command =
             parse(&["calibrate", "203.0.113.7=Helsinki", "198.51.100.9=Turku"])
-                .into_command_with(EnvironmentInputs::default())
+                .into_command(environment(&[]))
                 .unwrap();
-        let Command::Calibrate(sut) = command else {
+        let Command::Calibrate(calibration) = command else {
             panic!("expected calibrate command")
         };
 
-        assert_eq!(sut.targets().len(), 2);
-        assert_eq!(sut.targets()[0].ip(), Ipv4Addr::new(203, 0, 113, 7));
-        assert_eq!(sut.targets()[0].city().as_str(), "Helsinki");
+        assert_eq!(calibration.targets().len(), 2);
+        assert_eq!(
+            calibration.targets()[0].ip(),
+            Ipv4Addr::new(203, 0, 113, 7)
+        );
+        assert_eq!(calibration.targets()[0].city().as_str(), "Helsinki");
     }
 
     #[test]
     fn a_malformed_calibration_target_is_rejected_by_the_parser() {
-        let sut = ["chip", "calibrate", "not-an-ip=Helsinki"];
+        let args = ["chip", "calibrate", "not-an-ip=Helsinki"];
 
-        let error = Cli::try_parse_from(sut)
+        let error = Cli::try_parse_from(args)
             .err()
             .expect("target must be rejected");
 
@@ -1085,14 +1066,14 @@ mod tests {
     #[case::empty_city("203.0.113.7=")]
     #[case::blank_city("203.0.113.7=   ")]
     fn a_target_without_a_city_name_is_rejected_for_its_city(
-        #[case] sut: &str,
+        #[case] target: &str,
     ) {
-        let actual = sut.parse::<CalibrationTarget>();
+        let actual = target.parse::<CalibrationTarget>();
 
         assert!(
             matches!(
                 &actual,
-                Err(CalibrationTargetError::City { raw, .. }) if raw == sut
+                Err(CalibrationTargetError::City { raw, .. }) if raw == target
             ),
             "{actual:?}"
         );
@@ -1102,7 +1083,7 @@ mod tests {
     fn an_owned_environment_value_becomes_a_typed_secret() {
         let secret = secret_from_env::<GlobalpingToken>(
             "GLOBALPING_TOKEN",
-            Some(OsString::from("token-value")),
+            environment(&[("GLOBALPING_TOKEN", "token-value")]),
         )
         .unwrap();
 
@@ -1113,7 +1094,7 @@ mod tests {
     fn a_blank_environment_secret_names_the_setting_in_its_error() {
         let error = secret_from_env::<ProxycheckApiKey>(
             "PROXYCHECK_API_KEY",
-            Some(OsString::from("   ")),
+            environment(&[("PROXYCHECK_API_KEY", "   ")]),
         )
         .unwrap_err();
 
