@@ -1,5 +1,5 @@
 use crate::Verdict;
-use crate::model::{NeighborHttps, NeighborProbe, PtrLookup};
+use crate::model::{NeighborHttps, NeighborProbe, PtrLookup, TlsHandshake};
 use itertools::Itertools as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,11 +117,14 @@ const BRANDS: &[&str] = &[
 pub fn classify(probe: &NeighborProbe) -> NeighborBucket {
     let h = match &probe.https {
         NeighborHttps::Closed => return NeighborBucket::Closed,
-        NeighborHttps::Open { handshake: None } => {
+        NeighborHttps::Open {
+            handshake:
+                TlsHandshake::NoCertificate | TlsHandshake::Unavailable(_),
+        } => {
             return NeighborBucket::NoHandshake;
         }
         NeighborHttps::Open {
-            handshake: Some(handshake),
+            handshake: TlsHandshake::Presented(handshake),
         } => handshake,
     };
     let cn = h.cert_cn.as_deref().unwrap_or("");
@@ -177,11 +180,13 @@ fn largest_identical_default_certificate_group(
         .filter(|(_, bucket)| **bucket == NeighborBucket::SelfSigned)
         .filter_map(|(probe, _)| match &probe.https {
             NeighborHttps::Open {
-                handshake: Some(handshake),
+                handshake: TlsHandshake::Presented(handshake),
             } => Some(handshake),
-            NeighborHttps::Closed | NeighborHttps::Open { handshake: None } => {
-                None
-            }
+            NeighborHttps::Closed
+            | NeighborHttps::Open {
+                handshake:
+                    TlsHandshake::NoCertificate | TlsHandshake::Unavailable(_),
+            } => None,
         })
         .counts_by(|handshake| {
             (
@@ -261,11 +266,25 @@ mod tests {
             https: NeighborHttps::Closed,
         }
     }
-    fn no_handshake(ip: &str) -> NeighborProbe {
+    fn no_certificate(ip: &str) -> NeighborProbe {
         NeighborProbe {
             ip: ip.parse().unwrap(),
             ptr: PtrLookup::NotFound,
-            https: NeighborHttps::Open { handshake: None },
+            https: NeighborHttps::Open {
+                handshake: TlsHandshake::NoCertificate,
+            },
+        }
+    }
+
+    fn handshake_unavailable(ip: &str) -> NeighborProbe {
+        NeighborProbe {
+            ip: ip.parse().unwrap(),
+            ptr: PtrLookup::NotFound,
+            https: NeighborHttps::Open {
+                handshake: TlsHandshake::Unavailable(
+                    "openssl handshake timed out".to_string(),
+                ),
+            },
         }
     }
     fn handshake(
@@ -278,7 +297,7 @@ mod tests {
             ip: ip.parse().unwrap(),
             ptr: PtrLookup::NotFound,
             https: NeighborHttps::Open {
-                handshake: Some(TlsHandshakeFacts {
+                handshake: TlsHandshake::Presented(TlsHandshakeFacts {
                     cert_cn: Some(cn.into()),
                     cert_issuer: Some(issuer.into()),
                     cert_san: san.iter().map(ToString::to_string).collect(),
@@ -289,8 +308,12 @@ mod tests {
 
     #[rstest::rstest]
     #[case::closed(closed("203.0.113.1"), NeighborBucket::Closed)]
-    #[case::no_handshake(
-        no_handshake("203.0.113.2"),
+    #[case::no_certificate(
+        no_certificate("203.0.113.2"),
+        NeighborBucket::NoHandshake
+    )]
+    #[case::handshake_unavailable(
+        handshake_unavailable("203.0.113.9"),
         NeighborBucket::NoHandshake
     )]
     #[case::reality_google(
@@ -361,7 +384,7 @@ mod tests {
         let sut = vec![
             handshake("203.0.113.10", "blog.example.org", "R3", &[]),
             handshake("203.0.113.11", "www.apple.com", "DigiCert", &[]),
-            no_handshake("203.0.113.12"),
+            no_certificate("203.0.113.12"),
             closed("203.0.113.13"),
         ];
         assert_eq!(judge_neighbor_extremes(&sut).severity, Severity::Ok);
@@ -404,7 +427,9 @@ mod tests {
             .map(|i| NeighborProbe {
                 ip: format!("203.0.113.{i}").parse().unwrap(),
                 ptr: ptr(&format!("vpn{i}.example.net")),
-                https: NeighborHttps::Open { handshake: None },
+                https: NeighborHttps::Open {
+                    handshake: TlsHandshake::NoCertificate,
+                },
             })
             .collect();
         sut.push(handshake("203.0.113.99", "blog.example.org", "R3", &[]));

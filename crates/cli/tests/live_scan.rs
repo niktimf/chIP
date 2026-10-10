@@ -8,8 +8,8 @@
 //!     cargo test -p chip --test live_scan -- --ignored
 //! ```
 //!
-//! Without `CHIP_LIVE_IP`/`CHIP_LIVE_COUNTRY` the test returns without
-//! asserting, so `--ignored` on a machine with no candidate stays quiet.
+//! Without `CHIP_LIVE_IP` or `CHIP_LIVE_COUNTRY` the test fails and says
+//! which one is missing: a run with `--ignored` is meant to scan a candidate.
 
 use std::process::Command;
 
@@ -26,11 +26,10 @@ fn expected_gates() -> Vec<&'static str> {
 #[test]
 #[ignore = "needs a live candidate in CHIP_LIVE_IP and Globalping quota"]
 fn a_full_scan_reports_every_gate_and_exits_with_a_pipeline_code() {
-    let (Ok(ip), Ok(country)) =
-        (std::env::var("CHIP_LIVE_IP"), std::env::var("CHIP_LIVE_COUNTRY"))
-    else {
-        return;
-    };
+    let ip = std::env::var("CHIP_LIVE_IP")
+        .expect("CHIP_LIVE_IP must name the live candidate");
+    let country = std::env::var("CHIP_LIVE_COUNTRY")
+        .expect("CHIP_LIVE_COUNTRY must name the candidate's country");
     let report = tempfile::NamedTempFile::new().expect("a writable temp dir");
 
     let mut sut = Command::new(env!("CARGO_BIN_EXE_chip"));

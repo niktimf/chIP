@@ -128,9 +128,7 @@ mod tests {
 
     #[test]
     fn ipv6_lines_are_skipped_in_the_address_list() {
-        let sut = ADDRESS_LIST;
-
-        let actual = RknRegistryClient::parse_addresses(sut);
+        let actual = RknRegistryClient::parse_addresses(ADDRESS_LIST);
 
         assert_eq!(
             actual,
@@ -142,11 +140,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_reads_both_lists() {
+    async fn the_registry_holds_the_ipv4_entries_of_both_lists() {
         let server =
             serve(ResponseTemplate::new(200).set_body_string(ADDRESS_LIST))
                 .await;
-
         let sut = client(&server);
 
         let actual = sut.fetch().await.unwrap();
@@ -165,7 +162,6 @@ mod tests {
     #[tokio::test]
     async fn a_failed_list_is_an_error_rather_than_a_clean_registry() {
         let server = serve(ResponseTemplate::new(503)).await;
-
         let sut = client(&server);
 
         let error = sut.fetch().await.err().unwrap();
@@ -179,7 +175,6 @@ mod tests {
             ResponseTemplate::new(200).set_body_string("<html>error</html>"),
         )
         .await;
-
         let sut = client(&server);
 
         let error = sut.fetch().await.err().unwrap();

@@ -1,8 +1,9 @@
 use std::net::Ipv4Addr;
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use chip_core::anchor::{Anchor, select_for_city, select_for_country};
 use chip_core::gate;
 use chip_core::ip_lists::RknRegistry;
 use chip_core::model::{
@@ -31,9 +32,7 @@ use chip_core::verdict::tampering::judge_tampering;
 use chip_core::{
     CheckResult, CountryCode, GateId, GateScope, Report, ScanProfile, Verdict,
 };
-use chip_io::atlas::{
-    Anchor, AnchorClient, AtlasError, select_for_city, select_for_country,
-};
+use chip_io::atlas::{AnchorClient, AtlasError};
 use chip_io::blocklists::BlockListsClient;
 use chip_io::geoip::GeoIpClient;
 use chip_io::globalping::{
@@ -269,8 +268,8 @@ struct PingTarget {
 impl From<&Anchor> for PingTarget {
     fn from(anchor: &Anchor) -> Self {
         Self {
-            label: anchor.fqdn.clone(),
-            ip: anchor.ip_v4,
+            label: anchor.fqdn().to_owned(),
+            ip: anchor.ip_v4(),
         }
     }
 }
@@ -687,13 +686,17 @@ fn select_targets(
     command: &ScanCommand,
     anchors: &[Anchor],
 ) -> (Vec<PingTarget>, Option<Ipv4Addr>) {
+    const CITY_ANCHORS: NonZeroUsize =
+        NonZeroUsize::new(3).expect("3 is non-zero");
+    const CONTROL_ANCHORS: NonZeroUsize =
+        NonZeroUsize::new(2).expect("2 is non-zero");
     let city = command.anchor().map_or_else(
         || {
             let by_city = command.city().map_or_else(Vec::new, |city| {
-                select_for_city(anchors, city, 3)
+                select_for_city(anchors, city, CITY_ANCHORS)
             });
             let picked = if by_city.is_empty() {
-                select_for_country(anchors, command.country(), 3)
+                select_for_country(anchors, command.country(), CITY_ANCHORS)
             } else {
                 by_city
             };
@@ -706,9 +709,10 @@ fn select_targets(
             }]
         },
     );
-    let control = select_for_city(anchors, command.reference_city(), 2)
-        .first()
-        .map(|anchor| anchor.ip_v4);
+    let control =
+        select_for_city(anchors, command.reference_city(), CONTROL_ANCHORS)
+            .first()
+            .map(Anchor::ip_v4);
     (city, control)
 }
 
@@ -1423,15 +1427,18 @@ mod tests {
     #[test]
     fn an_unreadable_quota_names_its_cause_and_leaves_reach_without_a_listener()
     {
-        let sut = GlobalpingSetupError::QuotaUnavailable(
-            GlobalpingError::Http("HTTP 429".to_string()),
-        );
+        let sut =
+            GlobalpingSetupError::QuotaUnavailable(GlobalpingError::Status {
+                operation: "read limits",
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            });
 
         let results =
             globalping_failure_results(gate::GLOBALPING_QUOTA, sut, None);
 
         let detail = "could not read Globalping quota: \
-                      globalping request failed: HTTP 429";
+                      globalping request failed: read limits: \
+                      HTTP 429 Too Many Requests";
         assert_eq!(
             results,
             [
@@ -1446,12 +1453,16 @@ mod tests {
 
     #[test]
     fn a_failed_latency_step_reports_latency_once_beside_reach() {
-        let sut = GlobalpingError::Http("HTTP 503".to_string());
+        let sut = GlobalpingError::Status {
+            operation: "poll measurement",
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        };
 
         let results =
             globalping_failure_results(gate::LATENCY, sut, verified_listener());
 
-        let detail = "globalping request failed: HTTP 503";
+        let detail = "globalping request failed: poll measurement: \
+                      HTTP 503 Service Unavailable";
         assert_eq!(
             results,
             [

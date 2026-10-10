@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chip_core::model::{
-    NeighborHttps, NeighborProbe, PtrLookup, PtrName, TlsHandshakeFacts,
+    NeighborHttps, NeighborProbe, PtrLookup, PtrName, TlsHandshake,
+    TlsHandshakeFacts,
 };
 use ipnet::Ipv4Net;
 use tokio::process::Command;
@@ -18,6 +19,10 @@ pub struct SweepConfig {
 }
 
 impl SweepConfig {
+    const DEFAULT_CONCURRENCY: NonZeroUsize =
+        NonZeroUsize::new(16).expect("16 is non-zero");
+    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
+
     pub const fn new(concurrency: NonZeroUsize, timeout: Duration) -> Self {
         Self {
             concurrency,
@@ -28,10 +33,7 @@ impl SweepConfig {
 
 impl Default for SweepConfig {
     fn default() -> Self {
-        Self::new(
-            const { NonZeroUsize::new(16).expect("16 is non-zero") },
-            Duration::from_secs(3),
-        )
+        Self::new(Self::DEFAULT_CONCURRENCY, Self::DEFAULT_TIMEOUT)
     }
 }
 
@@ -83,33 +85,24 @@ fn parse_cert_block(raw: &str) -> Option<TlsHandshakeFacts> {
     })
 }
 
-async fn handshake(
-    ip: Ipv4Addr,
-    timeout: Duration,
-) -> Option<TlsHandshakeFacts> {
+async fn handshake(ip: Ipv4Addr, timeout: Duration) -> TlsHandshake {
     let mut command = Command::new("openssl");
     command
         .args(["s_client", "-showcerts", "-connect", &format!("{ip}:443")])
         .stdin(Stdio::null())
         .kill_on_drop(true);
-    // `NeighborHttps::Open { handshake: None }` keeps no cause, so each
-    // reason for a missing certificate goes to the log.
-    let output = match tokio::time::timeout(timeout, command.output()).await {
-        Ok(Ok(output)) => output,
+    match tokio::time::timeout(timeout, command.output()).await {
+        Err(_) => {
+            TlsHandshake::Unavailable("openssl handshake timed out".to_string())
+        }
         Ok(Err(error)) => {
-            tracing::debug!(%ip, %error, "openssl could not run");
-            return None;
+            TlsHandshake::Unavailable(format!("openssl could not run: {error}"))
         }
-        Err(elapsed) => {
-            tracing::debug!(%ip, error = %elapsed, "openssl handshake timed out");
-            return None;
+        Ok(Ok(output)) => {
+            parse_cert_block(&String::from_utf8_lossy(&output.stdout))
+                .map_or(TlsHandshake::NoCertificate, TlsHandshake::Presented)
         }
-    };
-    let facts = parse_cert_block(&String::from_utf8_lossy(&output.stdout));
-    if facts.is_none() {
-        tracing::debug!(%ip, "openssl printed no readable certificate");
     }
-    facts
 }
 
 async fn reverse_dns(ip: Ipv4Addr, timeout: Duration) -> PtrLookup {
@@ -165,6 +158,9 @@ pub async fn sweep(
 ) -> Result<Vec<NeighborProbe>, tokio::task::JoinError> {
     let semaphore = Arc::new(Semaphore::new(config.concurrency.get()));
     let mut tasks = tokio::task::JoinSet::new();
+    // One task per host, all spawned up front: the scan passes a /24, so at
+    // most 254 tasks wait here, and the semaphore bounds how many probe at
+    // once.
     for ip in network.hosts() {
         let semaphore = Arc::clone(&semaphore);
         let timeout = config.timeout;
@@ -172,16 +168,14 @@ pub async fn sweep(
             let Ok(_permit) = semaphore.acquire_owned().await else {
                 return None;
             };
-            let tcp_open = tcp_open(ip, timeout).await;
-            let (handshake, ptr) = if tcp_open {
-                tokio::join!(handshake(ip, timeout), reverse_dns(ip, timeout))
+            let (https, ptr) = if tcp_open(ip, timeout).await {
+                let (handshake, ptr) = tokio::join!(
+                    handshake(ip, timeout),
+                    reverse_dns(ip, timeout)
+                );
+                (NeighborHttps::Open { handshake }, ptr)
             } else {
-                (None, reverse_dns(ip, timeout).await)
-            };
-            let https = if tcp_open {
-                NeighborHttps::Open { handshake }
-            } else {
-                NeighborHttps::Closed
+                (NeighborHttps::Closed, reverse_dns(ip, timeout).await)
             };
             Some(NeighborProbe { ip, ptr, https })
         });

@@ -602,12 +602,22 @@ impl fmt::Display for RiskScore {
     }
 }
 
-/// One vote per keyless `GeoIP` source, or `None` if the source did not
-/// answer (including "answered with an unknown country code" — the I/O
-/// boundary folds that case into `None` too).
-#[derive(Debug, Clone)]
+/// One vote per keyless `GeoIP` source, in the order the sources are
+/// queried.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeoConsensusFacts {
-    pub votes: Vec<Option<CountryCode>>,
+    pub votes: Vec<GeoVote>,
+}
+
+/// The country one `GeoIP` source names for the candidate.
+///
+/// `country` is `None` when the source did not answer, including "answered
+/// with an unknown country code": the I/O boundary folds that case into
+/// `None` too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeoVote {
+    pub source: &'static str,
+    pub country: Option<CountryCode>,
 }
 
 /// One country voter behind the `service-geo` gate. A closed set: the
@@ -786,12 +796,24 @@ pub enum PtrLookup {
     Unavailable(String),
 }
 
+/// What a TLS handshake with a neighbor's `:443` produced.
+///
+/// `NoCertificate` and `Unavailable` are kept apart like the variants of
+/// `PtrLookup`: only the second means the handshake itself could not be run.
+#[derive(Debug, Clone)]
+pub enum TlsHandshake {
+    Presented(TlsHandshakeFacts),
+    /// The handshake ran, but its output held no readable certificate.
+    NoCertificate,
+    /// The handshake could not be run or did not finish; the string is the
+    /// cause.
+    Unavailable(String),
+}
+
 #[derive(Debug, Clone)]
 pub enum NeighborHttps {
     Closed,
-    Open {
-        handshake: Option<TlsHandshakeFacts>,
-    },
+    Open { handshake: TlsHandshake },
 }
 
 #[derive(Debug, Clone)]
@@ -802,7 +824,7 @@ pub struct NeighborProbe {
 }
 
 /// How the candidate's address is routed, as the RIS peers see it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Routing {
     /// An announcement covers the address. The prefix is usually shorter
     /// than a `/24`: cloud providers announce whole blocks.
@@ -818,7 +840,7 @@ pub enum Routing {
 ///
 /// The total is never zero: a routing answer without RIS peers carries no
 /// data and is rejected where the response is read.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingFacts {
     ris_peers_seeing: u32,
     total_ris_peers: NonZeroU32,

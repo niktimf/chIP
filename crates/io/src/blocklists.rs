@@ -131,9 +131,7 @@ mod tests {
 
     #[test]
     fn spamhaus_entries_are_read_and_the_metadata_line_is_skipped() {
-        let sut = SPAMHAUS_SAMPLE;
-
-        let actual = BlockListsClient::parse_spamhaus(sut);
+        let actual = BlockListsClient::parse_spamhaus(SPAMHAUS_SAMPLE);
 
         assert_eq!(
             actual,
@@ -145,7 +143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_populates_both_lists_when_both_succeed() {
+    async fn both_lists_are_read_when_both_sources_answer() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/spamhaus"))
@@ -161,7 +159,6 @@ mod tests {
             )
             .mount(&server)
             .await;
-
         let sut = client(&server);
 
         let actual = sut.fetch().await;
@@ -181,7 +178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_marks_a_failed_list_unavailable_without_failing_the_other() {
+    async fn a_failed_list_is_unavailable_and_the_other_is_still_read() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/spamhaus"))
@@ -195,7 +192,6 @@ mod tests {
             )
             .mount(&server)
             .await;
-
         let sut = client(&server);
 
         let actual = sut.fetch().await;
@@ -229,7 +225,6 @@ mod tests {
             )
             .mount(&server)
             .await;
-
         let sut = client(&server);
 
         let actual = sut.fetch().await;

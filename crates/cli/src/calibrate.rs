@@ -1,19 +1,22 @@
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use chip_core::anchor::{Anchor, select_for_city};
 use chip_core::model::{AnchorSeries, PingSample, PingSweepFacts};
 use chip_core::verdict::latency::{
     LatencySummary, LatencyThresholds, summarize_latency,
 };
-use chip_io::atlas::{Anchor, AnchorClient, select_for_city};
+use chip_io::atlas::AnchorClient;
 use chip_io::globalping::{GlobalpingClient, Locations, MeasurementId, Ping};
 
 use crate::config::{CalibrateCommand, CalibrationTarget, ProbeSelection};
 
 const MEASUREMENT_DEADLINE: Duration = Duration::from_secs(90);
 /// How many RIPE Atlas anchors of the target's city to measure against.
-const ANCHORS_PER_CITY: usize = 3;
+const ANCHORS_PER_CITY: NonZeroUsize =
+    NonZeroUsize::new(3).expect("3 is non-zero");
 
 #[derive(Debug, Clone)]
 pub struct CalibrationRow {
@@ -154,12 +157,12 @@ impl CalibrationSession {
         for anchor in anchors {
             let id = self
                 .globalping
-                .create_ping(anchor.ip_v4, &Locations::reuse(sample.clone()))
+                .create_ping(anchor.ip_v4(), &Locations::reuse(sample.clone()))
                 .await
                 .with_context(|| {
                     format!(
                         "failed to start a Globalping ping of anchor {}",
-                        anchor.fqdn
+                        anchor.fqdn()
                     )
                 })?;
             let samples = self
@@ -169,10 +172,10 @@ impl CalibrationSession {
                 .with_context(|| {
                     format!(
                         "failed to collect the Globalping ping of anchor {}",
-                        anchor.fqdn
+                        anchor.fqdn()
                     )
                 })?;
-            measurements.push(AnchorSeries::new(anchor.fqdn, samples));
+            measurements.push(AnchorSeries::new(anchor.fqdn(), samples));
         }
         Ok(measurements)
     }

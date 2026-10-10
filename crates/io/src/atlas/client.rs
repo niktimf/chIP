@@ -1,4 +1,4 @@
-use super::select::Anchor;
+use chip_core::anchor::Anchor;
 use futures::{TryStreamExt as _, stream};
 use serde::Deserialize;
 use thiserror::Error;
@@ -42,13 +42,7 @@ impl RawAnchor {
                 );
             })
             .ok()?;
-        Some(Anchor {
-            fqdn: self.fqdn,
-            ip_v4,
-            city: self.city,
-            country,
-            as_v4: self.as_v4,
-        })
+        Some(Anchor::new(self.fqdn, ip_v4, self.city, country, self.as_v4))
     }
 }
 
@@ -143,7 +137,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
-    async fn anchors_follows_pagination_and_drops_inactive_or_ipv6_only_rows() {
+    async fn active_anchors_with_ipv4_are_collected_from_every_page() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/page1"))
@@ -175,7 +169,7 @@ mod tests {
         let anchors = sut.anchors().await.unwrap();
 
         assert_eq!(
-            anchors.iter().map(|a| a.fqdn.as_str()).collect::<Vec<_>>(),
+            anchors.iter().map(Anchor::fqdn).collect::<Vec<_>>(),
             vec!["fi-hel-as1", "de-fra-as4"]
         );
     }

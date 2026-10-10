@@ -7,8 +7,8 @@
 //!     cargo test -p chip-io --test live_candidate -- --ignored --test-threads 1
 //! ```
 //!
-//! With `CHIP_LIVE_IP` unset each test returns without asserting, so
-//! `--ignored` on a machine with no candidate is quiet rather than red.
+//! With `CHIP_LIVE_IP` unset or not an IPv4 address each test fails and
+//! says so: a run with `--ignored` is meant to check a candidate.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -26,8 +26,11 @@ use chip_io::ssh::{
 };
 use chip_io::tunnel::TunnelClient;
 
-fn candidate() -> Option<Ipv4Addr> {
-    std::env::var("CHIP_LIVE_IP").ok()?.parse().ok()
+fn candidate() -> Ipv4Addr {
+    std::env::var("CHIP_LIVE_IP")
+        .expect("CHIP_LIVE_IP must name the live candidate")
+        .parse()
+        .expect("CHIP_LIVE_IP must be an IPv4 address")
 }
 
 fn listener_port() -> NonZeroU16 {
@@ -75,7 +78,7 @@ fn port_is_open(ip: Ipv4Addr, port: NonZeroU16) -> bool {
 #[tokio::test]
 #[ignore = "needs a live candidate in CHIP_LIVE_IP"]
 async fn the_candidate_carries_what_a_scan_needs_over_ssh() {
-    let Some(ip) = candidate() else { return };
+    let ip = candidate();
 
     let sut = SshSession::connect(ip, &config())
         .await
@@ -97,7 +100,7 @@ async fn the_candidate_carries_what_a_scan_needs_over_ssh() {
 #[tokio::test]
 #[ignore = "needs a live candidate in CHIP_LIVE_IP"]
 async fn traffic_through_the_tunnel_leaves_from_the_candidate() {
-    let Some(ip) = candidate() else { return };
+    let ip = candidate();
 
     let tunnel = SocksTunnel::start(ip, &config(), free_local_port())
         .await
@@ -116,7 +119,7 @@ async fn traffic_through_the_tunnel_leaves_from_the_candidate() {
 #[tokio::test]
 #[ignore = "needs a live candidate in CHIP_LIVE_IP"]
 async fn the_temporary_listener_opens_its_port_and_stopping_closes_it() {
-    let Some(ip) = candidate() else { return };
+    let ip = candidate();
     let port = listener_port();
 
     let sut = SshSession::connect(ip, &config())

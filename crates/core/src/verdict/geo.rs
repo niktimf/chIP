@@ -9,7 +9,7 @@ const MIN_ANSWERS: usize = 5;
 )]
 pub fn judge_geo(facts: &GeoConsensusFacts, expected: &CountryCode) -> Verdict {
     let answered: Vec<CountryCode> =
-        facts.votes.iter().flatten().copied().collect();
+        facts.votes.iter().filter_map(|vote| vote.country).collect();
     if answered.len() < MIN_ANSWERS {
         return Verdict::error(format!(
             "only {} of {} geo sources answered (need >= {MIN_ANSWERS})",
@@ -47,15 +47,27 @@ pub fn judge_geo(facts: &GeoConsensusFacts, expected: &CountryCode) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Severity;
+    use crate::model::{GeoVote, Severity};
 
     fn cc(code: &str) -> CountryCode {
         code.parse().unwrap()
     }
 
+    /// One vote per code, each from its own source.
     fn votes(codes: &[Option<&str>]) -> GeoConsensusFacts {
+        const SOURCES: [&str; 9] = [
+            "source-1", "source-2", "source-3", "source-4", "source-5",
+            "source-6", "source-7", "source-8", "source-9",
+        ];
         GeoConsensusFacts {
-            votes: codes.iter().map(|c| c.map(cc)).collect(),
+            votes: SOURCES
+                .into_iter()
+                .zip(codes)
+                .map(|(source, code)| GeoVote {
+                    source,
+                    country: code.map(cc),
+                })
+                .collect(),
         }
     }
 

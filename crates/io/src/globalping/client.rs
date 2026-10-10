@@ -1,7 +1,8 @@
 use super::types::{MeasurementStatus, RawMeasurement};
 use crate::credentials::GlobalpingToken;
 use chip_core::model::{HttpProbeOutcome, PingSample};
-use serde::Deserialize;
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU16;
@@ -10,8 +11,17 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum GlobalpingError {
-    #[error("globalping request failed: {0}")]
-    Http(String),
+    #[error("globalping request failed: {operation}: HTTP {status}")]
+    Status {
+        operation: &'static str,
+        status: StatusCode,
+    },
+    #[error("globalping request failed: {operation}")]
+    Request {
+        operation: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
     #[error(
         "globalping rate limit exceeded (try again next hour, or set GLOBALPING_TOKEN)"
     )]
@@ -22,8 +32,13 @@ pub enum GlobalpingError {
     Timeout(#[source] tokio::time::error::Elapsed),
     #[error("globalping returned an empty measurement id")]
     EmptyMeasurementId,
-    #[error(transparent)]
-    Reqwest(#[from] reqwest::Error),
+}
+
+impl GlobalpingError {
+    /// Wraps a transport or decoding error of `operation`.
+    fn request(operation: &'static str) -> impl FnOnce(reqwest::Error) -> Self {
+        move |source| Self::Request { operation, source }
+    }
 }
 
 /// Marker for a ping measurement: its id is polled with
@@ -123,16 +138,73 @@ impl Locations {
         Self(LocationsInner::Reuse(id.0))
     }
 
-    fn to_value(&self) -> serde_json::Value {
+    fn body(&self) -> LocationsBody<'_> {
         match &self.0 {
             LocationsInner::Ru {
                 eyeball_limit,
                 datacenter_limit,
-            } => serde_json::json!([
-                {"country": "RU", "tags": ["eyeball-network"], "limit": eyeball_limit},
-                {"country": "RU", "tags": ["datacenter-network"], "limit": datacenter_limit}
+            } => LocationsBody::Probes([
+                ProbeLocation::ru("eyeball-network", *eyeball_limit),
+                ProbeLocation::ru("datacenter-network", *datacenter_limit),
             ]),
-            LocationsInner::Reuse(id) => serde_json::Value::String(id.clone()),
+            LocationsInner::Reuse(id) => LocationsBody::Reuse(id),
+        }
+    }
+}
+
+/// Body of `POST /v1/measurements`.
+#[derive(Serialize)]
+struct CreateMeasurement<'a> {
+    locations: LocationsBody<'a>,
+    #[serde(flatten)]
+    measurement: MeasurementRequest,
+    target: Ipv4Addr,
+}
+
+/// The measurement type together with its options, so a type is never sent
+/// with the options of another.
+#[derive(Serialize)]
+#[serde(tag = "type", content = "measurementOptions", rename_all = "lowercase")]
+enum MeasurementRequest {
+    Ping { packets: u8 },
+    Http(HttpOptions),
+}
+
+#[derive(Serialize)]
+struct HttpOptions {
+    port: NonZeroU16,
+    protocol: &'static str,
+    request: HttpRequest,
+}
+
+#[derive(Serialize)]
+struct HttpRequest {
+    method: &'static str,
+    path: &'static str,
+}
+
+/// Either a list of probe filters or, to reuse the probes of an earlier
+/// measurement, its id as a bare string.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum LocationsBody<'a> {
+    Probes([ProbeLocation; 2]),
+    Reuse(&'a str),
+}
+
+#[derive(Serialize)]
+struct ProbeLocation {
+    country: &'static str,
+    limit: u8,
+    tags: [&'static str; 1],
+}
+
+impl ProbeLocation {
+    const fn ru(tag: &'static str, limit: u8) -> Self {
+        Self {
+            country: "RU",
+            limit,
+            tags: [tag],
         }
     }
 }
@@ -182,10 +254,10 @@ impl GlobalpingClient {
         target: Ipv4Addr,
         locations: &Locations,
     ) -> Result<MeasurementId<Ping>, GlobalpingError> {
+        const PACKETS: u8 = 10;
         self.create(
-            "ping",
+            MeasurementRequest::Ping { packets: PACKETS },
             target,
-            serde_json::json!({"packets": 10}),
             locations,
         )
         .await
@@ -202,24 +274,37 @@ impl GlobalpingClient {
         port: NonZeroU16,
         locations: &Locations,
     ) -> Result<MeasurementId<Https>, GlobalpingError> {
-        let options = serde_json::json!({"protocol": "HTTPS", "port": port.get(), "request": {"path": "/", "method": "GET"}});
-        self.create("http", target, options, locations).await
+        let options = HttpOptions {
+            port,
+            protocol: "HTTPS",
+            request: HttpRequest {
+                method: "GET",
+                path: "/",
+            },
+        };
+        self.create(MeasurementRequest::Http(options), target, locations)
+            .await
     }
 
     /// Sends the request and tags the id with `K`. The caller picks `K` to
-    /// match `typ`; `create_ping` and `create_https` are the only callers.
+    /// match `measurement`; `create_ping` and `create_https` are the only
+    /// callers.
     async fn create<K>(
         &self,
-        typ: &str,
+        measurement: MeasurementRequest,
         target: Ipv4Addr,
-        options: serde_json::Value,
         locations: &Locations,
     ) -> Result<MeasurementId<K>, GlobalpingError> {
+        const OPERATION: &str = "create measurement";
         #[derive(Deserialize)]
         struct Created {
             id: String,
         }
-        let body = serde_json::json!({"type": typ, "target": target.to_string(), "locations": locations.to_value(), "measurementOptions": options});
+        let body = CreateMeasurement {
+            locations: locations.body(),
+            measurement,
+            target,
+        };
         let resp = self
             .request(
                 self.http
@@ -227,9 +312,12 @@ impl GlobalpingClient {
                     .json(&body),
             )
             .send()
-            .await?;
-        let created: Created =
-            Self::checked(resp, "create measurement")?.json().await?;
+            .await
+            .map_err(GlobalpingError::request(OPERATION))?;
+        let created: Created = Self::checked(resp, OPERATION)?
+            .json()
+            .await
+            .map_err(GlobalpingError::request(OPERATION))?;
         MeasurementId::new(created.id)
     }
 
@@ -237,18 +325,16 @@ impl GlobalpingClient {
     /// decoded, so a 429 or 5xx does not surface as a JSON decode error.
     fn checked(
         resp: reqwest::Response,
-        operation: &str,
+        operation: &'static str,
     ) -> Result<reqwest::Response, GlobalpingError> {
         match resp.status() {
-            reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                Err(GlobalpingError::RateLimited)
-            }
-            reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+            StatusCode::TOO_MANY_REQUESTS => Err(GlobalpingError::RateLimited),
+            StatusCode::UNPROCESSABLE_ENTITY => {
                 Err(GlobalpingError::NoSuitableProbes)
             }
-            status if !status.is_success() => Err(GlobalpingError::Http(
-                format!("{operation}: HTTP {status}"),
-            )),
+            status if !status.is_success() => {
+                Err(GlobalpingError::Status { operation, status })
+            }
             _ => Ok(resp),
         }
     }
@@ -299,6 +385,7 @@ impl GlobalpingClient {
     }
 
     async fn poll(&self, id: &str) -> Result<RawMeasurement, GlobalpingError> {
+        const OPERATION: &str = "poll measurement";
         loop {
             let resp = self
                 .request(
@@ -306,9 +393,12 @@ impl GlobalpingClient {
                         .get(format!("{}/v1/measurements/{id}", self.base_url)),
                 )
                 .send()
-                .await?;
-            let measurement: RawMeasurement =
-                Self::checked(resp, "poll measurement")?.json().await?;
+                .await
+                .map_err(GlobalpingError::request(OPERATION))?;
+            let measurement: RawMeasurement = Self::checked(resp, OPERATION)?
+                .json()
+                .await
+                .map_err(GlobalpingError::request(OPERATION))?;
             match measurement.status {
                 MeasurementStatus::InProgress => {
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -338,11 +428,16 @@ impl GlobalpingClient {
         struct Measurements {
             create: Limits,
         }
+        const OPERATION: &str = "read limits";
         let resp = self
             .request(self.http.get(format!("{}/v1/limits", self.base_url)))
             .send()
-            .await?;
-        let body: Body = Self::checked(resp, "read limits")?.json().await?;
+            .await
+            .map_err(GlobalpingError::request(OPERATION))?;
+        let body: Body = Self::checked(resp, OPERATION)?
+            .json()
+            .await
+            .map_err(GlobalpingError::request(OPERATION))?;
         Ok(body.rate_limit.measurements.create)
     }
 }
@@ -385,9 +480,8 @@ mod tests {
     }
 
     /// The body of the single request the server received, parsed as JSON.
-    /// Asserting on parsed JSON (rather than a matcher in `Mock::given`)
-    /// avoids depending on a wiremock body-matching helper beyond the exact
-    /// ones this plan has confirmed exist (`method`, `path`).
+    /// Comparing parsed JSON checks the body's content and ignores the order
+    /// of its keys.
     async fn received_body(server: &MockServer) -> serde_json::Value {
         let requests = server
             .received_requests()
@@ -403,7 +497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_with_ru_locations_sends_the_expected_body_and_returns_the_id()
+    async fn a_ping_from_russian_probes_names_both_probe_groups_and_returns_the_id()
      {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -423,20 +517,22 @@ mod tests {
 
         assert_eq!(id.as_str(), "meas-1");
         let body = received_body(&server).await;
-        assert_eq!(body["type"], "ping");
-        assert_eq!(body["target"], "192.0.2.1");
         assert_eq!(
-            body["locations"],
-            serde_json::json!([
-                {"country": "RU", "tags": ["eyeball-network"], "limit": 8},
-                {"country": "RU", "tags": ["datacenter-network"], "limit": 4}
-            ])
+            body,
+            serde_json::json!({
+                "type": "ping",
+                "target": "192.0.2.1",
+                "locations": [
+                    {"country": "RU", "tags": ["eyeball-network"], "limit": 8},
+                    {"country": "RU", "tags": ["datacenter-network"], "limit": 4}
+                ],
+                "measurementOptions": {"packets": 10}
+            })
         );
-        assert_eq!(body["measurementOptions"]["packets"], 10);
     }
 
     #[tokio::test]
-    async fn create_reusing_a_previous_measurement_sends_a_bare_id_string() {
+    async fn a_measurement_on_earlier_probes_sends_their_id_as_a_bare_string() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/measurements"))
@@ -464,7 +560,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_https_sends_the_expected_measurement_options() {
+    async fn an_https_measurement_asks_for_get_slash_over_https_on_the_port() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/measurements"))
@@ -645,7 +741,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_server_error_from_limits_is_an_http_error() {
+    async fn a_server_error_while_reading_limits_keeps_its_status() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/limits"))
@@ -656,11 +752,20 @@ mod tests {
 
         let err = sut.limits().await.unwrap_err();
 
-        assert!(matches!(err, GlobalpingError::Http(_)), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                GlobalpingError::Status {
+                    operation: "read limits",
+                    status: StatusCode::INTERNAL_SERVER_ERROR
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
-    async fn limits_reads_the_nested_rate_limit_shape() {
+    async fn the_quota_is_read_from_the_nested_rate_limit_shape() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/limits"))
@@ -717,23 +822,32 @@ mod tests {
         };
 
         let error = sut.limits().await.unwrap_err();
+
         let displayed = error.to_string();
         let debugged = format!("{error:?}");
-
         assert!(!displayed.contains("SECRET123"), "{displayed}");
         assert!(!debugged.contains("SECRET123"), "{debugged}");
     }
+
     #[tokio::test]
     async fn a_finished_response_arriving_after_the_deadline_is_rejected() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"id": "slow", "status": "finished", "results": []}))
-                .set_delay(Duration::from_millis(300)))
-            .mount(&server).await;
-        let result = client_against(&server)
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!(
+                        {"id": "slow", "status": "finished", "results": []}
+                    ))
+                    .set_delay(Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+        let sut = client_against(&server);
+
+        let result = sut
             .poll_ping(&measurement_id("slow"), Duration::from_millis(50))
             .await;
+
         assert!(matches!(result, Err(GlobalpingError::Timeout(_))));
     }
 }
