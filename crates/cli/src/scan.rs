@@ -58,7 +58,9 @@ use ipnet::Ipv4Net;
 use itertools::{Either, Itertools as _};
 
 use crate::config::{NeighborSweep, ScanCommand, SshAccess, SshSettings};
-use crate::{CITY_ANCHORS, GLOBALPING_DEADLINE, REQUEST_TIMEOUT};
+use crate::net::{
+    CITY_ANCHORS, GLOBALPING_DEADLINE, REQUEST_TIMEOUT, http_client,
+};
 
 /// Shared collector for phase B. Every async producer records its rows here
 /// as soon as they are known and returns nothing, so what was measured
@@ -137,11 +139,11 @@ pub fn network_24(ip: Ipv4Addr) -> Ipv4Net {
 /// Globalping measurements one scan runs on every probe, which the quota
 /// check multiplies by the probe count.
 const SCAN_MEASUREMENTS_PER_PROBE: u32 = {
-    /// The candidate ping, which also picks the probes the rest reuse.
+    // The candidate ping, which also picks the probes the rest reuse.
     const CANDIDATE_PING: u32 = 1;
-    /// One ping per city anchor, at most [`CITY_ANCHORS`].
+    // One ping per city anchor, one per `CITY_ANCHORS`.
     const CITY_ANCHOR_PINGS: u32 = 3;
-    /// HTTPS to the candidate's listener and to the control anchor.
+    // HTTPS to the candidate's listener and to the control anchor.
     const REACH_MEASUREMENTS: u32 = 2;
     assert!(CITY_ANCHOR_PINGS as usize == CITY_ANCHORS.get());
     CANDIDATE_PING + CITY_ANCHOR_PINGS + REACH_MEASUREMENTS
@@ -1182,7 +1184,7 @@ pub async fn run_phase_b(
     fields(candidate_ip = %command.ip(), country = %command.country())
 )]
 pub async fn run_scan(command: &ScanCommand) -> Report {
-    let http = match crate::http_client() {
+    let http = match http_client() {
         Ok(client) => client,
         Err(error) => {
             return Report {
