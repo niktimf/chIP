@@ -7,7 +7,7 @@ pub use model::{
 };
 
 pub mod report;
-pub use report::Report;
+pub use report::{Report, ScanOutcome};
 
 pub mod gate;
 pub use gate::{GateId, GateOverrides};

@@ -56,6 +56,18 @@ fn markdown_cell(value: &str) -> String {
     escaped
 }
 
+/// How a whole scan ended, the verdict a pipeline acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanOutcome {
+    /// Nothing failed and every gate reached a verdict; warnings and skipped
+    /// gates do not change that.
+    Passed,
+    /// At least one gate failed.
+    Failed,
+    /// Nothing failed, but at least one gate could not reach a verdict.
+    Undetermined,
+}
+
 /// Every gate's result for one scan, ready to render.
 #[derive(Debug)]
 pub struct Report {
@@ -63,15 +75,13 @@ pub struct Report {
 }
 
 impl Report {
-    /// `0` no FAIL; `1` at least one FAIL; `2` no FAIL but at least one ERROR.
-    /// This order is fixed by the Global Constraints — a FAIL always wins.
-    pub fn exit_code(&self) -> i32 {
-        if self.results.iter().any(|r| r.severity() == Severity::Fail) {
-            1
-        } else if self.results.iter().any(|r| r.severity() == Severity::Error) {
-            2
-        } else {
-            0
+    /// A FAIL always wins over an ERROR: this order is fixed by the Global
+    /// Constraints.
+    pub fn outcome(&self) -> ScanOutcome {
+        match self.overall() {
+            Severity::Ok | Severity::Warn => ScanOutcome::Passed,
+            Severity::Error => ScanOutcome::Undetermined,
+            Severity::Fail => ScanOutcome::Failed,
         }
     }
 
@@ -181,12 +191,12 @@ mod tests {
     }
 
     #[test]
-    fn a_skipped_gate_does_not_change_the_exit_code() {
+    fn a_skipped_gate_does_not_change_the_outcome() {
         let sut = skipped_reach_and_ok_geo();
 
-        let exit_code = sut.exit_code();
+        let outcome = sut.outcome();
 
-        assert_eq!(exit_code, 0);
+        assert_eq!(outcome, ScanOutcome::Passed);
     }
 
     #[test]
@@ -204,26 +214,30 @@ mod tests {
             cr(GEO, Verdict::ok("RU 90%")),
             cr(NEIGHBORS, Verdict::warn("noisy")),
         ],
-        0
+        ScanOutcome::Passed
     )]
+    #[case::an_empty_report(vec![], ScanOutcome::Passed)]
     #[case::a_failure_wins_over_an_error(
         vec![
             cr(REPUTATION, Verdict::fail("vpn")),
             cr(GEO, Verdict::error("no sources answered")),
         ],
-        1
+        ScanOutcome::Failed
     )]
     #[case::nothing_failed_but_something_could_not_be_judged(
-        vec![cr(LATENCY, Verdict::error("fewer than 6 valid probes"))],
-        2
+        vec![
+            cr(GEO, Verdict::ok("RU 90%")),
+            cr(LATENCY, Verdict::error("fewer than 6 valid probes")),
+        ],
+        ScanOutcome::Undetermined
     )]
-    fn the_exit_code_follows_the_worst_result(
+    fn the_outcome_follows_the_worst_result(
         #[case] results: Vec<CheckResult>,
-        #[case] expected: i32,
+        #[case] expected: ScanOutcome,
     ) {
         let sut = Report { results };
 
-        let actual = sut.exit_code();
+        let actual = sut.outcome();
 
         assert_eq!(actual, expected);
     }

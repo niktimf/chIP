@@ -1205,7 +1205,7 @@ pub async fn run_scan(command: &ScanCommand) -> Report {
 mod tests {
     use std::collections::HashSet;
 
-    use chip_core::Severity;
+    use chip_core::{ScanOutcome, Severity};
 
     use super::*;
     use crate::config::FailurePolicy;
@@ -1328,7 +1328,7 @@ mod tests {
 
         let table = sut.table();
 
-        assert_eq!(sut.exit_code(), 0);
+        assert_eq!(sut.outcome(), ScanOutcome::Passed);
         assert_eq!(sut.results.len(), gate::ssh_gates().count());
         assert!(sut.results.iter().all(CheckResult::is_skipped), "{table}");
         assert!(!table.contains("OK "), "{table}");
@@ -1438,9 +1438,9 @@ mod tests {
             ),
         };
 
-        let code = sut.exit_code();
+        let outcome = sut.outcome();
 
-        assert_eq!(code, 0);
+        assert_eq!(outcome, ScanOutcome::Passed);
     }
 
     #[test]
@@ -1465,8 +1465,8 @@ mod tests {
             ),
         };
 
-        let code = sut.exit_code();
+        let outcome = sut.outcome();
 
-        assert_eq!(code, 1);
+        assert_eq!(outcome, ScanOutcome::Failed);
     }
 }

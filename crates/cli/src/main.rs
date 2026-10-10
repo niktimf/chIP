@@ -5,6 +5,7 @@ mod scan;
 use std::io::Write as _;
 use std::process::ExitCode;
 
+use chip_core::{Report, ScanOutcome};
 use clap::Parser as _;
 use config::{Cli, Command};
 use tokio::io::AsyncWriteExt as _;
@@ -69,7 +70,7 @@ fn print_error(message: std::fmt::Arguments<'_>) {
 
 /// Appends the Markdown report to the GitHub Actions step summary, if the
 /// run has one. A failure only warns: the report is already on stdout.
-async fn append_step_summary(report: &chip_core::Report) {
+async fn append_step_summary(report: &Report) {
     let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") else {
         return;
     };
@@ -89,6 +90,32 @@ async fn append_step_summary(report: &chip_core::Report) {
     }
 }
 
+/// The exit code of a finished scan. The JSON report's `exit_code` carries
+/// the same number, and pipelines depend on both: `0` passed, `1` failed,
+/// `2` undetermined.
+const fn scan_exit_code(outcome: ScanOutcome) -> u8 {
+    match outcome {
+        ScanOutcome::Passed => 0,
+        ScanOutcome::Failed => 1,
+        ScanOutcome::Undetermined => 2,
+    }
+}
+
+/// The `--json` report, schema 1.
+fn json_report(report: &Report) -> serde_json::Value {
+    serde_json::json!({
+        "schema": 1,
+        "overall": report.overall().to_string(),
+        "exit_code": scan_exit_code(report.outcome()),
+        "results": report.results.iter().map(|result| serde_json::json!({
+            "gate": result.gate().as_str(),
+            "severity": result.severity().to_string(),
+            "skipped": result.is_skipped(),
+            "detail": result.detail(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
 async fn run_scan_command(command: config::ScanCommand) -> ExitCode {
     let report = scan::run_scan(&command).await;
     if let Err(code) = print_output(&report.table()) {
@@ -96,18 +123,7 @@ async fn run_scan_command(command: config::ScanCommand) -> ExitCode {
     }
 
     if let Some(path) = command.json_path() {
-        let document = serde_json::json!({
-            "schema": 1,
-            "overall": report.overall().to_string(),
-            "exit_code": report.exit_code(),
-            "results": report.results.iter().map(|result| serde_json::json!({
-                "gate": result.gate().as_str(),
-                "severity": result.severity().to_string(),
-                "skipped": result.is_skipped(),
-                "detail": result.detail(),
-            })).collect::<Vec<_>>(),
-        });
-        let encoded = match serde_json::to_vec_pretty(&document) {
+        let encoded = match serde_json::to_vec_pretty(&json_report(&report)) {
             Ok(encoded) => encoded,
             Err(error) => {
                 print_error(format_args!(
@@ -127,7 +143,7 @@ async fn run_scan_command(command: config::ScanCommand) -> ExitCode {
 
     append_step_summary(&report).await;
 
-    ExitCode::from(u8::try_from(report.exit_code()).unwrap_or(2))
+    ExitCode::from(scan_exit_code(report.outcome()))
 }
 
 async fn run_calibrate_command(command: &config::CalibrateCommand) -> ExitCode {
@@ -138,5 +154,43 @@ async fn run_calibrate_command(command: &config::CalibrateCommand) -> ExitCode {
             print_error(format_args!("error: {error:#}"));
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chip_core::gate::{GEO, LATENCY, REACH, REPUTATION};
+    use chip_core::{CheckResult, Verdict};
+
+    use super::*;
+
+    #[rstest::rstest]
+    #[case::a_warning_and_a_skipped_gate_pass(
+        vec![
+            CheckResult::new(GEO, Verdict::warn("RU 60%")),
+            CheckResult::skipped(REACH, "ports are already in use"),
+        ],
+        0
+    )]
+    #[case::a_failure_fails(
+        vec![
+            CheckResult::new(REPUTATION, Verdict::fail("vpn")),
+            CheckResult::new(LATENCY, Verdict::error("no probes")),
+        ],
+        1
+    )]
+    #[case::an_error_without_a_failure_is_undetermined(
+        vec![CheckResult::new(LATENCY, Verdict::error("no probes"))],
+        2
+    )]
+    fn the_json_report_carries_the_exit_code_pipelines_rely_on(
+        #[case] results: Vec<CheckResult>,
+        #[case] expected: u64,
+    ) {
+        let report = Report { results };
+
+        let document = json_report(&report);
+
+        assert_eq!(document["exit_code"].as_u64(), Some(expected));
     }
 }
