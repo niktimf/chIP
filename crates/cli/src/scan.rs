@@ -143,11 +143,8 @@ const SCAN_MEASUREMENTS_PER_PROBE: u32 = {
     const CITY_ANCHOR_PINGS: u32 = 3;
     /// HTTPS to the candidate's listener and to the control anchor.
     const REACH_MEASUREMENTS: u32 = 2;
-    /// Kept in reserve above the measurements listed: the quota check asks
-    /// for an approximate budget.
-    const SPARE: u32 = 1;
     assert!(CITY_ANCHOR_PINGS as usize == CITY_ANCHORS.get());
-    CANDIDATE_PING + CITY_ANCHOR_PINGS + REACH_MEASUREMENTS + SPARE
+    CANDIDATE_PING + CITY_ANCHOR_PINGS + REACH_MEASUREMENTS
 };
 
 pub fn pick_free_port() -> std::io::Result<NonZeroU16> {
@@ -1397,12 +1394,12 @@ mod tests {
     }
 
     #[test]
-    fn a_full_scan_of_8_eyeball_and_4_datacenter_probes_needs_84_tests() {
+    fn a_full_scan_of_8_eyeball_and_4_datacenter_probes_needs_72_tests() {
         let probes = ProbeSelection::new(8, 4).unwrap();
 
         let budget = probes.tests_for(SCAN_MEASUREMENTS_PER_PROBE);
 
-        assert_eq!(budget, 84);
+        assert_eq!(budget, 72);
     }
 
     #[test]

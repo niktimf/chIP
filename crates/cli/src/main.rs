@@ -39,10 +39,19 @@ async fn main() -> ExitCode {
             2
         }
         Err(error) => {
-            print_error(format_args!(
-                "error: {}",
-                chip_io::describe_error(&error)
-            ));
+            let detail = chip_io::describe_error(&error);
+            // The same remedy a scan row names after a rate-limit cause.
+            let hint = match &error {
+                CliError::Calibrate(cause) => {
+                    scan::globalping_rate_limit_hint(cause)
+                }
+                _ => None,
+            };
+            let message = match hint {
+                Some(hint) => format!("{detail} ({hint})"),
+                None => detail,
+            };
+            print_error(format_args!("error: {message}"));
             2
         }
     };

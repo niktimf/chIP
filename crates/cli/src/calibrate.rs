@@ -13,7 +13,6 @@ use chip_io::globalping::{
 use futures::{StreamExt as _, TryStreamExt as _, stream};
 
 use crate::config::{CalibrateCommand, CalibrationTarget};
-use crate::scan::globalping_rate_limit_hint;
 use crate::{CITY_ANCHORS, GLOBALPING_DEADLINE};
 
 #[derive(Debug, Clone)]
@@ -221,10 +220,6 @@ pub async fn run_calibrate(
     )
     .try_collect()
     .await
-    .map_err(|error| match globalping_rate_limit_hint(&error) {
-        Some(hint) => error.context(hint),
-        None => error,
-    })
 }
 
 #[cfg(test)]
