@@ -318,16 +318,12 @@ impl PingSample {
         loss_pct: Option<f64>,
     ) -> Result<Self, InvalidPingSample> {
         if !rtt_ms.is_finite() || rtt_ms < 0.0 {
-            return Err(InvalidPingSample(
-                "RTT must be finite and non-negative",
-            ));
+            return Err(InvalidPingSample::Rtt(rtt_ms));
         }
-        if loss_pct.is_some_and(|loss| {
-            !loss.is_finite() || !(0.0..=100.0).contains(&loss)
-        }) {
-            return Err(InvalidPingSample(
-                "loss must be finite and between 0 and 100 percent",
-            ));
+        if let Some(loss) = loss_pct
+            && (!loss.is_finite() || !(0.0..=100.0).contains(&loss))
+        {
+            return Err(InvalidPingSample::Loss(loss));
         }
         Ok(Self { rtt_ms, loss_pct })
     }
@@ -341,9 +337,20 @@ impl PingSample {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("invalid ping sample: {0}")]
-pub struct InvalidPingSample(&'static str);
+/// Which part of a ping measurement is out of range, with the rejected
+/// value.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+pub enum InvalidPingSample {
+    #[error(
+        "invalid ping sample: RTT must be finite and non-negative, got {0}"
+    )]
+    Rtt(f64),
+    #[error(
+        "invalid ping sample: loss must be finite and between 0 and 100 \
+         percent, got {0}"
+    )]
+    Loss(f64),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
@@ -916,18 +923,26 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::nan_rtt(f64::NAN, Some(0.0), "RTT")]
-    #[case::negative_rtt(-1.0, Some(0.0), "RTT")]
-    #[case::excessive_loss(10.0, Some(101.0), "loss")]
-    #[case::nan_loss(10.0, Some(f64::NAN), "loss")]
-    fn invalid_ping_measurements_are_rejected(
+    #[case::nan_rtt(f64::NAN, Some(0.0))]
+    #[case::infinite_rtt(f64::INFINITY, Some(0.0))]
+    #[case::negative_rtt(-1.0, Some(0.0))]
+    fn a_ping_with_an_unusable_rtt_is_rejected(
         #[case] rtt_ms: f64,
         #[case] loss_pct: Option<f64>,
-        #[case] expected_detail: &str,
     ) {
         let error = PingSample::new(rtt_ms, loss_pct).unwrap_err();
 
-        assert!(error.to_string().contains(expected_detail), "{error}");
+        assert!(matches!(error, InvalidPingSample::Rtt(_)), "{error:?}");
+    }
+
+    #[rstest::rstest]
+    #[case::excessive_loss(Some(101.0))]
+    #[case::negative_loss(Some(-1.0))]
+    #[case::nan_loss(Some(f64::NAN))]
+    fn a_ping_with_an_unusable_loss_is_rejected(#[case] loss_pct: Option<f64>) {
+        let error = PingSample::new(10.0, loss_pct).unwrap_err();
+
+        assert!(matches!(error, InvalidPingSample::Loss(_)), "{error:?}");
     }
 
     #[test]

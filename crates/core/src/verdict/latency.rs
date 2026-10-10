@@ -12,7 +12,7 @@ const MIN_VALID_PROBES: usize = 6;
 /// evidence the candidate is not actually in its declared city.
 const SUSPICIOUSLY_NEGATIVE_MS: f64 = -5.0;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LatencyThresholds {
     max_excess_ms: f64,
     max_loss_delta_pct: f64,
@@ -28,13 +28,11 @@ impl LatencyThresholds {
         max_loss_delta_pct: f64,
     ) -> Result<Self, InvalidLatencyThresholds> {
         if !max_excess_ms.is_finite() || max_excess_ms <= 0.0 {
-            return Err(InvalidLatencyThresholds(
-                "maximum RTT excess must be finite and positive",
-            ));
+            return Err(InvalidLatencyThresholds::MaxExcess(max_excess_ms));
         }
         if !max_loss_delta_pct.is_finite() || max_loss_delta_pct < 0.0 {
-            return Err(InvalidLatencyThresholds(
-                "maximum loss delta must be finite and non-negative",
+            return Err(InvalidLatencyThresholds::MaxLossDelta(
+                max_loss_delta_pct,
             ));
         }
         Ok(Self {
@@ -44,14 +42,25 @@ impl LatencyThresholds {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("invalid latency thresholds: {0}")]
-pub struct InvalidLatencyThresholds(&'static str);
+/// Which latency threshold is out of range, with the rejected value.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+pub enum InvalidLatencyThresholds {
+    #[error(
+        "invalid latency thresholds: maximum RTT excess must be finite and \
+         positive, got {0}"
+    )]
+    MaxExcess(f64),
+    #[error(
+        "invalid latency thresholds: maximum loss delta must be finite and \
+         non-negative, got {0}"
+    )]
+    MaxLossDelta(f64),
+}
 
 /// The raw numbers behind a latency verdict — what `cli::calibrate`
 /// prints to help choose `LatencyThresholds`, and what `judge_latency` itself
 /// is built on, so the two can never disagree.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LatencySummary {
     pub median_excess_ms: f64,
     pub p75_excess_ms: f64,
@@ -302,17 +311,33 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::non_finite_excess(f64::NAN, 2.0, "RTT excess")]
-    #[case::negative_loss(14.0, -1.0, "loss delta")]
-    fn invalid_thresholds_cannot_enter_the_domain(
+    #[case::non_finite(f64::NAN)]
+    #[case::zero(0.0)]
+    #[case::negative(-1.0)]
+    fn an_unusable_rtt_excess_threshold_is_rejected(
         #[case] max_excess_ms: f64,
-        #[case] max_loss_delta_pct: f64,
-        #[case] expected_detail: &str,
     ) {
-        let error = LatencyThresholds::new(max_excess_ms, max_loss_delta_pct)
-            .expect_err("invalid thresholds must be rejected");
+        let error = LatencyThresholds::new(max_excess_ms, 2.0).unwrap_err();
 
-        assert!(error.to_string().contains(expected_detail), "{error}");
+        assert!(
+            matches!(error, InvalidLatencyThresholds::MaxExcess(_)),
+            "{error:?}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::non_finite(f64::INFINITY)]
+    #[case::negative(-1.0)]
+    fn an_unusable_loss_delta_threshold_is_rejected(
+        #[case] max_loss_delta_pct: f64,
+    ) {
+        let error =
+            LatencyThresholds::new(14.0, max_loss_delta_pct).unwrap_err();
+
+        assert!(
+            matches!(error, InvalidLatencyThresholds::MaxLossDelta(_)),
+            "{error:?}"
+        );
     }
 
     /// Reconstructs the FI-1-vs-Helsinki-anchors row of the 2026-09-15
@@ -410,8 +435,7 @@ mod tests {
             vec![anchor("only", &[20.0; 8])],
         );
 
-        let error = summarize_latency(&sut)
-            .expect_err("summary must reject insufficient samples");
+        let error = summarize_latency(&sut).unwrap_err();
 
         assert_eq!(
             error,
@@ -427,8 +451,7 @@ mod tests {
     fn missing_anchors_has_a_matchable_error_variant() {
         let sut = facts(samples(&[20.0], 0.0), vec![]);
 
-        let error = summarize_latency(&sut)
-            .expect_err("summary must reject an empty anchor set");
+        let error = summarize_latency(&sut).unwrap_err();
 
         assert_eq!(error, LatencySummaryError::NoUsableAnchors);
     }

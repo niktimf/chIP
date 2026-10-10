@@ -278,40 +278,53 @@ mod tests {
         assert_eq!(ids.len(), GATES.len());
     }
 
+    /// Every gate measured through the SOCKS tunnel, listed by hand so the
+    /// tests compare the registry against an independent expectation.
+    const TUNNEL: [GateId; 16] = [
+        TAMPERING,
+        SERVICE_CHATGPT_WEB,
+        SERVICE_CHATGPT_APP,
+        SERVICE_GEMINI,
+        SERVICE_YOUTUBE_PREMIUM,
+        SERVICE_NETFLIX,
+        SERVICE_CLAUDE,
+        SERVICE_TIKTOK,
+        SERVICE_NOTEBOOKLM,
+        SERVICE_GEO,
+        SERVICE_GEO_CAPTCHA,
+        SERVICE_GEO_CDN,
+        AI_OPENAI,
+        AI_ANTHROPIC,
+        AI_GEMINI,
+        AI_DEEPSEEK,
+    ];
+
     #[test]
     fn the_tunnel_set_is_every_service_ai_and_service_geo_gate_plus_tampering()
     {
-        let tunnel: Vec<&str> = tunnel_gates().map(GateId::as_str).collect();
+        let tunnel: HashSet<GateId> = tunnel_gates().collect();
 
-        assert_eq!(tunnel.len(), 16, "{tunnel:?}");
-        assert!(
-            tunnel.iter().all(|id| {
-                *id == "tampering"
-                    || id.starts_with("service:")
-                    || id.starts_with("service-geo")
-                    || id.starts_with("ai:")
-            }),
-            "{tunnel:?}"
-        );
+        assert_eq!(tunnel, HashSet::from(TUNNEL));
     }
 
     #[test]
     fn the_ssh_set_is_reach_steal_and_the_tunnel_gates() {
         let ssh: HashSet<GateId> = ssh_gates().collect();
-        let mut expected: HashSet<GateId> = tunnel_gates().collect();
-        expected.insert(REACH);
-        expected.insert(STEAL);
 
+        let expected: HashSet<GateId> =
+            [REACH, STEAL].into_iter().chain(TUNNEL).collect();
         assert_eq!(ssh, expected);
     }
 
     #[test]
     fn phase_b_covers_every_measurement_that_is_not_phase_a() {
         let phase_b: HashSet<GateId> = phase_b_gates().collect();
-        let expected: HashSet<GateId> = scan_gates()
-            .filter(|gate| gate.channel() != Channel::Direct)
-            .collect();
 
+        let expected: HashSet<GateId> =
+            [LATENCY, REACH, STEAL, NEIGHBORS_PTR, NEIGHBORS]
+                .into_iter()
+                .chain(TUNNEL)
+                .collect();
         assert_eq!(phase_b, expected);
     }
 

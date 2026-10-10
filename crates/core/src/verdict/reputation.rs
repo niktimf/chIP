@@ -83,21 +83,34 @@ mod tests {
         assert_eq!(judge_reputation(&sut).severity, Severity::Fail);
     }
 
+    fn named_operator() -> ReputationFacts {
+        ReputationFacts {
+            operator: Some("Snowd".into()),
+            ..clean()
+        }
+    }
+
     /// The operator is judged apart from the detection flags so an operator
     /// this rotation accepts can be waved through with
     /// `--skip-gate reputation:operator` without also disabling the vpn,
     /// proxy and tor checks.
     #[test]
-    fn a_named_operator_fails_its_own_gate_and_not_the_flag_gate() {
-        let sut = ReputationFacts {
-            operator: Some("Snowd".into()),
-            ..clean()
-        };
+    fn a_named_operator_does_not_fail_the_flag_gate() {
+        let sut = named_operator();
 
-        assert_eq!(judge_reputation(&sut).severity, Severity::Ok);
-        let operator = judge_reputation_operator(&sut);
-        assert_eq!(operator.severity, Severity::Fail);
-        assert_eq!(operator.detail, "named VPN operator: Snowd");
+        let verdict = judge_reputation(&sut);
+
+        assert_eq!(verdict.severity, Severity::Ok);
+    }
+
+    #[test]
+    fn a_named_operator_fails_the_operator_gate() {
+        let sut = named_operator();
+
+        let verdict = judge_reputation_operator(&sut);
+
+        assert_eq!(verdict.severity, Severity::Fail);
+        assert_eq!(verdict.detail, "named VPN operator: Snowd");
     }
 
     #[test]

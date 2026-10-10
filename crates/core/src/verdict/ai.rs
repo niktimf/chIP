@@ -73,7 +73,7 @@ mod tests {
     const AUTH_STATUSES: &[StatusCode] = &[StatusCode::UNAUTHORIZED];
 
     #[test]
-    fn an_unrecognized_api_response_is_a_warning() {
+    fn an_unrecognized_api_response_cannot_be_classified() {
         let state = classify_ai_endpoint(
             StatusCode::INTERNAL_SERVER_ERROR,
             "server error",
@@ -81,8 +81,7 @@ mod tests {
             AUTH_STATUSES,
         );
 
-        assert!(matches!(state, ServiceState::Error(_)));
-        assert_eq!(judge_ai_endpoint(&state).severity, Severity::Warn);
+        assert!(matches!(state, ServiceState::Error(_)), "{state:?}");
     }
 
     #[rstest::rstest]
@@ -110,6 +109,10 @@ mod tests {
     #[case::reachable(ServiceState::Available, Severity::Ok)]
     #[case::a_block_only_warns_never_fails(
         ServiceState::Blocked,
+        Severity::Warn
+    )]
+    #[case::an_unclassified_response_only_warns(
+        ServiceState::Error("unexpected HTTP 500".into()),
         Severity::Warn
     )]
     #[case::unreachable_is_an_error(

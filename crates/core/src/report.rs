@@ -144,37 +144,58 @@ mod tests {
         CheckResult::new(gate, v)
     }
 
+    fn skipped_reach() -> CheckResult {
+        CheckResult::skipped(REACH, "ports 443 and 8443 are already in use")
+    }
+
     #[test]
-    fn a_skipped_gate_is_shown_as_skip_in_both_renderings() {
+    fn a_skipped_gate_is_shown_as_skip_in_the_table() {
         let sut = Report {
-            results: vec![CheckResult::skipped(
-                REACH,
-                "ports 443 and 8443 are already in use",
-            )],
+            results: vec![skipped_reach()],
         };
 
         let table = sut.table();
-        let markdown = sut.markdown();
 
         assert!(table.starts_with("SKIP "), "{table}");
         assert!(
             table.contains("ports 443 and 8443 are already in use"),
             "{table}"
         );
-        assert!(markdown.contains("| SKIP | reach |"), "{markdown}");
     }
 
     #[test]
-    fn a_skipped_gate_does_not_change_the_exit_code_or_the_overall_severity() {
+    fn a_skipped_gate_is_shown_as_skip_in_markdown() {
         let sut = Report {
-            results: vec![
-                CheckResult::skipped(REACH, "ports are already in use"),
-                cr(GEO, Verdict::ok("7/7 say FI")),
-            ],
+            results: vec![skipped_reach()],
         };
 
-        assert_eq!(sut.exit_code(), 0);
-        assert_eq!(sut.overall(), Severity::Ok);
+        let markdown = sut.markdown();
+
+        assert!(markdown.contains("| SKIP | reach |"), "{markdown}");
+    }
+
+    fn skipped_reach_and_ok_geo() -> Report {
+        Report {
+            results: vec![skipped_reach(), cr(GEO, Verdict::ok("7/7 say FI"))],
+        }
+    }
+
+    #[test]
+    fn a_skipped_gate_does_not_change_the_exit_code() {
+        let sut = skipped_reach_and_ok_geo();
+
+        let exit_code = sut.exit_code();
+
+        assert_eq!(exit_code, 0);
+    }
+
+    #[test]
+    fn a_skipped_gate_does_not_change_the_overall_severity() {
+        let sut = skipped_reach_and_ok_geo();
+
+        let overall = sut.overall();
+
+        assert_eq!(overall, Severity::Ok);
     }
 
     #[rstest::rstest]

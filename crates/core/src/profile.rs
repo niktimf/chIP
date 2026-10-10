@@ -83,7 +83,7 @@ impl ScanProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gate::{LATENCY, SERVICE_NETFLIX, TAMPERING};
+    use crate::gate::{GATES, LATENCY, SERVICE_NETFLIX, TAMPERING};
     use crate::model::{Severity, Verdict};
 
     fn gate(id: &str) -> GateId {
@@ -134,7 +134,15 @@ mod tests {
 
     #[test]
     fn an_exit_judges_every_gate() {
-        assert!(ScanProfile::Exit.judges(LATENCY));
+        let sut = ScanProfile::Exit;
+
+        let skipped: Vec<GateId> = GATES
+            .iter()
+            .map(|spec| spec.id)
+            .filter(|&gate| !sut.judges(gate))
+            .collect();
+
+        assert_eq!(skipped, Vec::<GateId>::new());
     }
 
     #[test]
