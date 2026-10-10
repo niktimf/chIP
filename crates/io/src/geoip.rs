@@ -1,61 +1,109 @@
-use chip_core::model::{CountryCode, GeoConsensusFacts};
+use chip_core::checks::direct::geo::{GeoConsensusFacts, GeoVote};
+use chip_core::values::{CountryCode, InvalidCountryCode};
+
+use crate::error_chain::describe_error;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-pub struct GeoSource {
-    pub name: &'static str,
-    pub url: Box<dyn Fn(Ipv4Addr) -> String + Send + Sync>,
-    pub pointer: &'static str,
+/// One keyless `GeoIP` service: where to ask about an address and where
+/// the answer keeps the country code.
+#[derive(Debug)]
+struct GeoSource {
+    name: &'static str,
+    /// The request URL, with [`GeoSource::IP`] where the address goes.
+    url_template: String,
+    pointer: &'static str,
+}
+
+impl GeoSource {
+    const IP: &'static str = "{ip}";
+
+    fn new(
+        name: &'static str,
+        url_template: impl Into<String>,
+        pointer: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            url_template: url_template.into(),
+            pointer,
+        }
+    }
+
+    fn url(&self, ip: Ipv4Addr) -> String {
+        self.url_template.replace(Self::IP, &ip.to_string())
+    }
+}
+
+/// Why a source named no country. It goes to the log; the vote keeps only
+/// whether the source answered at all (see [`NoVote::vote`]).
+#[derive(Debug, thiserror::Error)]
+enum NoVote {
+    #[error("no answer within {0:?}")]
+    Timeout(Duration),
+    #[error("request failed")]
+    Request(#[source] reqwest::Error),
+    #[error("answered with HTTP {0}")]
+    Status(reqwest::StatusCode),
+    #[error("answer is not JSON")]
+    Body(#[source] reqwest::Error),
+    #[error("answer has no string at {0}")]
+    MissingField(&'static str),
+    #[error("answer has no country code")]
+    Country(#[source] InvalidCountryCode),
+}
+
+impl NoVote {
+    const fn vote(&self) -> GeoVote {
+        match self {
+            Self::Timeout(_)
+            | Self::Request(_)
+            | Self::Status(_)
+            | Self::Body(_) => GeoVote::NoAnswer,
+            Self::MissingField(_) | Self::Country(_) => GeoVote::NoCountryCode,
+        }
+    }
 }
 
 /// Delegates the registry check to `CountryCode::try_from` rather than
 /// re-implementing it: a source's free tier answering with a full name
 /// (`"Germany"`) or anything else that isn't a valid code is exactly the
-/// case that constructor already turns into `Err`, which becomes `None`
-/// here — one no-vote path, not two.
-fn extract(value: &serde_json::Value, pointer: &str) -> Option<CountryCode> {
-    CountryCode::try_from(value.pointer(pointer)?.as_str()?).ok()
+/// case that constructor already rejects.
+fn extract(
+    value: &serde_json::Value,
+    pointer: &'static str,
+) -> Result<CountryCode, NoVote> {
+    let raw = value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .ok_or(NoVote::MissingField(pointer))?;
+    CountryCode::try_from(raw).map_err(NoVote::Country)
 }
 
 fn default_sources() -> Vec<GeoSource> {
-    fn s(
-        name: &'static str,
-        url: impl Fn(Ipv4Addr) -> String + Send + Sync + 'static,
-        pointer: &'static str,
-    ) -> GeoSource {
-        GeoSource {
-            name,
-            url: Box::new(url),
-            pointer,
-        }
-    }
     vec![
-        s(
+        GeoSource::new(
             "ripe-rdap",
-            |ip| format!("https://rdap.db.ripe.net/ip/{ip}"),
+            "https://rdap.db.ripe.net/ip/{ip}",
             "/country",
         ),
-        s("ipinfo", |ip| format!("https://ipinfo.io/{ip}/json"), "/country"),
-        s(
-            "country.is",
-            |ip| format!("https://api.country.is/{ip}"),
-            "/country",
-        ),
-        s(
+        GeoSource::new("ipinfo", "https://ipinfo.io/{ip}/json", "/country"),
+        GeoSource::new("country.is", "https://api.country.is/{ip}", "/country"),
+        GeoSource::new(
             "geojs",
-            |ip| format!("https://get.geojs.io/v1/ip/country.json?ip={ip}"),
+            "https://get.geojs.io/v1/ip/country.json?ip={ip}",
             "/0/country",
         ),
-        s("ipwho", |ip| format!("https://ipwho.is/{ip}"), "/country_code"),
-        s("ipapi.co", |ip| format!("https://ipapi.co/{ip}/json/"), "/country"),
-        s(
+        GeoSource::new("ipwho", "https://ipwho.is/{ip}", "/country_code"),
+        GeoSource::new("ipapi.co", "https://ipapi.co/{ip}/json/", "/country"),
+        GeoSource::new(
             "ipquery",
-            |ip| format!("https://api.ipquery.io/{ip}"),
+            "https://api.ipquery.io/{ip}",
             "/location/country_code",
         ),
-        s(
+        GeoSource::new(
             "ipbase",
-            |ip| format!("https://api.ipbase.com/v2/info?ip={ip}"),
+            "https://api.ipbase.com/v2/info?ip={ip}",
             "/data/location/country/alpha2",
         ),
         // ipapi.is used to sit here. Its free tier answers `country` with a
@@ -65,6 +113,7 @@ fn default_sources() -> Vec<GeoSource> {
     ]
 }
 
+#[derive(Debug)]
 pub struct GeoIpClient {
     http: reqwest::Client,
     timeout: Duration,
@@ -93,52 +142,62 @@ impl GeoIpClient {
         }
     }
 
-    pub async fn consensus(
-        &self,
-        ip: Ipv4Addr,
-    ) -> Result<GeoConsensusFacts, tokio::task::JoinError> {
-        let mut tasks = tokio::task::JoinSet::new();
-        for (index, source) in self.sources.iter().enumerate() {
-            let http = self.http.clone();
-            let timeout = self.timeout;
-            let url = (source.url)(ip);
-            let pointer = source.pointer;
-            tasks.spawn(async move {
-                let vote = Self::query_one(&http, timeout, &url, pointer).await;
-                (index, vote)
-            });
+    /// Asks every source at once and returns their votes in source order.
+    /// A source that fails to answer is a missing vote, not an error.
+    pub async fn consensus(&self, ip: Ipv4Addr) -> GeoConsensusFacts {
+        let queries = self.sources.iter().map(|source| self.vote(source, ip));
+        GeoConsensusFacts {
+            votes: futures::future::join_all(queries).await,
         }
-        let mut votes = vec![None; self.sources.len()];
-        for (index, vote) in crate::tasks::collect(tasks).await? {
-            votes[index] = vote;
-        }
-        Ok(GeoConsensusFacts { votes })
+    }
+
+    async fn vote(&self, source: &GeoSource, ip: Ipv4Addr) -> GeoVote {
+        Self::query_one(
+            &self.http,
+            self.timeout,
+            &source.url(ip),
+            source.pointer,
+        )
+        .await
+        .map_or_else(
+            |error| {
+                tracing::debug!(
+                    source = source.name,
+                    error = %describe_error(&error),
+                    "geo source named no country"
+                );
+                error.vote()
+            },
+            GeoVote::Country,
+        )
     }
 
     async fn query_one(
         http: &reqwest::Client,
         timeout: Duration,
         url: &str,
-        pointer: &str,
-    ) -> Option<CountryCode> {
+        pointer: &'static str,
+    ) -> Result<CountryCode, NoVote> {
         tokio::time::timeout(timeout, async {
-            let response = http.get(url).send().await.ok()?;
-            if !response.status().is_success() {
-                return None;
+            let response =
+                http.get(url).send().await.map_err(NoVote::Request)?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(NoVote::Status(status));
             }
-            let value: serde_json::Value = response.json().await.ok()?;
+            let value: serde_json::Value =
+                response.json().await.map_err(NoVote::Body)?;
             extract(&value, pointer)
         })
         .await
-        .ok()
-        .flatten()
+        .unwrap_or(Err(NoVote::Timeout(timeout)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chip_core::model::CountryCode;
+    use chip_core::values::CountryCode;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -150,37 +209,44 @@ mod tests {
     #[case::a_plain_top_level_field(
         serde_json::json!({"country": "fi"}),
         "/country",
-        Some("FI")
+        "FI"
     )]
     #[case::an_array_index_then_an_object_key(
         serde_json::json!([{"country": "de"}]),
         "/0/country",
-        Some("DE")
+        "DE"
     )]
-    // ipapi.is's free tier answers with a full name, not a 2-letter code.
-    #[case::a_full_country_name_is_no_vote(
-        serde_json::json!({"country": "Germany"}),
-        "/country",
-        None
-    )]
-    #[case::a_missing_path(
-        serde_json::json!({"unrelated": "value"}),
-        "/country",
-        None
-    )]
-    fn extract_reads_the_country_code_at_the_pointer(
-        #[case] sut: serde_json::Value,
-        #[case] pointer: &str,
-        #[case] expected: Option<&str>,
+    fn a_vote_is_the_country_code_found_at_the_source_pointer(
+        #[case] answer: serde_json::Value,
+        #[case] pointer: &'static str,
+        #[case] expected: &str,
     ) {
-        let actual = extract(&sut, pointer);
+        let actual = extract(&answer, pointer).unwrap();
 
-        assert_eq!(actual, expected.map(cc));
+        assert_eq!(actual, cc(expected));
+    }
+
+    /// ipapi.is's free tier answers with a full name, not a 2-letter code.
+    #[test]
+    fn a_full_country_name_is_no_country_code() {
+        let answer = serde_json::json!({"country": "Germany"});
+
+        let error = extract(&answer, "/country").unwrap_err();
+
+        assert!(matches!(error, NoVote::Country(_)), "{error:?}");
+    }
+
+    #[test]
+    fn an_answer_without_the_pointer_names_the_missing_field() {
+        let answer = serde_json::json!({"unrelated": "value"});
+
+        let error = extract(&answer, "/country").unwrap_err();
+
+        assert!(matches!(error, NoVote::MissingField("/country")), "{error:?}");
     }
 
     #[tokio::test]
-    async fn consensus_keeps_going_after_one_source_fails_and_preserves_order()
-    {
+    async fn a_failing_source_casts_no_vote_and_the_others_keep_their_order() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/ok"))
@@ -196,22 +262,8 @@ mod tests {
             .mount(&server)
             .await;
         let sources = vec![
-            GeoSource {
-                name: "first",
-                url: {
-                    let base = server.uri();
-                    Box::new(move |_ip: Ipv4Addr| format!("{base}/ok"))
-                },
-                pointer: "/country",
-            },
-            GeoSource {
-                name: "second",
-                url: {
-                    let base = server.uri();
-                    Box::new(move |_ip: Ipv4Addr| format!("{base}/broken"))
-                },
-                pointer: "/country",
-            },
+            source_at("first", format!("{}/ok", server.uri())),
+            source_at("second", format!("{}/broken", server.uri())),
         ];
         let sut = GeoIpClient::with_sources(
             reqwest::Client::new(),
@@ -219,30 +271,69 @@ mod tests {
             sources,
         );
 
-        let facts =
-            sut.consensus("203.0.113.1".parse().unwrap()).await.unwrap();
+        let facts = sut.consensus("203.0.113.1".parse().unwrap()).await;
 
-        assert_eq!(facts.votes, vec![Some(cc("FI")), None]);
+        assert_eq!(
+            facts.votes,
+            [GeoVote::Country(cc("FI")), GeoVote::NoAnswer]
+        );
     }
+
     #[tokio::test]
-    async fn source_timeout_includes_reading_the_response_body() {
+    async fn a_full_country_name_counts_as_an_answer_without_a_country_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/name"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"country": "Germany"})),
+            )
+            .mount(&server)
+            .await;
+        let sut = GeoIpClient::with_sources(
+            reqwest::Client::new(),
+            std::time::Duration::from_secs(5),
+            vec![source_at("named", format!("{}/name", server.uri()))],
+        );
+
+        let facts = sut.consensus("203.0.113.1".parse().unwrap()).await;
+
+        assert_eq!(facts.votes, [GeoVote::NoCountryCode]);
+    }
+
+    fn source_at(name: &'static str, url: String) -> GeoSource {
+        GeoSource::new(name, url, "/country")
+    }
+
+    /// A server that sends the headers and the first byte of a 100-byte body,
+    /// then stalls until `release` fires.
+    async fn stalled_body_server()
+    -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
         let (release, hold) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(async move {
+        tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
-            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let _bytes_read = stream.read(&mut request).await.unwrap();
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
                 .await
                 .unwrap();
-            let _ = hold.await;
+            // A dropped sender ends the stall the same way a release does.
+            let _released = hold.await;
         });
+        (address, release)
+    }
+
+    #[tokio::test]
+    async fn source_timeout_includes_reading_the_response_body() {
+        let (address, _release) = stalled_body_server().await;
         let http = reqwest::Client::new();
+
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             GeoIpClient::query_one(
@@ -253,8 +344,7 @@ mod tests {
             ),
         )
         .await;
-        let _ = release.send(());
-        server.await.unwrap();
-        assert_eq!(result.unwrap(), None);
+
+        assert!(matches!(result, Ok(Err(NoVote::Timeout(_)))), "{result:?}");
     }
 }

@@ -1,5 +1,9 @@
 use crate::credentials::ProxycheckApiKey;
-use chip_core::model::{ReputationFacts, RiskScore};
+use chip_core::checks::direct::reputation::{
+    InvalidRiskScore, ReputationFacts, ReputationFlag, RiskScore,
+};
+use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use thiserror::Error;
 
@@ -9,10 +13,138 @@ pub enum ProxycheckError {
     QuotaExceeded,
     #[error("proxycheck.io error: {0}")]
     Api(String),
-    #[error(transparent)]
-    Reqwest(#[from] reqwest::Error),
+    #[error("proxycheck.io response has no entry for {ip}")]
+    MissingEntry { ip: Ipv4Addr },
+    #[error("proxycheck.io entry for {ip} does not match the v3 shape")]
+    MalformedEntry {
+        ip: Ipv4Addr,
+        source: serde_json::Error,
+    },
+    #[error("proxycheck.io entry for {ip} has an out-of-range risk score")]
+    RiskOutOfRange {
+        ip: Ipv4Addr,
+        source: InvalidRiskScore,
+    },
+    #[error("proxycheck.io answered {operation} with HTTP {status}")]
+    Status {
+        operation: &'static str,
+        status: reqwest::StatusCode,
+    },
+    #[error("proxycheck.io answer to {operation} is not a v3 JSON object")]
+    MalformedResponse {
+        operation: &'static str,
+        source: serde_json::Error,
+    },
+    /// Built only by `ProxycheckError::request`, which strips the URL:
+    /// the URL carries the API key.
+    #[error("proxycheck.io request failed: {operation}")]
+    Request {
+        operation: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
 }
 
+impl ProxycheckError {
+    /// Wraps a transport error of `operation` without its URL, which
+    /// carries the API key.
+    fn request(operation: &'static str) -> impl FnOnce(reqwest::Error) -> Self {
+        move |source| Self::Request {
+            operation,
+            source: source.without_url(),
+        }
+    }
+}
+
+/// The top level of a v3 answer: its status, an optional message and one
+/// entry per looked-up address, keyed by the address.
+#[derive(Deserialize)]
+struct RawAnswer {
+    status: Option<RawStatus>,
+    message: Option<String>,
+    #[serde(flatten)]
+    entries: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawStatus {
+    /// The daily query allowance is used up.
+    Denied,
+    Error,
+    /// `ok`, `warning` and any other status: the entries are read.
+    #[serde(other)]
+    Answered,
+}
+
+/// One address's entry in a v3 answer. The detection flags are required:
+/// an entry without them is a changed or broken response, and reading the
+/// gap as `false` would pass the address as clean.
+#[derive(Deserialize)]
+struct RawEntry {
+    detections: RawDetections,
+    operator: Option<RawOperator>,
+}
+
+#[derive(Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "mirrors the independent detection flags of the v3 wire format"
+)]
+struct RawDetections {
+    vpn: bool,
+    proxy: bool,
+    tor: bool,
+    compromised: bool,
+    anonymous: bool,
+    scraper: bool,
+    risk: Option<u64>,
+}
+
+impl RawDetections {
+    fn flags(&self) -> BTreeSet<ReputationFlag> {
+        [
+            (self.vpn, ReputationFlag::Vpn),
+            (self.proxy, ReputationFlag::Proxy),
+            (self.tor, ReputationFlag::Tor),
+            (self.compromised, ReputationFlag::Compromised),
+            (self.anonymous, ReputationFlag::Anonymous),
+            (self.scraper, ReputationFlag::Scraper),
+        ]
+        .into_iter()
+        .filter_map(|(raised, flag)| raised.then_some(flag))
+        .collect()
+    }
+}
+
+/// v3 answers with an object (`{"name": …, "url": …, "anonymity": …}`),
+/// not a bare string: reading it as a string silently dropped every
+/// operator proxycheck ever named.
+#[derive(Deserialize)]
+struct RawOperator {
+    name: Option<String>,
+}
+
+/// A risk above 100 is an error rather than "risk unknown": the rest of the
+/// entry is read strictly, and an unknown risk would hide a changed scale.
+impl TryFrom<RawEntry> for ReputationFacts {
+    type Error = InvalidRiskScore;
+
+    fn try_from(entry: RawEntry) -> Result<Self, Self::Error> {
+        let RawEntry {
+            detections,
+            operator,
+        } = entry;
+        let risk = detections.risk.map(RiskScore::try_from).transpose()?;
+        Ok(Self {
+            flags: detections.flags(),
+            risk,
+            operator: operator.and_then(|operator| operator.name),
+        })
+    }
+}
+
+#[derive(Debug)]
 pub struct ProxycheckClient {
     http: reqwest::Client,
     api_key: Option<ProxycheckApiKey>,
@@ -31,57 +163,67 @@ impl ProxycheckClient {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns `ProxycheckError` when the request fails, the API reports an
+    /// exhausted quota or another error, or the answer has no well-formed
+    /// entry for `ip`.
     pub async fn lookup(
         &self,
         ip: Ipv4Addr,
     ) -> Result<ReputationFacts, ProxycheckError> {
-        let ip_text = ip.to_string();
+        const OPERATION: &str = "address lookup";
         let url = format!("{}/v3/{ip}", self.base_url);
-        let mut request = self.http.get(&url);
-        if let Some(key) = &self.api_key {
-            request = request.query(&[("key", key.expose())]);
-        }
-        // reqwest errors print the URL, which carries the key: strip it.
-        let response =
-            request.send().await.map_err(reqwest::Error::without_url)?;
-        let body: serde_json::Value =
-            response.json().await.map_err(reqwest::Error::without_url)?;
-        match body["status"].as_str() {
-            Some("denied") => return Err(ProxycheckError::QuotaExceeded),
-            Some("error") => {
+        let request = self.http.get(&url);
+        let request = match &self.api_key {
+            Some(key) => request.query(&[("key", key.expose())]),
+            None => request,
+        };
+        let response = request
+            .send()
+            .await
+            .map_err(ProxycheckError::request(OPERATION))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(ProxycheckError::request(OPERATION))?;
+        // A refusal can come with a non-success status, so the body is read
+        // first and its own status decides when it names one.
+        let answer = serde_json::from_slice::<RawAnswer>(&body);
+        let mut answer = match (answer, status.is_success()) {
+            (Ok(answer), _) if answer.status == Some(RawStatus::Denied) => {
+                return Err(ProxycheckError::QuotaExceeded);
+            }
+            (Ok(answer), _) if answer.status == Some(RawStatus::Error) => {
                 return Err(ProxycheckError::Api(
-                    body["message"]
-                        .as_str()
-                        .unwrap_or("unknown error")
-                        .to_string(),
+                    answer
+                        .message
+                        .unwrap_or_else(|| "unknown error".to_string()),
                 ));
             }
-            _ => {}
-        }
-        if !body[&ip_text].is_object() {
-            return Err(ProxycheckError::Api(format!(
-                "no entry for {ip} in the response"
-            )));
-        }
-        let entry = &body[&ip_text];
-        let detections = &entry["detections"];
-        let get_bool =
-            |field: &str| detections[field].as_bool().unwrap_or(false);
-        Ok(ReputationFacts {
-            vpn: get_bool("vpn"),
-            proxy: get_bool("proxy"),
-            tor: get_bool("tor"),
-            compromised: get_bool("compromised"),
-            anonymous: get_bool("anonymous"),
-            scraper: get_bool("scraper"),
-            risk: detections["risk"]
-                .as_u64()
-                .and_then(|risk| RiskScore::try_from(risk).ok()),
-            // v3 answers with an object ({"name": …, "url": …, "anonymity":
-            // …}), not a bare string: reading it as a string silently
-            // dropped every operator proxycheck ever named.
-            operator: entry["operator"]["name"].as_str().map(str::to_string),
-        })
+            (_, false) => {
+                return Err(ProxycheckError::Status {
+                    operation: OPERATION,
+                    status,
+                });
+            }
+            (Ok(answer), true) => answer,
+            (Err(source), true) => {
+                return Err(ProxycheckError::MalformedResponse {
+                    operation: OPERATION,
+                    source,
+                });
+            }
+        };
+        let entry = answer
+            .entries
+            .remove(&ip.to_string())
+            .ok_or(ProxycheckError::MissingEntry { ip })?;
+        let entry = serde_json::from_value::<RawEntry>(entry)
+            .map_err(|source| ProxycheckError::MalformedEntry { ip, source })?;
+        ReputationFacts::try_from(entry)
+            .map_err(|source| ProxycheckError::RiskOutOfRange { ip, source })
     }
 }
 
@@ -151,13 +293,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_clean_hosting_address_parses_into_facts_with_no_hard_flags() {
+    async fn a_clean_hosting_address_has_no_flags_and_its_risk_score() {
         let server = MockServer::start().await;
         let sut = client_against(&server, "203.0.113.1", CLEAN_HOSTING).await;
 
         let facts = sut.lookup("203.0.113.1".parse().unwrap()).await.unwrap();
 
-        assert!(!facts.vpn && !facts.proxy && !facts.tor && !facts.compromised);
+        assert_eq!(facts.flags, BTreeSet::new());
         assert_eq!(facts.risk.map(RiskScore::value), Some(33));
         assert_eq!(facts.operator, None);
     }
@@ -169,7 +311,7 @@ mod tests {
 
         let facts = sut.lookup("203.0.113.2".parse().unwrap()).await.unwrap();
 
-        assert!(facts.vpn);
+        assert_eq!(facts.flags, BTreeSet::from([ReputationFlag::Vpn]));
         assert_eq!(facts.operator.as_deref(), Some("Snowd"));
     }
 
@@ -185,7 +327,7 @@ mod tests {
 
         let facts = sut.lookup("203.0.113.3".parse().unwrap()).await.unwrap();
 
-        assert!(!facts.vpn && !facts.proxy);
+        assert_eq!(facts.flags, BTreeSet::new());
         assert_eq!(facts.operator.as_deref(), Some("Snowd"));
     }
 
@@ -239,7 +381,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_response_without_an_entry_for_the_ip_is_an_api_error() {
+    async fn a_denied_status_with_a_failed_http_status_is_a_quota_exceeded_error()
+     {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/203.0.113.3"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_json(serde_json::json!({"status": "denied"})),
+            )
+            .mount(&server)
+            .await;
+        let sut = ProxycheckClient {
+            http: reqwest::Client::new(),
+            api_key: None,
+            base_url: server.uri(),
+        };
+
+        let err = sut
+            .lookup("203.0.113.3".parse().unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ProxycheckError::QuotaExceeded), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_http_status_without_a_v3_body_keeps_the_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/203.0.113.3"))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_string("<html>down</html>"),
+            )
+            .mount(&server)
+            .await;
+        let sut = ProxycheckClient {
+            http: reqwest::Client::new(),
+            api_key: None,
+            base_url: server.uri(),
+        };
+
+        let err = sut
+            .lookup("203.0.113.3".parse().unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                ProxycheckError::Status { status, .. }
+                    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_without_an_entry_for_the_ip_is_a_missing_entry_error() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v3/203.0.113.7"))
@@ -263,11 +462,107 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ProxycheckError::Api(ref detail)
-                    if detail == "no entry for 203.0.113.7 in the response"
+                ProxycheckError::MissingEntry { ip }
+                    if ip == Ipv4Addr::new(203, 0, 113, 7)
             ),
             "{err:?}"
         );
+    }
+
+    /// Without `detections` the flags used to default to `false`, and the
+    /// address passed every reputation gate as clean.
+    #[tokio::test]
+    async fn an_entry_without_detections_is_a_malformed_response() {
+        let server = MockServer::start().await;
+        let sut = client_against(
+            &server,
+            "203.0.113.8",
+            r#"{"status": "ok", "203.0.113.8": {"operator": null}}"#,
+        )
+        .await;
+
+        let err = sut
+            .lookup("203.0.113.8".parse().unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                ProxycheckError::MalformedEntry { ip, .. }
+                    if ip == Ipv4Addr::new(203, 0, 113, 8)
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_detection_flag_missing_from_the_entry_is_a_malformed_response() {
+        let server = MockServer::start().await;
+        let sut = client_against(
+            &server,
+            "203.0.113.8",
+            r#"{"status": "ok", "203.0.113.8": {"detections": {
+                "proxy": false, "vpn": true, "compromised": false,
+                "scraper": false, "anonymous": false, "risk": 10}}}"#,
+        )
+        .await;
+
+        let err = sut
+            .lookup("203.0.113.8".parse().unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ProxycheckError::MalformedEntry { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// A risk above 100 used to read as "risk unknown".
+    #[tokio::test]
+    async fn a_risk_above_one_hundred_is_an_out_of_range_error() {
+        let server = MockServer::start().await;
+        let sut = client_against(
+            &server,
+            "203.0.113.8",
+            r#"{"status": "ok", "203.0.113.8": {"detections": {
+                "proxy": false, "vpn": false, "compromised": false,
+                "scraper": false, "tor": false, "anonymous": false,
+                "risk": 150}}}"#,
+        )
+        .await;
+
+        let err = sut
+            .lookup("203.0.113.8".parse().unwrap())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "proxycheck.io entry for 203.0.113.8 has an out-of-range risk score"
+        );
+        assert_eq!(
+            std::error::Error::source(&err).map(ToString::to_string),
+            Some("risk score must be between 0 and 100, got 150".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_without_a_risk_score_has_an_unknown_risk() {
+        let server = MockServer::start().await;
+        let sut = client_against(
+            &server,
+            "203.0.113.8",
+            r#"{"status": "ok", "203.0.113.8": {"detections": {
+                "proxy": false, "vpn": false, "compromised": false,
+                "scraper": false, "tor": false, "anonymous": false}}}"#,
+        )
+        .await;
+
+        let facts = sut.lookup("203.0.113.8".parse().unwrap()).await.unwrap();
+
+        assert_eq!(facts.risk, None);
     }
 
     #[tokio::test]

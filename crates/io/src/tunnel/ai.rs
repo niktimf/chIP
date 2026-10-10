@@ -1,9 +1,10 @@
-use chip_core::model::ServiceState;
-use chip_core::verdict::ai::classify_ai_endpoint;
+use chip_core::checks::tunnel::ServiceState;
+use chip_core::checks::tunnel::ai::{AiProvider, classify_ai_endpoint};
 use http::header::USER_AGENT;
-use http::{HeaderName, HeaderValue, StatusCode};
+use http::{HeaderName, HeaderValue};
 
 use super::client::TunnelClient;
+use super::fetch_state;
 
 const API_UA: HeaderValue = HeaderValue::from_static("curl/8.5.0");
 
@@ -19,61 +20,45 @@ static ANTHROPIC_HEADERS: [(HeaderName, HeaderValue); 2] = [
     ),
 ];
 
-/// One AI API as a probe target: where to ask, how to identify, and how to
-/// read the answer.
+/// One AI API as a probe target: where to ask and how to identify. How to
+/// read the answer is the provider's rule in core.
 struct AiEndpoint {
+    provider: AiProvider,
     url: &'static str,
     headers: &'static [(HeaderName, HeaderValue)],
-    /// Body markers that mean a region refusal.
-    region_markers: &'static [&'static str],
-    /// Statuses that mean "reachable, just unauthenticated" for this API.
-    auth_statuses: &'static [StatusCode],
 }
 
 impl AiEndpoint {
     async fn probe(&self, client: &TunnelClient) -> ServiceState {
-        match client.get(self.url, self.headers).await {
-            Ok(response) => classify_ai_endpoint(
-                response.status,
-                &response.body,
-                self.region_markers,
-                self.auth_statuses,
-            ),
-            Err(error) => ServiceState::Unavailable(error.to_string()),
-        }
+        fetch_state(client, self.url, self.headers, |response| {
+            classify_ai_endpoint(self.provider, response.status, &response.body)
+        })
+        .await
     }
 }
 
 static OPENAI: AiEndpoint = AiEndpoint {
+    provider: AiProvider::OpenAi,
     url: "https://api.openai.com/v1/models",
     headers: &API_HEADERS,
-    region_markers: &[
-        "unsupported_country_region_territory",
-        "country, region, or territory not supported",
-    ],
-    auth_statuses: &[StatusCode::UNAUTHORIZED],
 };
 
 static ANTHROPIC: AiEndpoint = AiEndpoint {
+    provider: AiProvider::Anthropic,
     url: "https://api.anthropic.com/v1/models",
     headers: &ANTHROPIC_HEADERS,
-    region_markers: &["request not allowed", "unsupported_country"],
-    auth_statuses: &[StatusCode::UNAUTHORIZED],
 };
 
 static GEMINI: AiEndpoint = AiEndpoint {
+    provider: AiProvider::Gemini,
     url: "https://generativelanguage.googleapis.com/v1beta/models",
     headers: &API_HEADERS,
-    region_markers: &[],
-    // This API refuses an anonymous caller with 403, not only 401.
-    auth_statuses: &[StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN],
 };
 
 static DEEPSEEK: AiEndpoint = AiEndpoint {
+    provider: AiProvider::DeepSeek,
     url: "https://api.deepseek.com/models",
     headers: &API_HEADERS,
-    region_markers: &[],
-    auth_statuses: &[StatusCode::UNAUTHORIZED],
 };
 
 /// One field per probed API, so an endpoint cannot be dropped, duplicated,

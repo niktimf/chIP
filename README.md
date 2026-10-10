@@ -106,10 +106,12 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
-The project requires Rust 1.88 or newer and is licensed under MIT.
+The project requires the Rust version named by `rust-version` in
+`Cargo.toml` (currently 1.88) or newer and is licensed under MIT.
 
 Development uses the toolchain pinned in `rust-toolchain.toml`. CI also checks
-all targets against Rust 1.88.0. Run `sh ci/check.sh` for the local checks;
+all targets against that `rust-version`. Run `sh ci/check.sh` for the local
+checks;
 install `cargo-deny 0.20.2` and `cargo-machete 0.9.2` first. The dependency
 checks require network access to refresh the advisory database.
 

@@ -1,107 +1,52 @@
-use chip_core::model::ServiceState;
-use chip_core::verdict::services::{
+use chip_core::checks::tunnel::ServiceState;
+use chip_core::checks::tunnel::services::{
     classify_chatgpt_app, classify_chatgpt_web, classify_gemini,
     classify_youtube_premium,
 };
-use http::header::{ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
-use http::{HeaderName, HeaderValue};
 
 use super::client::TunnelClient;
+use super::{
+    BROWSER_EN_HEADERS, BROWSER_HEADERS, BROWSER_HTML_HEADERS, ServicePage,
+};
 
-pub(super) const BROWSER_UA: HeaderValue = HeaderValue::from_static(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
-);
-pub(super) const ACCEPT_LANGUAGE_EN: HeaderValue =
-    HeaderValue::from_static("en-US,en;q=0.9");
-/// The one-header set most browser-imitating probes send. A named `static`
-/// (not an inline slice): `HeaderValue` carries an atomic refcount, so a
-/// borrowed temporary cannot be promoted to `'static`.
-pub(super) static BROWSER_HEADERS: [(HeaderName, HeaderValue); 1] =
-    [(USER_AGENT, BROWSER_UA)];
+static CHATGPT_WEB: ServicePage = ServicePage {
+    url: "https://api.openai.com/compliance/cookie_requirements",
+    headers: &BROWSER_HEADERS,
+    classify: |response| classify_chatgpt_web(&response.body),
+};
 
-fn unavailable(error: impl std::fmt::Display) -> ServiceState {
-    ServiceState::Unavailable(error.to_string())
-}
+static CHATGPT_APP: ServicePage = ServicePage {
+    url: "https://ios.chat.openai.com",
+    headers: &BROWSER_HEADERS,
+    classify: |response| classify_chatgpt_app(response.status, &response.body),
+};
 
-async fn probe_chatgpt_web_at(
-    client: &TunnelClient,
-    url: &str,
-) -> ServiceState {
-    match client.get(url, &BROWSER_HEADERS).await {
-        Ok(response) => classify_chatgpt_web(&response.body),
-        Err(error) => unavailable(error),
-    }
-}
+static YOUTUBE_PREMIUM: ServicePage = ServicePage {
+    url: "https://www.youtube.com/premium",
+    headers: &BROWSER_EN_HEADERS,
+    classify: |response| classify_youtube_premium(&response.body),
+};
+
+static GEMINI: ServicePage = ServicePage {
+    url: "https://gemini.google.com/app",
+    headers: &BROWSER_HTML_HEADERS,
+    classify: |response| classify_gemini(response.status, &response.body),
+};
 
 pub async fn probe_chatgpt_web(client: &TunnelClient) -> ServiceState {
-    probe_chatgpt_web_at(
-        client,
-        "https://api.openai.com/compliance/cookie_requirements",
-    )
-    .await
-}
-
-async fn probe_chatgpt_app_at(
-    client: &TunnelClient,
-    url: &str,
-) -> ServiceState {
-    match client.get(url, &BROWSER_HEADERS).await {
-        Ok(response) => classify_chatgpt_app(response.status, &response.body),
-        Err(error) => unavailable(error),
-    }
+    CHATGPT_WEB.probe(client).await
 }
 
 pub async fn probe_chatgpt_app(client: &TunnelClient) -> ServiceState {
-    probe_chatgpt_app_at(client, "https://ios.chat.openai.com").await
-}
-
-async fn probe_youtube_premium_at(
-    client: &TunnelClient,
-    url: &str,
-) -> ServiceState {
-    match client
-        .get(
-            url,
-            &[
-                (USER_AGENT, BROWSER_UA),
-                (ACCEPT_LANGUAGE, ACCEPT_LANGUAGE_EN),
-            ],
-        )
-        .await
-    {
-        Ok(response) => classify_youtube_premium(&response.body),
-        Err(error) => unavailable(error),
-    }
+    CHATGPT_APP.probe(client).await
 }
 
 pub async fn probe_youtube_premium(client: &TunnelClient) -> ServiceState {
-    probe_youtube_premium_at(client, "https://www.youtube.com/premium").await
-}
-
-async fn probe_gemini_at(client: &TunnelClient, url: &str) -> ServiceState {
-    match client
-        .get(
-            url,
-            &[
-                (USER_AGENT, BROWSER_UA),
-                (
-                    ACCEPT,
-                    HeaderValue::from_static(
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    ),
-                ),
-                (ACCEPT_LANGUAGE, ACCEPT_LANGUAGE_EN),
-            ],
-        )
-        .await
-    {
-        Ok(response) => classify_gemini(response.status, &response.body),
-        Err(error) => unavailable(error),
-    }
+    YOUTUBE_PREMIUM.probe(client).await
 }
 
 pub async fn probe_gemini(client: &TunnelClient) -> ServiceState {
-    probe_gemini_at(client, "https://gemini.google.com/app").await
+    GEMINI.probe(client).await
 }
 
 #[cfg(test)]
@@ -122,22 +67,33 @@ mod tests {
             .await;
         let client = TunnelClient::from_client(reqwest::Client::new());
 
-        let state = probe_youtube_premium_at(&client, &server.uri()).await;
+        let sut = ServicePage {
+            url: &server.uri(),
+            ..YOUTUBE_PREMIUM
+        };
+
+        let state = sut.probe(&client).await;
 
         assert_eq!(state, ServiceState::Available);
     }
 
     #[tokio::test]
-    async fn transport_failure_stays_distinct_from_an_inconclusive_page() {
-        let client = TunnelClient::from_client(
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_millis(100))
-                .build()
-                .unwrap(),
+    async fn a_refused_connection_reports_the_operating_system_cause() {
+        let client = TunnelClient::from_client(reqwest::Client::new());
+        let sut = ServicePage {
+            url: "http://127.0.0.1:1",
+            ..CHATGPT_WEB
+        };
+
+        let state = sut.probe(&client).await;
+
+        assert!(
+            matches!(
+                &state,
+                ServiceState::Unavailable(detail)
+                    if detail.contains("Connection refused")
+            ),
+            "{state:?}"
         );
-
-        let state = probe_chatgpt_web_at(&client, "http://127.0.0.1:1").await;
-
-        assert!(matches!(state, ServiceState::Unavailable(_)), "{state:?}");
     }
 }

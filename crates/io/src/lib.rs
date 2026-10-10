@@ -13,4 +13,5 @@ pub mod rkn_registry;
 pub mod ssh;
 pub mod tunnel;
 
-mod tasks;
+mod error_chain;
+pub use error_chain::describe_error;

@@ -7,21 +7,35 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
+# Application crates are not published. cargo-deny relies on this to skip
+# license checks and versionless path dependencies of workspace crates.
+publish = false
 repository = "https://github.com/niktimf/chIP"
+
+[workspace.metadata.rust-playbook]
+# The rust-playbook hook runs cargo fmt, clippy and the tests before an agent
+# finishes. These checks execute build scripts, procedural macros and tests of
+# the workspace, so the hook runs them only where this key is set.
+hooks = true
 
 [workspace.dependencies]
 anyhow = "1"
+futures = { version = "0.3", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 country-code-enum = { version = "1", default-features = false }
 http = "1"
 ipnet = { version = "2.12", features = ["serde"] }
 itertools = "0.15"
-openssh = "0.11"
+# Exact pin: ssh/known_hosts.rs passes a quoted, two-file option value
+# through SessionBuilder::user_known_hosts_file, which 0.11.6 inserts
+# verbatim. Re-check builder.rs before bumping.
+openssh = "=0.11.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
 regex = "1.13"
 secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+strum = { version = "0.28", features = ["derive"] }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "fs", "io-util", "net", "sync"] }
@@ -36,19 +50,69 @@ pretty_assertions = "1"
 rstest = "0.26"
 wiremock = "0.6"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 cognitive_complexity = "warn"
-module_name_repetitions = "allow"
+# `#[must_use]` belongs on library APIs, not on every application function.
 must_use_candidate = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
 
-[workspace.lints.rust]
-unsafe_code = "forbid"
+# Panic paths. clippy.toml exempts tests. A panic that guards a local
+# invariant is marked `#[expect(clippy::expect_used, reason = "...")]` with
+# the reason the branch cannot happen.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+panic_in_result_fn = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+dbg_macro = "warn"
+
+# Errors are handled or propagated with their source, never dropped.
+map_err_ignore = "warn"
+let_underscore_must_use = "warn"
+unused_result_ok = "warn"
+
+# `println!` panics when stdout is closed, for example in `cli | head`. CLI
+# output goes through `writeln!` and returns the error; backends log through
+# `tracing`. The exit code is set only in `main`.
+print_stdout = "warn"
+print_stderr = "warn"
+exit = "warn"
+
+# Test names describe behaviour; a negative test checks the error.
+redundant_test_prefix = "warn"
+assertions_on_result_states = "warn"
+
+# A type with an invariant keeps all fields private; a DTO opens all of them.
+partial_pub_fields = "warn"
+# `Arc::clone(&x)` separates a reference count increment from a deep copy.
+clone_on_ref_ptr = "warn"
+
+# Every lint exception explains itself.
+allow_attributes_without_reason = "warn"
+
+# One module layout: `foo/mod.rs`, not `foo.rs` next to `foo/`.
+self_named_module_files = "warn"
+
+# Identifiers use Latin script only, which rules out homoglyphs.
+disallowed_script_idents = "warn"
+
+# Unsafe code. These fire only in a crate that allows unsafe code.
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
 
 [profile.release]
 lto = "thin"
 strip = "debuginfo"
 panic = "unwind"
+# Integer overflow behaves the same in debug and release builds.
+overflow-checks = true

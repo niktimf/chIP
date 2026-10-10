@@ -9,13 +9,17 @@
 //! Public DNS is not blocked, and Meta's networks have been blocked as whole
 //! subnets since 2022. If the second test starts failing, check the export
 //! before the parser: the registry may have changed.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helpers fail fast on broken setup"
+)]
 
 use std::net::Ipv4Addr;
 
-use chip_core::ip_lists::RknRegistry;
-use chip_core::model::RknListing;
+use chip_core::checks::direct::ip_lists::RknRegistry;
+use chip_core::checks::direct::rkn_registry::RknListing;
 use chip_io::rkn_registry::RknRegistryClient;
-use rstest::rstest;
 
 async fn registry() -> RknRegistry {
     RknRegistryClient::new(reqwest::Client::new())
@@ -24,25 +28,23 @@ async fn registry() -> RknRegistry {
         .expect("antifilter.download should serve both lists")
 }
 
-#[rstest]
-#[case::google_public_dns(
-    Ipv4Addr::new(8, 8, 8, 8),
-    |listing| listing == RknListing::NotListed
-)]
-// Only the variant: the registry may re-slice Meta's networks at any time.
-#[case::meta(
-    Ipv4Addr::new(157, 240, 0, 35),
-    |listing| matches!(listing, RknListing::Subnet(_))
-)]
 #[tokio::test]
 #[ignore = "needs the public internet"]
-async fn a_public_address_has_its_long_standing_registry_entry(
-    #[case] ip: Ipv4Addr,
-    #[case] expected: fn(RknListing) -> bool,
-) {
+async fn google_public_dns_is_not_listed() {
     let sut = registry().await;
 
-    let facts = sut.check(ip).unwrap();
+    let facts = sut.check(Ipv4Addr::new(8, 8, 8, 8));
 
-    assert!(expected(facts.listing()), "{facts:?}");
+    assert_eq!(facts.listing(), RknListing::NotListed, "{facts:?}");
+}
+
+/// Only the variant: the registry may re-slice Meta's networks at any time.
+#[tokio::test]
+#[ignore = "needs the public internet"]
+async fn a_meta_address_is_listed_by_its_subnet() {
+    let sut = registry().await;
+
+    let facts = sut.check(Ipv4Addr::new(157, 240, 0, 35));
+
+    assert!(matches!(facts.listing(), RknListing::Subnet(_)), "{facts:?}");
 }

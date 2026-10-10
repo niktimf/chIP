@@ -1,14 +1,61 @@
 use super::session::{SshError, SshSession};
-use chip_core::model::ProcStatSnapshot;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU16;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
+use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Why a temporary listener operation could not report an outcome.
+#[derive(Debug, Error)]
+pub enum ListenerError {
+    #[error(
+        "a temporary listener on port {port} is already owned by this session"
+    )]
+    AlreadyStarted { port: NonZeroU16 },
+    #[error("unexpected listener preflight response: {0}")]
+    InvalidPreflightResponse(String),
+    #[error("unexpected listener start response: {0}")]
+    InvalidStartResponse(String),
+    #[error(transparent)]
+    Ssh(#[from] SshError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListenerOutcome {
     Listening,
     PortInUse,
-    Failed(String),
+    Failed(ListenerFailure),
+}
+
+/// Why the candidate could not start a temporary listener. The texts are
+/// the details a scan reports after "listener failed: ".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
+pub enum ListenerFailure {
+    #[strum(to_string = "openssl is not installed on the candidate")]
+    MissingOpenSsl,
+    #[strum(to_string = "ss is not installed on the candidate")]
+    MissingSocketInspector,
+    #[strum(to_string = "could not create a private temporary directory")]
+    TempDir,
+    #[strum(to_string = "could not generate the throwaway certificate")]
+    Certificate,
+    #[strum(to_string = "openssl s_server started but no socket listens on \
+                         the port")]
+    NotListening,
+}
+
+impl ListenerOutcome {
+    /// Reads the stdout of `listener_start_script`, which is exactly one
+    /// reply line.
+    fn parse_start_reply(stdout: &str) -> Result<Self, ListenerError> {
+        match stdout.trim() {
+            "LISTENING" => Ok(Self::Listening),
+            "FAILED" => Ok(Self::Failed(ListenerFailure::NotListening)),
+            "CERT_FAILED" => Ok(Self::Failed(ListenerFailure::Certificate)),
+            "TEMP_FAILED" => Ok(Self::Failed(ListenerFailure::TempDir)),
+            _ => Err(ListenerError::InvalidStartResponse(stdout.to_owned())),
+        }
+    }
 }
 
 /// A successful preflight describes one actionable state. Transport and
@@ -22,13 +69,16 @@ pub enum ListenerReadiness {
 }
 
 impl ListenerReadiness {
-    fn parse(output: &str) -> Result<Self, SshError> {
-        match output.trim() {
+    /// Reads the stdout of `listener_preflight_script`.
+    fn parse(stdout: &str) -> Result<Self, ListenerError> {
+        match stdout.trim() {
             "READY" => Ok(Self::Ready),
             "BUSY" => Ok(Self::PortInUse),
             "MISSING_OPENSSL" => Ok(Self::MissingOpenSsl),
             "MISSING_SS" => Ok(Self::MissingSocketInspector),
-            _ => Err(SshError::InvalidPreflightResponse(output.to_owned())),
+            _ => {
+                Err(ListenerError::InvalidPreflightResponse(stdout.to_owned()))
+            }
         }
     }
 }
@@ -42,21 +92,46 @@ fn listener_preflight_script(port: NonZeroU16) -> String {
     )
 }
 
-fn parse_proc_stat(text: &str) -> Option<ProcStatSnapshot> {
-    let line = text.lines().find(|l| l.starts_with("cpu "))?;
-    let fields: Vec<u64> = line
-        .split_whitespace()
-        .skip(1)
-        .map(str::parse)
-        .collect::<Result<_, _>>()
-        .ok()?;
-    if fields.len() < 8 {
-        return None;
+/// The port of the remote listener this session has to clean up.
+///
+/// A port is claimed before the start command runs and released only after
+/// a stop command succeeded, so a lost or failed command leaves it claimed
+/// for the next cleanup.
+#[derive(Debug, Default)]
+pub(super) struct ListenerSlot(Mutex<Option<NonZeroU16>>);
+
+impl ListenerSlot {
+    pub(super) fn owned(&self) -> Option<NonZeroU16> {
+        *self.lock()
     }
-    ProcStatSnapshot::new(fields[7], fields.iter().sum()).ok()
+
+    fn claim(&self, port: NonZeroU16) -> Result<(), ListenerError> {
+        let mut owned = self.lock();
+        if let Some(current) = *owned {
+            return Err(ListenerError::AlreadyStarted { port: current });
+        }
+        *owned = Some(port);
+        drop(owned);
+        Ok(())
+    }
+
+    /// Releases `port` only while it is still the claimed one: a concurrent
+    /// stop may have released it already and a newer start claimed another.
+    fn release(&self, port: NonZeroU16) {
+        let mut owned = self.lock();
+        if *owned == Some(port) {
+            *owned = None;
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<NonZeroU16>> {
+        // The guarded value is a plain `Copy` port, so a panic while it was
+        // held cannot leave it half-written.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
-fn listener_start_script(port: u16) -> String {
+fn listener_start_script(port: NonZeroU16) -> String {
     format!(
         "D=$(mktemp -d /tmp/chip-pf-{port}.XXXXXX) || {{ echo TEMP_FAILED; exit 0; }}; \
          trap 'rm -rf -- \"$D\"' EXIT; \
@@ -80,10 +155,13 @@ fn listener_start_script(port: u16) -> String {
     )
 }
 
-fn listener_stop_script(port: u16) -> String {
+/// The `pkill` patterns end at the port: `$` after the startup tag, which
+/// is the last argument, and a space after the `-accept` value, which
+/// `-cert` follows. Port 443 then does not match 4430.
+fn listener_stop_script(port: NonZeroU16) -> String {
     format!(
         "pkill -KILL -u \"$(id -u)\" -f '[c]hip-listener-start-{port}$' 2>/dev/null || true; \
-         pkill -f '^timeout 600 openssl s_server -accept {port}' 2>/dev/null || true; \
+         pkill -u \"$(id -u)\" -f '^timeout 600 openssl s_server -accept {port} ' 2>/dev/null || true; \
          for D in /tmp/chip-pf-{port}.*; do \
            [ -L \"$D\" ] && continue; [ -d \"$D\" ] || continue; \
            [ \"$(stat -c %u \"$D\" 2>/dev/null)\" = \"$(id -u)\" ] || continue; \
@@ -97,10 +175,15 @@ fn listener_stop_script(port: u16) -> String {
 }
 
 impl SshSession {
+    /// # Errors
+    ///
+    /// Returns `ListenerError::Ssh` when the preflight command fails, and
+    /// `ListenerError::InvalidPreflightResponse` when its output is not a
+    /// known readiness answer.
     pub async fn listener_readiness(
         &self,
         port: NonZeroU16,
-    ) -> Result<ListenerReadiness, SshError> {
+    ) -> Result<ListenerReadiness, ListenerError> {
         let output = self
             .run_shell(&listener_preflight_script(port), self.command_timeout())
             .await?;
@@ -112,12 +195,21 @@ impl SshSession {
     /// generating a throwaway self-signed cert in a private temporary
     /// directory. Opens the port in `ufw` if present; both the files and a
     /// rule added by this run are removed when the listener exits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ListenerError::AlreadyStarted` when this session already
+    /// owns a listener, `ListenerError::Ssh` when a remote command fails,
+    /// and `ListenerError::InvalidPreflightResponse` or
+    /// `ListenerError::InvalidStartResponse` when a remote script replies
+    /// with an unknown answer. A listener that does not come up is an `Ok`
+    /// outcome.
     pub async fn start_listener(
         &self,
         port: NonZeroU16,
-    ) -> Result<ListenerOutcome, SshError> {
-        if self.listener_port().is_some() {
-            return Err(SshError::ListenerAlreadyStarted);
+    ) -> Result<ListenerOutcome, ListenerError> {
+        if let Some(owned) = self.listener.owned() {
+            return Err(ListenerError::AlreadyStarted { port: owned });
         }
         match self.listener_readiness(port).await? {
             ListenerReadiness::Ready => {}
@@ -126,61 +218,45 @@ impl SshSession {
             }
             ListenerReadiness::MissingOpenSsl => {
                 return Ok(ListenerOutcome::Failed(
-                    "openssl is not installed on the candidate".to_string(),
+                    ListenerFailure::MissingOpenSsl,
                 ));
             }
             ListenerReadiness::MissingSocketInspector => {
                 return Ok(ListenerOutcome::Failed(
-                    "ss is not installed on the candidate".to_string(),
+                    ListenerFailure::MissingSocketInspector,
                 ));
             }
         }
         let timeout = self.command_timeout();
-        let port = port.get();
         let script = listener_start_script(port);
         // Ownership is registered before awaiting a command that can create
         // remote state, including when its response is lost or cancelled.
-        self.listener_port
-            .compare_exchange(
-                0,
-                port,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .map_err(|_| SshError::ListenerAlreadyStarted)?;
+        self.listener.claim(port)?;
         // Give the remote startup shell an identity so cleanup can stop it
         // before removing state, even if the SSH response was cancelled.
         let tag = format!("chip-listener-start-{port}");
         let output = self
             .run_command("sh", &["-c", &script, &tag], timeout)
             .await?;
-        if output.contains("LISTENING") {
-            Ok(ListenerOutcome::Listening)
-        } else {
-            Ok(ListenerOutcome::Failed(output.trim().to_string()))
-        }
+        ListenerOutcome::parse_start_reply(&output)
     }
 
-    pub async fn stop_listener(
-        &self,
-        port: NonZeroU16,
-    ) -> Result<(), SshError> {
-        let timeout = self.command_timeout();
-        let script = listener_stop_script(port.get());
-        self.run_shell(&script, timeout).await?;
-        let _ = self.listener_port.compare_exchange(
-            port.get(),
-            0,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+    /// Stops the listener this session started and removes its remote
+    /// state. Without a started listener nothing runs on the candidate. The
+    /// port stays registered until the stop command succeeds, so a failed
+    /// stop can be retried.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SshError` when the stop command fails.
+    pub async fn stop_listener(&self) -> Result<(), SshError> {
+        let Some(port) = self.listener.owned() else {
+            return Ok(());
+        };
+        let script = listener_stop_script(port);
+        self.run_shell(&script, self.command_timeout()).await?;
+        self.listener.release(port);
         Ok(())
-    }
-
-    pub async fn steal_snapshot(&self) -> Result<ProcStatSnapshot, SshError> {
-        let timeout = self.command_timeout();
-        let text = self.run_command("cat", &["/proc/stat"], timeout).await?;
-        parse_proc_stat(&text).ok_or(SshError::InvalidSnapshot)
     }
 }
 
@@ -189,19 +265,40 @@ impl SshSession {
 /// Runs before any Globalping quota is spent on the listener. It serves a
 /// throwaway self-signed certificate, so certificate verification is off on
 /// purpose.
+///
+/// The client is built here rather than taken from the caller because it
+/// skips certificate verification, which the shared client must not do.
+/// `timeout` bounds the whole request.
+///
+/// # Errors
+///
+/// Returns `ListenerProbeError::Unreachable` when the listener does not
+/// answer TLS within `timeout`.
 pub async fn verify_listener(
     ip: Ipv4Addr,
     port: NonZeroU16,
-) -> Result<(), reqwest::Error> {
+    timeout: Duration,
+) -> Result<(), ListenerProbeError> {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(5))
-        .build()?;
+        .timeout(timeout)
+        .build()
+        .map_err(ListenerProbeError::Client)?;
     client
         .get(format!("https://{ip}:{port}/"))
         .send()
         .await
         .map(drop)
+        .map_err(ListenerProbeError::Unreachable)
+}
+
+/// Why the runner could not confirm the temporary listener.
+#[derive(Debug, Error)]
+pub enum ListenerProbeError {
+    #[error("could not build the TLS client for the listener probe")]
+    Client(#[source] reqwest::Error),
+    #[error("temporary TLS listener is not reachable from the runner")]
+    Unreachable(#[source] reqwest::Error),
 }
 
 #[cfg(test)]
@@ -209,32 +306,6 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
-
-    const PROC_STAT_LINE: &str = "cpu  1200 30 450 90111 12 0 34 250 0 0\ncpu0 600 15 225 45055 6 0 17 125 0 0\n";
-
-    #[test]
-    #[allow(clippy::identity_op)] // zeros mirror the /proc/stat fields
-    fn parse_proc_stat_reads_the_aggregate_cpu_line_only() {
-        let snap = parse_proc_stat(PROC_STAT_LINE).unwrap();
-        // fields after "cpu": 1200 30 450 90111 12 0 34 250 0 0 - steal is
-        // the 8th (250), total is their sum (92087).
-        assert_eq!(snap.steal_ticks(), 250);
-        assert_eq!(
-            snap.total_ticks(),
-            1200 + 30 + 450 + 90111 + 12 + 0 + 34 + 250 + 0 + 0
-        );
-    }
-
-    #[rstest::rstest]
-    #[case::too_few_fields("cpu  1 2 3\n")]
-    #[case::no_cpu_line("nonsense\n")]
-    fn parse_proc_stat_returns_none_for_an_unreadable_snapshot(
-        #[case] sut: &str,
-    ) {
-        let actual = parse_proc_stat(sut);
-
-        assert!(actual.is_none());
-    }
 
     #[cfg(unix)]
     fn write_stub(dir: &std::path::Path, name: &str, body: &str) {
@@ -255,8 +326,70 @@ mod tests {
             .unwrap()
     }
 
+    /// A port that was free a moment ago, so parallel tests do not share
+    /// remote state paths or `pkill` patterns.
     #[cfg(unix)]
-    fn listener_state_dirs(port: u16) -> Vec<std::path::PathBuf> {
+    fn free_port() -> NonZeroU16 {
+        let reservation =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        port(reservation.local_addr().unwrap().port())
+    }
+
+    /// Starts `timeout 600 openssl s_server -accept {accept} ...` with the
+    /// command line the start script gives the server; the `openssl` stub
+    /// in `dir` only sleeps.
+    #[cfg(unix)]
+    fn spawn_server(
+        dir: &std::path::Path,
+        accept: &str,
+    ) -> std::process::Child {
+        let path = format!(
+            "{}:{}",
+            dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        std::process::Command::new("timeout")
+            .args(["600", "openssl", "s_server", "-accept", accept])
+            .args(["-cert", "cert.pem", "-key", "key.pem", "-www", "-quiet"])
+            .env("PATH", path)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn exits_within(child: &mut std::process::Child, limit: Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_kills_the_server_of_its_port_and_spares_a_longer_port_number() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stub(dir.path(), "openssl", "exec sleep 30");
+        let port = free_port();
+        let mut own = spawn_server(dir.path(), &port.to_string());
+        let mut neighbor = spawn_server(dir.path(), &format!("{port}0"));
+
+        let stop = run_sh(&listener_stop_script(port), dir.path());
+
+        let own_exited = exits_within(&mut own, Duration::from_secs(3));
+        let neighbor_running = neighbor.try_wait().unwrap().is_none();
+        neighbor.kill().unwrap();
+        neighbor.wait().unwrap();
+        assert!(stop.status.success(), "stop: {:?}", stop.status);
+        assert!(own_exited, "the server on port {port} kept running");
+        assert!(neighbor_running, "the server on port {port}0 was killed");
+    }
+
+    #[cfg(unix)]
+    fn listener_state_dirs(port: NonZeroU16) -> Vec<std::path::PathBuf> {
         let prefix = format!("chip-pf-{port}.");
         std::fs::read_dir("/tmp")
             .unwrap()
@@ -272,10 +405,7 @@ mod tests {
     #[test]
     fn listener_uses_private_random_state_and_stop_cleans_it_up() {
         let dir = tempfile::tempdir().unwrap();
-        let reservation =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = reservation.local_addr().unwrap().port();
-        drop(reservation);
+        let port = free_port();
         write_stub(
             dir.path(),
             "openssl",
@@ -289,6 +419,7 @@ mod tests {
             &format!("echo \"LISTEN 0 128 0.0.0.0:{port} 0.0.0.0:*\""),
         );
 
+        // Starting is the act of the first step and the arrange of the stop.
         let start = run_sh(&listener_start_script(port), dir.path());
         let stdout = String::from_utf8_lossy(&start.stdout).to_string();
         let state_dirs = listener_state_dirs(port);
@@ -297,7 +428,6 @@ mod tests {
                 .ok()
                 .map(|metadata| metadata.permissions().mode() & 0o777)
         });
-
         let stop = run_sh(&listener_stop_script(port), dir.path());
 
         assert!(start.status.success(), "start: {:?} {stdout}", start.status);
@@ -309,36 +439,134 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn stop_script_is_valid_shell() {
-        for script in [listener_start_script(443), listener_stop_script(443)] {
-            let status = std::process::Command::new("sh")
-                .arg("-n")
-                .arg("-c")
-                .arg(&script)
-                .status()
-                .unwrap();
-            assert!(status.success(), "sh -n failed for: {script}");
-        }
-    }
     #[rstest::rstest]
-    #[case("READY\n", ListenerReadiness::Ready)]
-    #[case("BUSY\n", ListenerReadiness::PortInUse)]
-    #[case("MISSING_OPENSSL\n", ListenerReadiness::MissingOpenSsl)]
-    #[case("MISSING_SS\n", ListenerReadiness::MissingSocketInspector)]
+    #[case::start(listener_start_script(port(443)))]
+    #[case::stop(listener_stop_script(port(443)))]
+    fn the_listener_script_parses_as_shell(#[case] script: String) {
+        let status = std::process::Command::new("sh")
+            .arg("-n")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "sh -n failed for: {script}");
+    }
+
+    #[rstest::rstest]
+    #[case::free_port("READY\n", ListenerReadiness::Ready)]
+    #[case::busy_port("BUSY\n", ListenerReadiness::PortInUse)]
+    #[case::no_openssl("MISSING_OPENSSL\n", ListenerReadiness::MissingOpenSsl)]
+    #[case::no_ss("MISSING_SS\n", ListenerReadiness::MissingSocketInspector)]
     fn preflight_returns_one_actionable_state(
         #[case] response: &str,
         #[case] expected: ListenerReadiness,
     ) {
-        assert_eq!(ListenerReadiness::parse(response).unwrap(), expected);
+        let actual = ListenerReadiness::parse(response).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::listening("LISTENING\n", ListenerOutcome::Listening)]
+    #[case::no_socket(
+        "FAILED\n",
+        ListenerOutcome::Failed(ListenerFailure::NotListening)
+    )]
+    #[case::no_certificate(
+        "CERT_FAILED\n",
+        ListenerOutcome::Failed(ListenerFailure::Certificate)
+    )]
+    #[case::no_temp_dir(
+        "TEMP_FAILED\n",
+        ListenerOutcome::Failed(ListenerFailure::TempDir)
+    )]
+    fn the_start_reply_names_one_outcome(
+        #[case] reply: &str,
+        #[case] expected: ListenerOutcome,
+    ) {
+        let actual = ListenerOutcome::parse_start_reply(reply).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::empty("")]
+    #[case::two_replies("LISTENING\nFAILED\n")]
+    #[case::reply_inside_a_line("NOT LISTENING\n")]
+    fn an_unknown_start_reply_is_an_error_not_a_failed_listener(
+        #[case] reply: &str,
+    ) {
+        let actual = ListenerOutcome::parse_start_reply(reply);
+
+        assert!(
+            matches!(&actual, Err(ListenerError::InvalidStartResponse(text)) if text == reply),
+            "{actual:?}"
+        );
+    }
+
+    fn port(value: u16) -> NonZeroU16 {
+        NonZeroU16::new(value).unwrap()
+    }
+
+    fn slot_owning(value: u16) -> ListenerSlot {
+        let slot = ListenerSlot::default();
+        slot.claim(port(value)).unwrap();
+        slot
+    }
+
+    #[test]
+    fn a_session_without_a_started_listener_has_nothing_to_stop() {
+        let sut = ListenerSlot::default();
+
+        let actual = sut.owned();
+
+        assert_eq!(actual, None);
+    }
+
+    #[test]
+    fn a_second_listener_is_refused_while_the_first_is_owned() {
+        let sut = slot_owning(443);
+
+        let actual = sut.claim(port(8443));
+
+        assert!(
+            matches!(
+                actual,
+                Err(ListenerError::AlreadyStarted { port: owned })
+                    if owned == port(443)
+            ),
+            "{actual:?}"
+        );
+        assert_eq!(sut.owned(), Some(port(443)));
+    }
+
+    #[test]
+    fn a_stopped_listener_leaves_nothing_to_clean_up() {
+        let sut = slot_owning(443);
+
+        sut.release(port(443));
+
+        assert_eq!(sut.owned(), None);
+    }
+
+    #[test]
+    fn stopping_another_port_keeps_the_owned_listener_for_cleanup() {
+        let sut = slot_owning(8443);
+
+        sut.release(port(443));
+
+        assert_eq!(sut.owned(), Some(port(8443)));
     }
 
     #[test]
     fn unreadable_preflight_is_not_a_free_or_busy_port() {
-        assert!(matches!(
-            ListenerReadiness::parse(""),
-            Err(SshError::InvalidPreflightResponse(_))
-        ));
+        let actual = ListenerReadiness::parse("");
+
+        assert!(
+            matches!(actual, Err(ListenerError::InvalidPreflightResponse(_))),
+            "{actual:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -347,13 +575,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_stub(dir.path(), "openssl", "exit 0");
         write_stub(dir.path(), "ss", "echo 'inspection denied' >&2; exit 1");
-        let result = run_sh(
-            &listener_preflight_script(NonZeroU16::new(8443).unwrap()),
-            dir.path(),
-        );
+
+        let result = run_sh(&listener_preflight_script(port(8443)), dir.path());
+
         assert!(!result.status.success());
         assert!(result.stdout.is_empty());
     }
+
     #[cfg(unix)]
     fn wait_for_file(path: &std::path::Path) -> bool {
         let deadline =
@@ -385,9 +613,7 @@ fi
     #[test]
     fn cleanup_stops_startup_before_it_can_launch_a_late_listener() {
         let dir = tempfile::tempdir().unwrap();
-        let reservation =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = reservation.local_addr().unwrap().port();
+        let port = free_port();
         write_stub(dir.path(), "openssl", DELAYED_CERT_GENERATION);
         write_stub(dir.path(), "ufw", "exit 0");
         write_stub(dir.path(), "sudo", "exit 1");
@@ -411,7 +637,9 @@ fi
             .spawn()
             .unwrap();
         let started = wait_for_file(&dir.path().join("started"));
+
         let stopped = run_sh(&listener_stop_script(port), dir.path());
+
         std::fs::write(dir.path().join("release"), "").unwrap();
         let status = startup.wait().unwrap();
         let finished = wait_for_file(&dir.path().join("done"));

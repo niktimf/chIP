@@ -1,0 +1,94 @@
+# Clippy settings of chip-core, the functional core. Clippy does not merge
+# this file with the root clippy.toml, so it repeats every root setting and
+# adds the effects that core must not perform: core receives time,
+# environment, randomness and I/O results as arguments from chip-io and the
+# cli.
+#
+# The default cognitive-complexity-threshold is intentional. Add an explicit
+# value only after measurements on a real codebase justify changing it.
+
+# Root settings, kept identical to the workspace clippy.toml.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = false
+allow-print-in-tests = false
+allow-indexing-slicing-in-tests = true
+
+max-fn-params-bools = 0
+max-struct-bools = 1
+
+await-holding-invalid-types = [
+    { path = "tracing::span::Entered", reason = "instrument the future with tracing::Instrument::instrument instead of holding span.enter() across .await" },
+    { path = "tracing::span::EnteredSpan", reason = "instrument the future with tracing::Instrument::instrument instead of holding span.entered() across .await" },
+]
+
+disallowed-methods = [
+    # Root settings: queues are bounded.
+    { path = "std::sync::mpsc::channel", reason = "unbounded queue: use std::sync::mpsc::sync_channel with a capacity" },
+    { path = "tokio::sync::mpsc::unbounded_channel", reason = "unbounded queue: use tokio::sync::mpsc::channel with a capacity" },
+    { path = "crossbeam_channel::unbounded", reason = "unbounded queue: use crossbeam_channel::bounded" },
+    { path = "crossbeam::channel::unbounded", reason = "unbounded queue: use crossbeam::channel::bounded" },
+    { path = "futures::channel::mpsc::unbounded", reason = "unbounded queue: use futures::channel::mpsc::channel", allow-invalid = true },
+    { path = "flume::unbounded", reason = "unbounded queue: use flume::bounded" },
+    { path = "async_channel::unbounded", reason = "unbounded queue: use async_channel::bounded" },
+    # Core: time comes from the shell.
+    { path = "std::time::SystemTime::now", reason = "core is pure: read the clock in the shell and pass the time as an argument" },
+    { path = "std::time::Instant::now", reason = "core is pure: read the clock in the shell and pass the instant as an argument" },
+    { path = "tokio::time::Instant::now", reason = "core is pure: read the clock in the shell and pass the instant as an argument" },
+    { path = "chrono::Utc::now", reason = "core is pure: read the clock in the shell and pass the time as an argument" },
+    { path = "chrono::Local::now", reason = "core is pure: read the clock in the shell and pass the time as an argument" },
+    { path = "time::OffsetDateTime::now_utc", reason = "core is pure: read the clock in the shell and pass the time as an argument" },
+    { path = "time::OffsetDateTime::now_local", reason = "core is pure: read the clock in the shell and pass the time as an argument" },
+    # Core: environment, arguments and working directory come from the shell.
+    { path = "std::env::var", reason = "core is pure: read configuration in the shell and pass a typed value" },
+    { path = "std::env::var_os", reason = "core is pure: read configuration in the shell and pass a typed value" },
+    { path = "std::env::vars", reason = "core is pure: read configuration in the shell and pass a typed value" },
+    { path = "std::env::vars_os", reason = "core is pure: read configuration in the shell and pass a typed value" },
+    { path = "std::env::args", reason = "core is pure: parse arguments in the shell and pass a typed value" },
+    { path = "std::env::args_os", reason = "core is pure: parse arguments in the shell and pass a typed value" },
+    { path = "std::env::current_dir", reason = "core is pure: resolve paths in the shell and pass them as arguments" },
+    # Core: randomness and generated identifiers come from the shell.
+    { path = "rand::random", reason = "core is pure: generate randomness in the shell and pass the value" },
+    { path = "rand::rng", reason = "core is pure: generate randomness in the shell and pass the value" },
+    { path = "rand::thread_rng", reason = "core is pure: generate randomness in the shell and pass the value" },
+    { path = "uuid::Uuid::new_v4", reason = "core is pure: generate identifiers in the shell and pass them" },
+    { path = "uuid::Uuid::now_v7", reason = "core is pure: generate identifiers in the shell and pass them" },
+    # Core: threads and tasks belong to the shell.
+    { path = "std::thread::spawn", reason = "core is pure: spawning belongs to the shell" },
+    { path = "tokio::spawn", reason = "core is pure: spawning belongs to the shell" },
+    { path = "tokio::task::spawn", reason = "core is pure: spawning belongs to the shell" },
+    { path = "tokio::task::spawn_blocking", reason = "core is pure: spawning belongs to the shell" },
+    # Core: standard streams and the file system belong to the shell.
+    { path = "std::io::stdin", reason = "core is pure: read input in the shell and pass the data" },
+    { path = "std::io::stdout", reason = "core is pure: write output in the shell" },
+    { path = "std::io::stderr", reason = "core is pure: write output in the shell" },
+    { path = "std::fs::read", reason = "core is pure: read files in the shell and pass the data" },
+    { path = "std::fs::read_to_string", reason = "core is pure: read files in the shell and pass the data" },
+    { path = "std::fs::read_dir", reason = "core is pure: read directories in the shell and pass the data" },
+    { path = "std::fs::metadata", reason = "core is pure: query the file system in the shell" },
+    { path = "std::fs::write", reason = "core is pure: return the data and write it in the shell" },
+    { path = "std::fs::copy", reason = "core is pure: change the file system in the shell" },
+    { path = "std::fs::rename", reason = "core is pure: change the file system in the shell" },
+    { path = "std::fs::create_dir", reason = "core is pure: change the file system in the shell" },
+    { path = "std::fs::create_dir_all", reason = "core is pure: change the file system in the shell" },
+    { path = "std::fs::remove_file", reason = "core is pure: change the file system in the shell" },
+    { path = "std::fs::remove_dir", reason = "core is pure: change the file system in the shell" },
+    { path = "std::fs::remove_dir_all", reason = "core is pure: change the file system in the shell" },
+]
+
+# Core: files, sockets and processes belong to the shell.
+disallowed-types = [
+    { path = "std::fs::File", reason = "core is pure: open files in the shell and pass the data" },
+    { path = "std::fs::OpenOptions", reason = "core is pure: open files in the shell and pass the data" },
+    { path = "std::net::TcpStream", reason = "core is pure: network I/O belongs to the shell" },
+    { path = "std::net::TcpListener", reason = "core is pure: network I/O belongs to the shell" },
+    { path = "std::net::UdpSocket", reason = "core is pure: network I/O belongs to the shell" },
+    { path = "std::process::Command", reason = "core is pure: run processes in the shell" },
+    { path = "std::process::Child", reason = "core is pure: run processes in the shell" },
+    { path = "tokio::fs::File", reason = "core is pure: open files in the shell and pass the data" },
+    { path = "tokio::net::TcpStream", reason = "core is pure: network I/O belongs to the shell" },
+    { path = "tokio::net::TcpListener", reason = "core is pure: network I/O belongs to the shell" },
+    { path = "tokio::net::UdpSocket", reason = "core is pure: network I/O belongs to the shell" },
+    { path = "tokio::process::Command", reason = "core is pure: run processes in the shell" },
+]

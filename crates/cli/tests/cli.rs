@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use rstest::rstest;
 
@@ -16,22 +16,19 @@ fn help_names_both_subcommands() {
     assert!(stdout.contains("calibrate"), "{stdout}");
 }
 
-#[test]
-fn scan_help_explains_every_flag_and_names_the_secret_variables() {
+#[rstest]
+#[case::latency_threshold("excess over the best anchor")]
+#[case::probe_count("probes in Russian home networks")]
+#[case::gate_escalation("Promote a warning to a failure")]
+#[case::ssh_key_variable("SSH_PRIVATE_KEY")]
+#[case::globalping_token_variable("GLOBALPING_TOKEN")]
+#[case::proxycheck_key_variable("PROXYCHECK_API_KEY")]
+fn scan_help_explains_the_setting(#[case] expected: &str) {
     let output = chip().args(["scan", "--help"]).output().unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for expected in [
-        "excess over the best anchor",
-        "probes in Russian home networks",
-        "Promote a warning to a failure",
-        "SSH_PRIVATE_KEY",
-        "GLOBALPING_TOKEN",
-        "PROXYCHECK_API_KEY",
-    ] {
-        assert!(stdout.contains(expected), "{expected} missing:\n{stdout}");
-    }
+    assert!(stdout.contains(expected), "{expected} missing:\n{stdout}");
 }
 
 #[rstest]
@@ -57,10 +54,10 @@ fn scan_help_explains_every_flag_and_names_the_secret_variables() {
     "expected IP=City"
 )]
 fn invalid_input_exits_two_before_any_network_work(
-    #[case] sut: &[&str],
+    #[case] args: &[&str],
     #[case] expected_error: &str,
 ) {
-    let output = chip().args(sut).output().unwrap();
+    let output = chip().args(args).output().unwrap();
 
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -102,4 +99,107 @@ fn calibrate_does_not_read_scan_only_secrets() {
     assert!(stderr.contains("expected IP=City"), "{stderr}");
     assert!(!stderr.contains("SSH_PRIVATE_KEY"), "{stderr}");
     assert!(!stderr.contains("PROXYCHECK_API_KEY"), "{stderr}");
+}
+
+#[test]
+fn an_unparsable_rust_log_is_reported_instead_of_silently_replaced() {
+    let output = chip()
+        .env("RUST_LOG", "chip=loud")
+        .args(["calibrate", "not-a-target"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning: ignoring RUST_LOG and logging at info"),
+        "{stderr}"
+    );
+}
+
+/// A scan that never leaves the machine: every HTTP request goes to a proxy
+/// on a loopback port with no listener, and SSH and the /24 sweep are off.
+/// Every gate whose source is then unreachable is skipped, so the scan
+/// itself passes and an exit code of 2 can only come from writing the
+/// report.
+fn offline_scan() -> Command {
+    let mut command = chip();
+    for proxy in ["ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY"] {
+        command.env(proxy, "http://127.0.0.1:1");
+    }
+    for variable in [
+        "NO_PROXY",
+        "no_proxy",
+        "GITHUB_STEP_SUMMARY",
+        "GLOBALPING_TOKEN",
+        "PROXYCHECK_API_KEY",
+        "SSH_PRIVATE_KEY",
+    ] {
+        command.env_remove(variable);
+    }
+    command.env("RUST_LOG", "off").args([
+        "scan",
+        "203.0.113.1",
+        "--country",
+        "FI",
+        "--no-ssh",
+        "--no-neighbors",
+        "--skip-gate",
+        "blocklists,geo,globalping-quota,latency,provenance,reputation,\
+         reputation:operator,rkn-registry",
+    ]);
+    command
+}
+
+#[test]
+fn an_offline_scan_with_its_unreachable_gates_skipped_passes() {
+    let output = offline_scan().output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("OVERALL: OK"), "{stdout}");
+}
+
+#[test]
+fn a_reader_closing_the_pipe_early_ends_the_scan_with_exit_two_not_a_panic() {
+    let mut sut = offline_scan()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Closing the read end before the report is written is what
+    // `chip scan ... | head` does once it has its lines.
+    drop(sut.stdout.take());
+
+    let output = sut.wait_with_output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!stderr.lines().any(|line| line.starts_with("error:")), "{stderr}");
+}
+
+#[test]
+fn a_closed_stdout_still_leaves_the_json_report_and_the_step_summary() {
+    let directory = tempfile::tempdir().unwrap();
+    let json = directory.path().join("report.json");
+    let summary = directory.path().join("summary.md");
+    let mut sut = offline_scan()
+        .env("GITHUB_STEP_SUMMARY", &summary)
+        .arg("--json")
+        .arg(&json)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(sut.stdout.take());
+
+    let output = sut.wait_with_output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+    assert_eq!(document["overall"], "OK");
+    assert!(!std::fs::read_to_string(&summary).unwrap().is_empty());
 }

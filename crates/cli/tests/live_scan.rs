@@ -8,9 +8,10 @@
 //!     cargo test -p chip --test live_scan -- --ignored
 //! ```
 //!
-//! Without `CHIP_LIVE_IP`/`CHIP_LIVE_COUNTRY` the test returns without
-//! asserting, so `--ignored` on a machine with no candidate stays quiet.
+//! Without `CHIP_LIVE_IP` or `CHIP_LIVE_COUNTRY` the test fails and says
+//! which one is missing: a run with `--ignored` is meant to scan a candidate.
 
+use std::ffi::OsString;
 use std::process::Command;
 
 /// Every gate a full scan owes a row for, straight from the registry that
@@ -18,28 +19,31 @@ use std::process::Command;
 /// failure this test exists to catch — a missing row reads as "checked and
 /// fine" to whoever runs the rotation.
 fn expected_gates() -> Vec<&'static str> {
-    chip_core::gate::scan_gates()
-        .map(chip_core::GateId::as_str)
+    chip_core::report::gate::scan_gates()
+        .map(chip_core::report::gate::Gate::as_str)
         .collect()
 }
 
 #[test]
 #[ignore = "needs a live candidate in CHIP_LIVE_IP and Globalping quota"]
 fn a_full_scan_reports_every_gate_and_exits_with_a_pipeline_code() {
-    let (Ok(ip), Ok(country)) =
-        (std::env::var("CHIP_LIVE_IP"), std::env::var("CHIP_LIVE_COUNTRY"))
-    else {
-        return;
-    };
+    let ip = std::env::var("CHIP_LIVE_IP")
+        .expect("CHIP_LIVE_IP must name the live candidate");
+    let country = std::env::var("CHIP_LIVE_COUNTRY")
+        .expect("CHIP_LIVE_COUNTRY must name the candidate's country");
+    let city = std::env::var_os("CHIP_LIVE_CITY")
+        .map(|city| [OsString::from("--city"), city])
+        .into_iter()
+        .flatten();
     let report = tempfile::NamedTempFile::new().expect("a writable temp dir");
 
-    let mut sut = Command::new(env!("CARGO_BIN_EXE_chip"));
-    sut.args(["scan", &ip, "--country", &country]);
-    if let Ok(city) = std::env::var("CHIP_LIVE_CITY") {
-        sut.args(["--city", &city]);
-    }
-    let output = sut
-        .args(["--json", &report.path().to_string_lossy()])
+    // `--no-fail-fast`: a candidate that fails phase A still owes the phase B
+    // rows this test checks for.
+    let output = Command::new(env!("CARGO_BIN_EXE_chip"))
+        .args(["scan", &ip, "--country", &country, "--no-fail-fast"])
+        .args(city)
+        .arg("--json")
+        .arg(report.path())
         .output()
         .expect("the binary runs");
 
@@ -58,9 +62,11 @@ fn a_full_scan_reports_every_gate_and_exits_with_a_pipeline_code() {
         .iter()
         .map(|result| result["gate"].as_str().expect("a gate id"))
         .collect();
-    for gate in expected_gates() {
-        assert!(reported.contains(&gate), "no row for {gate}: {reported:?}");
-    }
+    let missing: Vec<&str> = expected_gates()
+        .into_iter()
+        .filter(|gate| !reported.contains(gate))
+        .collect();
+    assert!(missing.is_empty(), "no row for {missing:?}: {reported:?}");
     assert_eq!(
         document["exit_code"].as_i64(),
         Some(i64::from(code)),

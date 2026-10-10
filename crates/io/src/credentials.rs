@@ -15,6 +15,8 @@ fn parse_owned_secret(value: String) -> Result<SecretString, EmptySecret> {
 
 macro_rules! secret_type {
     ($name:ident) => {
+        // `Clone`: the CLI copies each secret from its parsed config into
+        // the client or SSH config that sends it.
         #[derive(Clone, Debug)]
         pub struct $name(SecretString);
 

@@ -1,14 +1,17 @@
-use super::select::Anchor;
+use chip_core::checks::globalping::latency::anchor::{Anchor, AnchorFields};
+use futures::{TryStreamExt as _, stream};
 use serde::Deserialize;
 use thiserror::Error;
 
 #[derive(Deserialize)]
 struct RawAnchor {
     fqdn: String,
-    ip_v4: String,
+    /// `null` for an anchor without IPv4.
+    ip_v4: Option<String>,
     city: String,
     country: String,
-    as_v4: u32,
+    /// `null` for an anchor without IPv4.
+    as_v4: Option<u32>,
     is_disabled: bool,
     date_decommissioned: Option<String>,
 }
@@ -18,22 +21,54 @@ impl RawAnchor {
         if self.is_disabled || self.date_decommissioned.is_some() {
             return None;
         }
-        Some(Anchor {
+        let (Some(ip_v4), Some(as_v4)) = (self.ip_v4, self.as_v4) else {
+            tracing::debug!(
+                fqdn = %self.fqdn,
+                "active anchor dropped: no IPv4 address or AS number"
+            );
+            return None;
+        };
+        let ip_v4 = ip_v4
+            .parse()
+            .inspect_err(|error| {
+                tracing::debug!(
+                    fqdn = %self.fqdn,
+                    %ip_v4,
+                    %error,
+                    "active anchor dropped: invalid IPv4 address"
+                );
+            })
+            .ok()?;
+        let country = self
+            .country
+            .parse()
+            .inspect_err(|error| {
+                tracing::debug!(
+                    fqdn = %self.fqdn,
+                    %error,
+                    "active anchor dropped: unknown country"
+                );
+            })
+            .ok()?;
+        Some(Anchor::new(AnchorFields {
             fqdn: self.fqdn,
-            ip_v4: self.ip_v4.parse().ok()?,
+            ip_v4,
             city: self.city,
-            country: self.country.parse().ok()?,
-            as_v4: self.as_v4,
-        })
+            country,
+            as_v4,
+        }))
     }
 }
 
 #[derive(Debug, Error)]
 pub enum AtlasError {
-    #[error("RIPE Atlas request failed: {0}")]
+    #[error("RIPE Atlas request failed")]
     Http(#[from] reqwest::Error),
+    #[error("RIPE Atlas anchor list did not end within {limit} pages")]
+    TooManyPages { limit: usize },
 }
 
+#[derive(Debug)]
 pub struct AnchorClient {
     http: reqwest::Client,
     base_url: String,
@@ -52,29 +87,61 @@ impl AnchorClient {
         Self { http, base_url }
     }
 
+    /// # Errors
+    ///
+    /// Returns `AtlasError::Http` when a page request or its decoding fails,
+    /// and `AtlasError::TooManyPages` when the list does not end within the
+    /// page limit.
     pub async fn anchors(&self) -> Result<Vec<Anchor>, AtlasError> {
-        #[derive(serde::Deserialize)]
-        struct Page {
-            results: Vec<RawAnchor>,
-            next: Option<String>,
-        }
-        let mut url = format!(
-            "{}?page_size=500&fields=fqdn,ip_v4,city,country,as_v4,is_disabled,date_decommissioned",
-            self.base_url
-        );
-        let mut out = Vec::new();
-        loop {
-            let page: Page = self.http.get(&url).send().await?.json().await?;
-            out.extend(
-                page.results.into_iter().filter_map(RawAnchor::into_active),
-            );
-            match page.next {
-                Some(next) => url = next,
-                None => break,
+        // About 800 anchors exist, two pages at this page size. The bound
+        // stops a `next` link that keeps pointing back at a served page.
+        const MAX_PAGES: usize = 20;
+        const FIELDS: &str =
+            "fqdn,ip_v4,city,country,as_v4,is_disabled,date_decommissioned";
+        let first = self
+            .http
+            .get(&self.base_url)
+            .query(&[("page_size", "500"), ("fields", FIELDS)]);
+        let start = Cursor {
+            request: Some(first),
+            fetched: 0,
+        };
+        let pages = stream::try_unfold(start, |cursor| async move {
+            let Some(request) = cursor.request else {
+                return Ok(None);
+            };
+            if cursor.fetched == MAX_PAGES {
+                return Err(AtlasError::TooManyPages { limit: MAX_PAGES });
             }
-        }
-        Ok(out)
+            let Page { results, next } = Self::page(request).await?;
+            let following = Cursor {
+                request: next.map(|url| self.http.get(url)),
+                fetched: cursor.fetched + 1,
+            };
+            Ok(Some((results, following)))
+        });
+        let raw: Vec<RawAnchor> = pages.try_concat().await?;
+        Ok(raw.into_iter().filter_map(RawAnchor::into_active).collect())
     }
+
+    async fn page(
+        request: reqwest::RequestBuilder,
+    ) -> Result<Page, AtlasError> {
+        Ok(request.send().await?.error_for_status()?.json().await?)
+    }
+}
+
+#[derive(Deserialize)]
+struct Page {
+    results: Vec<RawAnchor>,
+    next: Option<String>,
+}
+
+/// State of the walk over the anchor pages: the request for the next page,
+/// if any, and how many pages were already fetched.
+struct Cursor {
+    request: Option<reqwest::RequestBuilder>,
+    fetched: usize,
 }
 
 #[cfg(test)]
@@ -84,7 +151,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
-    async fn anchors_follows_pagination_and_drops_inactive_or_ipv6_only_rows() {
+    async fn active_anchors_with_ipv4_are_collected_from_every_page() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/page1"))
@@ -116,8 +183,84 @@ mod tests {
         let anchors = sut.anchors().await.unwrap();
 
         assert_eq!(
-            anchors.iter().map(|a| a.fqdn.as_str()).collect::<Vec<_>>(),
+            anchors.iter().map(Anchor::fqdn).collect::<Vec<_>>(),
             vec!["fi-hel-as1", "de-fra-as4"]
         );
+    }
+
+    #[tokio::test]
+    async fn an_anchor_with_null_ipv4_is_skipped_and_the_page_still_reads() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/anchors"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [
+                    {"fqdn": "fi-hel-as5-v6only", "ip_v4": null, "city": "Helsinki", "country": "FI", "as_v4": null, "is_disabled": false, "date_decommissioned": null},
+                    {"fqdn": "fi-hel-as1", "ip_v4": "192.0.2.1", "city": "Helsinki", "country": "FI", "as_v4": 1, "is_disabled": false, "date_decommissioned": null}
+                ],
+                "next": null
+            })))
+            .mount(&server)
+            .await;
+        let sut = AnchorClient::with_base_url(
+            reqwest::Client::new(),
+            format!("{}/anchors", server.uri()),
+        );
+
+        let anchors = sut.anchors().await.unwrap();
+
+        assert_eq!(
+            anchors.iter().map(Anchor::fqdn).collect::<Vec<_>>(),
+            vec!["fi-hel-as1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_error_is_reported_with_its_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/anchors"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let sut = AnchorClient::with_base_url(
+            reqwest::Client::new(),
+            format!("{}/anchors", server.uri()),
+        );
+
+        let err = sut.anchors().await.unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                AtlasError::Http(ref source)
+                    if source.status()
+                        == Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_next_link_that_never_ends_stops_with_too_many_pages() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/loop"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "results": [],
+                    "next": format!("{}/loop", server.uri())
+                }),
+            ))
+            .mount(&server)
+            .await;
+        let sut = AnchorClient::with_base_url(
+            reqwest::Client::new(),
+            format!("{}/loop", server.uri()),
+        );
+
+        let err = sut.anchors().await.unwrap_err();
+
+        assert!(matches!(err, AtlasError::TooManyPages { .. }), "{err:?}");
     }
 }

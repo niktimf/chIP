@@ -1,19 +1,48 @@
-use chip_core::ip_lists::{BlockLists, FetchedList, NetworkList};
+use chip_core::checks::direct::ip_lists::{
+    BlockLists, FetchedList, NetworkList,
+};
 use ipnet::Ipv4Net;
 use serde::Deserialize;
 
-use crate::netset;
+use crate::error_chain::describe_error;
+use crate::netset::{self, Garbage, Line, ParsedList};
 
-const SPAMHAUS_URL: &str = "https://www.spamhaus.org/drop/drop_v4.json";
-const FIREHOL_URL: &str = "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset";
-
-/// One line of the Spamhaus DROP export. The trailing metadata line has no
-/// `cidr` and does not parse as an entry.
+/// One line of the Spamhaus DROP export: an entry, or the trailing
+/// `{"type": "metadata", ...}` line.
 #[derive(Deserialize)]
-struct DropEntry {
-    cidr: Ipv4Net,
+#[serde(untagged)]
+enum DropLine {
+    Entry {
+        cidr: Ipv4Net,
+    },
+    Metadata {
+        #[serde(rename = "type")]
+        _kind: DropLineType,
+    },
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DropLineType {
+    Metadata,
+}
+
+impl DropLine {
+    fn read(line: &str) -> Result<Line<Ipv4Net>, Garbage> {
+        if line.is_empty() {
+            return Ok(Line::Skip);
+        }
+        match serde_json::from_str::<Self>(line) {
+            Ok(Self::Entry { cidr }) => Ok(Line::Entry(cidr)),
+            Ok(Self::Metadata { .. }) => Ok(Line::Skip),
+            // The caller counts garbage lines; the decode error of one line
+            // adds nothing to that count.
+            Err(_) => Err(Garbage),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct BlockListsClient {
     http: reqwest::Client,
     spamhaus_url: String,
@@ -22,6 +51,8 @@ pub struct BlockListsClient {
 
 impl BlockListsClient {
     pub fn new(http: reqwest::Client) -> Self {
+        const SPAMHAUS_URL: &str = "https://www.spamhaus.org/drop/drop_v4.json";
+        const FIREHOL_URL: &str = "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset";
         Self {
             http,
             spamhaus_url: SPAMHAUS_URL.to_owned(),
@@ -31,32 +62,53 @@ impl BlockListsClient {
 
     pub async fn fetch(&self) -> BlockLists {
         let (spamhaus, firehol) = tokio::join!(
-            self.fetch_list(&self.spamhaus_url, Self::parse_spamhaus),
-            self.fetch_list(&self.firehol_url, netset::parse)
+            self.fetch_list(
+                "spamhaus",
+                &self.spamhaus_url,
+                Self::parse_spamhaus
+            ),
+            self.fetch_list("firehol", &self.firehol_url, netset::parse)
         );
         BlockLists { spamhaus, firehol }
     }
 
     /// A failed download and one that parsed to nothing both leave the list
-    /// unavailable rather than clean.
+    /// unavailable rather than clean. `FetchedList::Unavailable` has no
+    /// place for the cause, so it goes to the log.
     async fn fetch_list(
         &self,
+        list: &'static str,
         url: &str,
-        parse: fn(&str) -> Vec<Ipv4Net>,
+        parse: fn(&str) -> ParsedList<Vec<Ipv4Net>>,
     ) -> FetchedList {
-        self.get_text(url)
-            .await
-            .map_or(FetchedList::Unavailable, |body| {
-                NetworkList::new(parse(&body))
-                    .map_or(FetchedList::Unavailable, FetchedList::Fetched)
-            })
+        let body = match self.get_text(url).await {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(
+                    list,
+                    error = %describe_error(&error),
+                    "block list download failed"
+                );
+                return FetchedList::Unavailable;
+            }
+        };
+        let networks = parse(&body).into_logged_entries(list);
+        NetworkList::new(networks).map_or_else(
+            |error| {
+                tracing::warn!(
+                    list,
+                    url,
+                    %error,
+                    "block list parsed to no networks"
+                );
+                FetchedList::Unavailable
+            },
+            FetchedList::Fetched,
+        )
     }
 
-    fn parse_spamhaus(body: &str) -> Vec<Ipv4Net> {
-        body.lines()
-            .filter_map(|line| serde_json::from_str::<DropEntry>(line).ok())
-            .map(|entry| entry.cidr)
-            .collect()
+    fn parse_spamhaus(body: &str) -> ParsedList<Vec<Ipv4Net>> {
+        ParsedList::parse(body, DropLine::read)
     }
 
     async fn get_text(&self, url: &str) -> Result<String, reqwest::Error> {
@@ -106,12 +158,10 @@ mod tests {
 
     #[test]
     fn spamhaus_entries_are_read_and_the_metadata_line_is_skipped() {
-        let sut = SPAMHAUS_SAMPLE;
-
-        let actual = BlockListsClient::parse_spamhaus(sut);
+        let actual = BlockListsClient::parse_spamhaus(SPAMHAUS_SAMPLE);
 
         assert_eq!(
-            actual,
+            actual.into_logged_entries("spamhaus"),
             vec![
                 "203.0.113.0/24".parse::<Ipv4Net>().unwrap(),
                 "198.51.100.0/24".parse().unwrap(),
@@ -119,8 +169,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_spamhaus_line_that_is_neither_entry_nor_metadata_is_garbage() {
+        let actual = DropLine::read(r#"{"type":"something-else"}"#);
+
+        assert_eq!(actual, Err(Garbage));
+    }
+
     #[tokio::test]
-    async fn fetch_populates_both_lists_when_both_succeed() {
+    async fn both_lists_are_read_when_both_sources_answer() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/spamhaus"))
@@ -136,7 +193,6 @@ mod tests {
             )
             .mount(&server)
             .await;
-
         let sut = client(&server);
 
         let actual = sut.fetch().await;
@@ -156,7 +212,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_marks_a_failed_list_unavailable_without_failing_the_other() {
+    async fn a_failed_list_is_unavailable_and_the_other_is_still_read() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/spamhaus"))
@@ -170,7 +226,6 @@ mod tests {
             )
             .mount(&server)
             .await;
-
         let sut = client(&server);
 
         let actual = sut.fetch().await;
@@ -204,19 +259,10 @@ mod tests {
             )
             .mount(&server)
             .await;
-
         let sut = client(&server);
 
         let actual = sut.fetch().await;
 
         assert_eq!(actual.spamhaus, FetchedList::Unavailable);
-        assert_eq!(
-            actual.firehol,
-            fetched_list(&[
-                "192.0.2.0/24",
-                "203.0.113.0/25",
-                "198.51.100.7/32"
-            ])
-        );
     }
 }
