@@ -36,9 +36,7 @@ use chip_io::atlas::{
 };
 use chip_io::blocklists::BlockListsClient;
 use chip_io::geoip::GeoIpClient;
-use chip_io::globalping::{
-    GlobalpingClient, Locations, MeasurementId, MeasurementKind,
-};
+use chip_io::globalping::{GlobalpingClient, Locations, MeasurementId, Ping};
 use chip_io::neighbors::{SweepConfig, sweep};
 use chip_io::proxycheck::ProxycheckClient;
 use chip_io::ripestat::RipestatClient;
@@ -337,7 +335,7 @@ impl AnchorRuns {
 
 async fn anchor_measurements(
     client: &GlobalpingClient,
-    first_measurement_id: &MeasurementId,
+    first_measurement_id: &MeasurementId<Ping>,
     targets: &[PingTarget],
 ) -> Result<AnchorRuns, tokio::task::JoinError> {
     let client = Arc::new(client.clone());
@@ -350,10 +348,7 @@ async fn anchor_measurements(
         tasks.spawn(async move {
             let samples: anyhow::Result<Vec<Option<PingSample>>> = async {
                 let id = client
-                    .create(
-                        &MeasurementKind::ping(target),
-                        &Locations::reuse(sample),
-                    )
+                    .create_ping(target, &Locations::reuse(sample))
                     .await?;
                 Ok(client.poll_ping(&id, GLOBALPING_DEADLINE).await?)
             }
@@ -378,7 +373,7 @@ async fn anchor_measurements(
 
 async fn reach_verdict(
     client: &GlobalpingClient,
-    first_measurement_id: &MeasurementId,
+    first_measurement_id: &MeasurementId<Ping>,
     candidate: Ipv4Addr,
     candidate_port: NonZeroU16,
     control: Option<Ipv4Addr>,
@@ -387,14 +382,10 @@ async fn reach_verdict(
         return Verdict::error("no HTTPS control anchor available");
     };
     let locations = Locations::reuse(first_measurement_id.clone());
-    let candidate_kind = MeasurementKind::https(candidate, candidate_port);
-    let control_kind = MeasurementKind::https(
-        control,
-        const { NonZeroU16::new(443).expect("443 is non-zero") },
-    );
+    let control_port = const { NonZeroU16::new(443).expect("443 is non-zero") };
     let (candidate_id, control_id) = tokio::join!(
-        client.create(&candidate_kind, &locations),
-        client.create(&control_kind, &locations)
+        client.create_https(candidate, candidate_port, &locations),
+        client.create_https(control, control_port, &locations)
     );
     let (candidate_id, control_id) = match (candidate_id, control_id) {
         (Ok(candidate_id), Ok(control_id)) => (candidate_id, control_id),
@@ -416,7 +407,7 @@ async fn reach_verdict(
 async fn record_latency(
     client: &GlobalpingClient,
     command: &ScanCommand,
-    candidate_id: &MeasurementId,
+    candidate_id: &MeasurementId<Ping>,
     candidate: Vec<Option<PingSample>>,
     city_targets: &[PingTarget],
     progress: &ScanProgress,
@@ -470,9 +461,7 @@ async fn run_globalping_measurements(
             return;
         }
     };
-    let candidate_id = match client
-        .create(&MeasurementKind::ping(command.ip()), &locations)
-        .await
+    let candidate_id = match client.create_ping(command.ip(), &locations).await
     {
         Ok(id) => id,
         Err(error) => {

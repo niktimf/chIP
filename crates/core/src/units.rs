@@ -17,6 +17,10 @@ pub fn duration_from_millis(
     Duration::try_from_secs_f64(millis / MILLIS_PER_SECOND)
 }
 
+/// Goes through whole nanoseconds: `as_secs_f64() * 1000.0` does not round
+/// trip, `0.014 s * 1000` prints as `14.000000000000002`. Replace with
+/// `Duration::as_millis_f64` once `duration_millis_float` is stable; it is
+/// still nightly-only on 1.98.
 #[expect(
     clippy::cast_precision_loss,
     reason = "RTTs and latency thresholds stay far below 2^53 ns (~104 days)"

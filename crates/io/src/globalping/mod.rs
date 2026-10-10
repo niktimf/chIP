@@ -1,7 +1,7 @@
 pub mod client;
 mod types;
 pub use client::{
-    GlobalpingClient, GlobalpingError, Limits, Locations, MeasurementId,
-    MeasurementKind,
+    GlobalpingClient, GlobalpingError, Https, Limits, Locations, MeasurementId,
+    Ping,
 };
 mod convert;

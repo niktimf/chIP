@@ -2,6 +2,7 @@ use super::types::{MeasurementStatus, RawMeasurement};
 use crate::credentials::GlobalpingToken;
 use chip_core::model::{HttpProbeOutcome, PingSample};
 use serde::Deserialize;
+use std::marker::PhantomData;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU16;
 use std::time::Duration;
@@ -25,15 +26,53 @@ pub enum GlobalpingError {
     Reqwest(#[from] reqwest::Error),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MeasurementId(String);
+/// Marker for a ping measurement: its id is polled with
+/// [`GlobalpingClient::poll_ping`]. It has no values and only tags
+/// [`MeasurementId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ping {}
 
-impl MeasurementId {
+/// Marker for an HTTPS measurement: its id is polled with
+/// [`GlobalpingClient::poll_https`]. It has no values and only tags
+/// [`MeasurementId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Https {}
+
+/// Id of a created measurement, tagged with the kind it was created as.
+///
+/// Only [`GlobalpingClient::create_ping`] and
+/// [`GlobalpingClient::create_https`] produce ids, so the tag always matches
+/// the measurement type sent to Globalping, and an id is polled only by the
+/// parser of its own kind:
+///
+/// ```
+/// use chip_io::globalping::{GlobalpingClient, Https, MeasurementId};
+/// use std::time::Duration;
+///
+/// async fn outcomes(client: &GlobalpingClient, id: &MeasurementId<Https>) {
+///     let _ = client.poll_https(id, Duration::from_secs(90)).await;
+/// }
+/// ```
+///
+/// An HTTPS id does not compile as an argument of `poll_ping`:
+///
+/// ```compile_fail
+/// use chip_io::globalping::{GlobalpingClient, Https, MeasurementId};
+/// use std::time::Duration;
+///
+/// async fn samples(client: &GlobalpingClient, id: &MeasurementId<Https>) {
+///     let _ = client.poll_ping(id, Duration::from_secs(90)).await;
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MeasurementId<K>(String, PhantomData<K>);
+
+impl<K> MeasurementId<K> {
     fn new(value: String) -> Result<Self, GlobalpingError> {
         if value.is_empty() {
             Err(GlobalpingError::EmptyMeasurementId)
         } else {
-            Ok(Self(value))
+            Ok(Self(value, PhantomData))
         }
     }
 
@@ -42,41 +81,9 @@ impl MeasurementId {
     }
 }
 
-impl std::fmt::Display for MeasurementId {
+impl<K> std::fmt::Display for MeasurementId<K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug)]
-pub struct MeasurementKind(MeasurementKindInner);
-
-#[derive(Debug)]
-enum MeasurementKindInner {
-    Ping { target: Ipv4Addr },
-    Https { target: Ipv4Addr, port: NonZeroU16 },
-}
-
-impl MeasurementKind {
-    pub const fn ping(target: Ipv4Addr) -> Self {
-        Self(MeasurementKindInner::Ping { target })
-    }
-
-    pub const fn https(target: Ipv4Addr, port: NonZeroU16) -> Self {
-        Self(MeasurementKindInner::Https { target, port })
-    }
-
-    fn type_target_options(&self) -> (&'static str, String, serde_json::Value) {
-        match &self.0 {
-            MeasurementKindInner::Ping { target } => {
-                ("ping", target.to_string(), serde_json::json!({"packets": 10}))
-            }
-            MeasurementKindInner::Https { target, port } => (
-                "http",
-                target.to_string(),
-                serde_json::json!({"protocol": "HTTPS", "port": port.get(), "request": {"path": "/", "method": "GET"}}),
-            ),
-        }
     }
 }
 
@@ -89,7 +96,7 @@ enum LocationsInner {
         eyeball_limit: u8,
         datacenter_limit: u8,
     },
-    Reuse(MeasurementId),
+    Reuse(String),
 }
 
 impl Locations {
@@ -110,8 +117,10 @@ impl Locations {
         }
     }
 
-    pub const fn reuse(id: MeasurementId) -> Self {
-        Self(LocationsInner::Reuse(id))
+    /// Runs on the probe set of an earlier measurement of any kind, so
+    /// results of both measurements line up probe by probe.
+    pub fn reuse<K>(id: MeasurementId<K>) -> Self {
+        Self(LocationsInner::Reuse(id.0))
     }
 
     fn to_value(&self) -> serde_json::Value {
@@ -123,9 +132,7 @@ impl Locations {
                 {"country": "RU", "tags": ["eyeball-network"], "limit": eyeball_limit},
                 {"country": "RU", "tags": ["datacenter-network"], "limit": datacenter_limit}
             ]),
-            LocationsInner::Reuse(id) => {
-                serde_json::Value::String(id.to_string())
-            }
+            LocationsInner::Reuse(id) => serde_json::Value::String(id.clone()),
         }
     }
 }
@@ -163,22 +170,56 @@ impl GlobalpingClient {
         }
     }
 
+    /// Starts a ping measurement of `target`: 10 packets from every probe.
+    ///
     /// # Errors
     ///
     /// Returns `GlobalpingError` when the request fails, the API answers with
     /// a rate limit, no suitable probes or another non-success status, or the
     /// measurement id is empty.
-    pub async fn create(
+    pub async fn create_ping(
         &self,
-        kind: &MeasurementKind,
+        target: Ipv4Addr,
         locations: &Locations,
-    ) -> Result<MeasurementId, GlobalpingError> {
+    ) -> Result<MeasurementId<Ping>, GlobalpingError> {
+        self.create(
+            "ping",
+            target,
+            serde_json::json!({"packets": 10}),
+            locations,
+        )
+        .await
+    }
+
+    /// Starts an HTTPS measurement: `GET /` on `target:port` from every probe.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`GlobalpingClient::create_ping`].
+    pub async fn create_https(
+        &self,
+        target: Ipv4Addr,
+        port: NonZeroU16,
+        locations: &Locations,
+    ) -> Result<MeasurementId<Https>, GlobalpingError> {
+        let options = serde_json::json!({"protocol": "HTTPS", "port": port.get(), "request": {"path": "/", "method": "GET"}});
+        self.create("http", target, options, locations).await
+    }
+
+    /// Sends the request and tags the id with `K`. The caller picks `K` to
+    /// match `typ`; `create_ping` and `create_https` are the only callers.
+    async fn create<K>(
+        &self,
+        typ: &str,
+        target: Ipv4Addr,
+        options: serde_json::Value,
+        locations: &Locations,
+    ) -> Result<MeasurementId<K>, GlobalpingError> {
         #[derive(Deserialize)]
         struct Created {
             id: String,
         }
-        let (typ, target, options) = kind.type_target_options();
-        let body = serde_json::json!({"type": typ, "target": target, "locations": locations.to_value(), "measurementOptions": options});
+        let body = serde_json::json!({"type": typ, "target": target.to_string(), "locations": locations.to_value(), "measurementOptions": options});
         let resp = self
             .request(
                 self.http
@@ -222,10 +263,11 @@ impl GlobalpingClient {
     /// before `deadline`, and the request errors of `create` otherwise.
     pub async fn poll_ping(
         &self,
-        id: &MeasurementId,
+        id: &MeasurementId<Ping>,
         deadline: Duration,
     ) -> Result<Vec<Option<PingSample>>, GlobalpingError> {
-        let measurement = self.poll_until_finished(id, deadline).await?;
+        let measurement =
+            self.poll_until_finished(id.as_str(), deadline).await?;
         Ok(measurement.ping_samples())
     }
 
@@ -238,16 +280,17 @@ impl GlobalpingClient {
     /// before `deadline`, and the request errors of `create` otherwise.
     pub async fn poll_https(
         &self,
-        id: &MeasurementId,
+        id: &MeasurementId<Https>,
         deadline: Duration,
     ) -> Result<Vec<HttpProbeOutcome>, GlobalpingError> {
-        let measurement = self.poll_until_finished(id, deadline).await?;
+        let measurement =
+            self.poll_until_finished(id.as_str(), deadline).await?;
         Ok(measurement.https_outcomes())
     }
 
     async fn poll_until_finished(
         &self,
-        id: &MeasurementId,
+        id: &str,
         deadline: Duration,
     ) -> Result<RawMeasurement, GlobalpingError> {
         tokio::time::timeout(deadline, self.poll(id))
@@ -255,10 +298,7 @@ impl GlobalpingClient {
             .map_err(GlobalpingError::Timeout)?
     }
 
-    async fn poll(
-        &self,
-        id: &MeasurementId,
-    ) -> Result<RawMeasurement, GlobalpingError> {
+    async fn poll(&self, id: &str) -> Result<RawMeasurement, GlobalpingError> {
         loop {
             let resp = self
                 .request(
@@ -318,13 +358,13 @@ mod tests {
         value.parse().unwrap()
     }
 
-    fn measurement_id(value: &str) -> MeasurementId {
+    fn measurement_id<K>(value: &str) -> MeasurementId<K> {
         MeasurementId::new(value.to_string()).unwrap()
     }
 
     #[test]
     fn an_empty_measurement_id_is_rejected() {
-        let error = MeasurementId::new(String::new()).unwrap_err();
+        let error = MeasurementId::<Ping>::new(String::new()).unwrap_err();
 
         assert!(matches!(error, GlobalpingError::EmptyMeasurementId));
     }
@@ -377,10 +417,7 @@ mod tests {
         let sut = client_against(&server);
 
         let id = sut
-            .create(
-                &MeasurementKind::ping(ip("192.0.2.1")),
-                &Locations::ru(8, 4).unwrap(),
-            )
+            .create_ping(ip("192.0.2.1"), &Locations::ru(8, 4).unwrap())
             .await
             .unwrap();
 
@@ -412,9 +449,9 @@ mod tests {
         let sut = client_against(&server);
 
         let id = sut
-            .create(
-                &MeasurementKind::ping(ip("192.0.2.2")),
-                &Locations::reuse(measurement_id("meas-1")),
+            .create_ping(
+                ip("192.0.2.2"),
+                &Locations::reuse(measurement_id::<Ping>("meas-1")),
             )
             .await
             .unwrap();
@@ -439,12 +476,10 @@ mod tests {
             .await;
         let sut = client_against(&server);
 
-        sut.create(
-            &MeasurementKind::https(
-                ip("192.0.2.1"),
-                NonZeroU16::new(443).unwrap(),
-            ),
-            &Locations::reuse(measurement_id("meas-1")),
+        sut.create_https(
+            ip("192.0.2.1"),
+            NonZeroU16::new(443).unwrap(),
+            &Locations::reuse(measurement_id::<Ping>("meas-1")),
         )
         .await
         .unwrap();
@@ -468,9 +503,9 @@ mod tests {
         let sut = client_against(&server);
 
         let err = sut
-            .create(
-                &MeasurementKind::ping(ip("192.0.2.1")),
-                &Locations::reuse(measurement_id("x")),
+            .create_ping(
+                ip("192.0.2.1"),
+                &Locations::reuse(measurement_id::<Ping>("x")),
             )
             .await
             .unwrap_err();
@@ -489,9 +524,9 @@ mod tests {
         let sut = client_against(&server);
 
         let err = sut
-            .create(
-                &MeasurementKind::ping(ip("192.0.2.1")),
-                &Locations::reuse(measurement_id("x")),
+            .create_ping(
+                ip("192.0.2.1"),
+                &Locations::reuse(measurement_id::<Ping>("x")),
             )
             .await
             .unwrap_err();

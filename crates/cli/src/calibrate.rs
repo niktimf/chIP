@@ -4,9 +4,7 @@ use anyhow::Context as _;
 use chip_core::model::{AnchorSeries, PingSample, PingSweepFacts};
 use chip_core::verdict::latency::{LatencySummary, summarize_latency};
 use chip_io::atlas::{Anchor, AnchorClient, select_for_city};
-use chip_io::globalping::{
-    GlobalpingClient, Locations, MeasurementId, MeasurementKind,
-};
+use chip_io::globalping::{GlobalpingClient, Locations, MeasurementId, Ping};
 
 use crate::config::{CalibrateCommand, CalibrationTarget, ProbeSelection};
 
@@ -30,7 +28,7 @@ struct CalibrationSession {
     globalping: GlobalpingClient,
     anchors: Vec<Anchor>,
     probes: ProbeSelection,
-    first_measurement_id: Option<MeasurementId>,
+    first_measurement_id: Option<MeasurementId<Ping>>,
 }
 
 impl CalibrationSession {
@@ -66,10 +64,8 @@ impl CalibrationSession {
             || Locations::ru(self.probes.eyeball(), self.probes.datacenter()),
             |id| Ok(Locations::reuse(id.clone())),
         )?;
-        let candidate_id = self
-            .globalping
-            .create(&MeasurementKind::ping(target.ip()), &locations)
-            .await?;
+        let candidate_id =
+            self.globalping.create_ping(target.ip(), &locations).await?;
         let sample = self
             .first_measurement_id
             .get_or_insert_with(|| candidate_id.clone())
@@ -85,16 +81,13 @@ impl CalibrationSession {
     async fn measure_anchors(
         &self,
         anchors: Vec<Anchor>,
-        sample: &MeasurementId,
+        sample: &MeasurementId<Ping>,
     ) -> anyhow::Result<Vec<AnchorSeries>> {
         let mut measurements = Vec::with_capacity(anchors.len());
         for anchor in anchors {
             let id = self
                 .globalping
-                .create(
-                    &MeasurementKind::ping(anchor.ip_v4),
-                    &Locations::reuse(sample.clone()),
-                )
+                .create_ping(anchor.ip_v4, &Locations::reuse(sample.clone()))
                 .await?;
             let samples =
                 self.globalping.poll_ping(&id, MEASUREMENT_DEADLINE).await?;
