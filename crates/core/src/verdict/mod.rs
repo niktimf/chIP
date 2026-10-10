@@ -3,6 +3,7 @@ pub mod blocklists;
 pub mod geo;
 pub mod latency;
 pub mod neighbors;
+pub mod portal;
 pub mod provenance;
 pub mod reach;
 pub mod reputation;

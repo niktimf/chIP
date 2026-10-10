@@ -1,144 +1,37 @@
 use chip_core::model::PortalOutcome;
-use http::StatusCode;
+use chip_core::verdict::portal::{PortalChecks, PortalEndpoint};
+use futures::future::join_all;
 
 use super::client::TunnelClient;
 use crate::error_chain::describe_error;
 
-#[derive(Debug, Clone, Copy)]
-struct PortalEndpoint {
-    url: &'static str,
-    expected_status: StatusCode,
-    expected_body: Option<&'static str>,
-}
-
-const PORTAL_ENDPOINTS: &[PortalEndpoint] = &[
-    PortalEndpoint {
-        url: "http://connectivitycheck.gstatic.com/generate_204",
-        expected_status: StatusCode::NO_CONTENT,
-        expected_body: Some(""),
-    },
-    PortalEndpoint {
-        url: "http://cp.cloudflare.com/generate_204",
-        expected_status: StatusCode::NO_CONTENT,
-        expected_body: Some(""),
-    },
-    PortalEndpoint {
-        url: "http://captive.apple.com/hotspot-detect.html",
-        expected_status: StatusCode::OK,
-        expected_body: Some(
-            "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>",
-        ),
-    },
-    PortalEndpoint {
-        url: "http://www.msftconnecttest.com/connecttest.txt",
-        expected_status: StatusCode::OK,
-        expected_body: Some("Microsoft Connect Test"),
-    },
-    PortalEndpoint {
-        url: "http://detectportal.firefox.com/success.txt",
-        expected_status: StatusCode::OK,
-        expected_body: Some("success"),
-    },
-    PortalEndpoint {
-        url: "https://connectivitycheck.gstatic.com/generate_204",
-        expected_status: StatusCode::NO_CONTENT,
-        expected_body: Some(""),
-    },
-    PortalEndpoint {
-        url: "https://cp.cloudflare.com/generate_204",
-        expected_status: StatusCode::NO_CONTENT,
-        expected_body: Some(""),
-    },
-];
-
-async fn probe_at(
+async fn probe(
     client: &TunnelClient,
-    url: &str,
-    expected_status: StatusCode,
-    expected_body: Option<&str>,
+    endpoint: &PortalEndpoint,
 ) -> PortalOutcome {
-    let response = match client.get(url, &[]).await {
-        Ok(response) => response,
+    let url = endpoint.url();
+    match client.get(&url, &[]).await {
+        Ok(response) => endpoint.classify(
+            response.status,
+            &response.final_url,
+            &response.body,
+        ),
         Err(error) => {
             tracing::debug!(
                 url,
                 error = %describe_error(&error),
                 "portal endpoint unreachable"
             );
-            return PortalOutcome::Unreachable;
+            PortalOutcome::Unreachable
         }
-    };
-    let body_matches = expected_body
-        .is_none_or(|expected| response.body.trim() == expected.trim());
-    let final_url_matches = reqwest::Url::parse(url)
-        .is_ok_and(|expected| response.final_url == expected);
-    if response.status == expected_status && final_url_matches && body_matches {
-        PortalOutcome::Ok
-    } else {
-        PortalOutcome::Altered
     }
 }
 
-/// Returns `(https, http)` outcomes for the vendor-documented connectivity
-/// endpoints. Requests are concurrent and every task is joined.
-///
-/// # Errors
-///
-/// Returns `JoinError` when a probe task panics or is cancelled.
-pub async fn probe_portal_endpoints(
-    client: &TunnelClient,
-) -> Result<(Vec<PortalOutcome>, Vec<PortalOutcome>), tokio::task::JoinError> {
-    let mut tasks = tokio::task::JoinSet::new();
-    for (index, endpoint) in PORTAL_ENDPOINTS.iter().copied().enumerate() {
-        let client = client.clone();
-        tasks.spawn(async move {
-            let outcome = probe_at(
-                &client,
-                endpoint.url,
-                endpoint.expected_status,
-                endpoint.expected_body,
-            )
-            .await;
-            (index, endpoint.url.starts_with("https://"), outcome)
-        });
-    }
-
-    let mut rows = crate::tasks::collect(tasks).await?;
-    rows.sort_by_key(|(index, _, _)| *index);
-    let (https, http): (Vec<_>, Vec<_>) =
-        rows.into_iter().partition(|(_, is_https, _)| *is_https);
-    Ok((
-        https.into_iter().map(|(_, _, outcome)| outcome).collect(),
-        http.into_iter().map(|(_, _, outcome)| outcome).collect(),
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use wiremock::matchers::method;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    #[tokio::test]
-    async fn exact_response_is_ok_and_wrong_body_is_altered() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string("expected"),
-            )
-            .mount(&server)
-            .await;
-        let client = TunnelClient::from_client(reqwest::Client::new());
-
-        assert_eq!(
-            probe_at(&client, &server.uri(), StatusCode::OK, Some("expected"))
-                .await,
-            PortalOutcome::Ok
-        );
-        assert_eq!(
-            probe_at(&client, &server.uri(), StatusCode::OK, Some("different"))
-                .await,
-            PortalOutcome::Altered
-        );
-    }
+/// Fetches every vendor-documented connectivity endpoint concurrently and
+/// classifies each answer.
+pub async fn probe_portal_endpoints(client: &TunnelClient) -> PortalChecks {
+    let probes = PortalEndpoint::ALL.iter().map(|endpoint| async move {
+        (endpoint.scheme(), probe(client, endpoint).await)
+    });
+    join_all(probes).await.into_iter().collect()
 }

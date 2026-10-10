@@ -526,14 +526,7 @@ async fn record_service(
 }
 
 async fn record_portal(client: &TunnelClient, progress: &ScanProgress) {
-    let verdict = probe_portal_endpoints(client).await.map_or_else(
-        |error| {
-            error_verdict(
-                anyhow::Error::new(error).context("portal task failed"),
-            )
-        },
-        |(https, http)| judge_tampering(&https, &http),
-    );
+    let verdict = judge_tampering(&probe_portal_endpoints(client).await);
     progress.add([CheckResult::new(gate::TAMPERING, verdict)]);
 }
 
