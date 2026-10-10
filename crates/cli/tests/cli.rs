@@ -111,7 +111,7 @@ fn an_unparsable_rust_log_is_reported_instead_of_silently_replaced() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("warning: ignoring RUST_LOG and logging at info"),
+        stderr.contains("ignoring RUST_LOG and logging at info"),
         "{stderr}"
     );
 }
@@ -158,6 +158,25 @@ fn an_offline_scan_with_its_unreachable_gates_skipped_passes() {
     assert_eq!(output.status.code(), Some(0), "{stderr}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("OVERALL: OK"), "{stdout}");
+}
+
+#[test]
+fn logs_go_to_stderr_and_leave_stdout_to_the_table() {
+    let output = offline_scan().env("RUST_LOG", "info").output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The offline scan skips every gate, so each row of its table is a SKIP.
+    let not_table: Vec<&str> = stdout
+        .lines()
+        .filter(|line| {
+            !line.starts_with("SKIP ") && !line.starts_with("OVERALL: ")
+        })
+        .collect();
+    assert_eq!(not_table, Vec::<&str>::new(), "{stdout}");
+    assert!(stdout.ends_with("OVERALL: OK\n"), "{stdout}");
+    // The unreachable block lists are logged as warnings.
+    assert!(stderr.contains("WARN"), "{stderr}");
 }
 
 #[test]

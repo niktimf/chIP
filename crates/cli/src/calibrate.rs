@@ -13,7 +13,7 @@ use chip_io::globalping::{
 use futures::{StreamExt as _, TryStreamExt as _, stream};
 
 use crate::config::{CalibrateCommand, CalibrationTarget};
-use crate::{CITY_ANCHORS, GLOBALPING_DEADLINE};
+use crate::net::{CITY_ANCHORS, GLOBALPING_DEADLINE, http_client};
 
 #[derive(Debug, Clone)]
 pub struct CalibrationRow {
@@ -84,8 +84,7 @@ struct CalibrationSession {
 
 impl CalibrationSession {
     async fn start(command: &CalibrateCommand) -> anyhow::Result<Self> {
-        let http =
-            crate::http_client().context("failed to build the HTTP client")?;
+        let http = http_client().context("failed to build the HTTP client")?;
         let anchors = AnchorClient::new(http.clone())
             .anchors()
             .await
