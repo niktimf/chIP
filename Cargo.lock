@@ -226,6 +226,7 @@ name = "chip-io"
 version = "0.2.0"
 dependencies = [
  "chip-core",
+ "futures",
  "http",
  "ipnet",
  "itertools",

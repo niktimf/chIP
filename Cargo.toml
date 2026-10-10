@@ -20,6 +20,7 @@ hooks = true
 
 [workspace.dependencies]
 anyhow = "1"
+futures = { version = "0.3", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 country-code-enum = { version = "1", default-features = false }
 http = "1"

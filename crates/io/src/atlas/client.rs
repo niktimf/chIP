@@ -1,4 +1,5 @@
 use super::select::Anchor;
+use futures::{TryStreamExt as _, stream};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -64,35 +65,52 @@ impl AnchorClient {
         // About 800 anchors exist, two pages at this page size. The bound
         // stops a `next` link that keeps pointing back at a served page.
         const MAX_PAGES: usize = 20;
-        #[derive(serde::Deserialize)]
-        struct Page {
-            results: Vec<RawAnchor>,
-            next: Option<String>,
-        }
-        let mut url = format!(
-            "{}?page_size=500&fields=fqdn,ip_v4,city,country,as_v4,is_disabled,date_decommissioned",
-            self.base_url
-        );
-        let mut out = Vec::new();
-        for _ in 0..MAX_PAGES {
-            let page: Page = self
-                .http
-                .get(&url)
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            out.extend(
-                page.results.into_iter().filter_map(RawAnchor::into_active),
-            );
-            match page.next {
-                Some(next) => url = next,
-                None => return Ok(out),
+        const FIELDS: &str =
+            "fqdn,ip_v4,city,country,as_v4,is_disabled,date_decommissioned";
+        let first = self
+            .http
+            .get(&self.base_url)
+            .query(&[("page_size", "500"), ("fields", FIELDS)]);
+        let start = Cursor {
+            request: Some(first),
+            fetched: 0,
+        };
+        let pages = stream::try_unfold(start, |cursor| async move {
+            let Some(request) = cursor.request else {
+                return Ok(None);
+            };
+            if cursor.fetched == MAX_PAGES {
+                return Err(AtlasError::TooManyPages { limit: MAX_PAGES });
             }
-        }
-        Err(AtlasError::TooManyPages { limit: MAX_PAGES })
+            let Page { results, next } = Self::page(request).await?;
+            let following = Cursor {
+                request: next.map(|url| self.http.get(url)),
+                fetched: cursor.fetched + 1,
+            };
+            Ok(Some((results, following)))
+        });
+        let raw: Vec<RawAnchor> = pages.try_concat().await?;
+        Ok(raw.into_iter().filter_map(RawAnchor::into_active).collect())
     }
+
+    async fn page(
+        request: reqwest::RequestBuilder,
+    ) -> Result<Page, AtlasError> {
+        Ok(request.send().await?.error_for_status()?.json().await?)
+    }
+}
+
+#[derive(Deserialize)]
+struct Page {
+    results: Vec<RawAnchor>,
+    next: Option<String>,
+}
+
+/// State of the walk over the anchor pages: the request for the next page,
+/// if any, and how many pages were already fetched.
+struct Cursor {
+    request: Option<reqwest::RequestBuilder>,
+    fetched: usize,
 }
 
 #[cfg(test)]
