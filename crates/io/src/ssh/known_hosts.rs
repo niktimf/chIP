@@ -1,4 +1,5 @@
-use super::session::{SshError, private_file, secret_file};
+use super::credential_files::{private_file, secret_file};
+use super::session::SshError;
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};

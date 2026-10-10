@@ -722,10 +722,12 @@ async fn start_listener(
     ip: Ipv4Addr,
     progress: &ScanProgress,
 ) -> Option<NonZeroU16> {
+    /// How long the runner waits for the temporary listener's TLS answer.
+    const LISTENER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
     for port in LISTENER_PORTS {
         match session.start_listener(port).await {
             Ok(ListenerOutcome::Listening) => {
-                match verify_listener(ip, port).await {
+                match verify_listener(ip, port, LISTENER_PROBE_TIMEOUT).await {
                     Ok(()) => return Some(port),
                     Err(error) => {
                         // A failed stop keeps the port in the session, so the
@@ -735,9 +737,7 @@ async fn start_listener(
                             stop_listener(session).await;
                         progress.add([CheckResult::new(
                             gate::REACH,
-                            error_verdict(anyhow::Error::new(error).context(
-                                "temporary TLS listener is not reachable from the runner",
-                            )),
+                            error_verdict(error),
                         )]);
                         return None;
                     }
@@ -884,7 +884,7 @@ fn skipped_ssh_results() -> Vec<CheckResult> {
         .collect()
 }
 
-fn ssh_failure(error: chip_io::ssh::SshError) -> Verdict {
+fn ssh_failure(error: impl Into<anyhow::Error>) -> Verdict {
     // Formatting belongs to the CLI boundary; the adapter retains typed causes.
     error_verdict(error)
 }

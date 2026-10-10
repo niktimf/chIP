@@ -1,15 +1,68 @@
 use super::session::{SshError, SshSession};
-use chip_core::model::ProcStatSnapshot;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU16;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
+use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Why a temporary listener operation could not report an outcome.
+#[derive(Debug, Error)]
+pub enum ListenerError {
+    #[error(
+        "a temporary listener on port {port} is already owned by this session"
+    )]
+    AlreadyStarted { port: u16 },
+    #[error("unexpected listener preflight response: {0}")]
+    InvalidPreflightResponse(String),
+    #[error("unexpected listener start response: {0}")]
+    InvalidStartResponse(String),
+    #[error(transparent)]
+    Ssh(#[from] SshError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListenerOutcome {
     Listening,
     PortInUse,
-    Failed(String),
+    Failed(ListenerFailure),
+}
+
+/// Why the candidate could not start a temporary listener. The texts are
+/// the details a scan reports after "listener failed: ".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
+pub enum ListenerFailure {
+    #[strum(to_string = "openssl is not installed on the candidate")]
+    MissingOpenSsl,
+    #[strum(to_string = "ss is not installed on the candidate")]
+    MissingSocketInspector,
+    /// The private temporary directory could not be created.
+    #[strum(to_string = "TEMP_FAILED")]
+    TempDir,
+    /// The throwaway certificate could not be generated.
+    #[strum(to_string = "CERT_FAILED")]
+    Certificate,
+    /// `openssl s_server` was launched but no socket listens on the port.
+    #[strum(to_string = "FAILED")]
+    NotListening,
+}
+
+impl ListenerOutcome {
+    /// Reads the reply of `listener_start_script`.
+    ///
+    /// The script prints exactly one reply line. The collected output puts
+    /// stdout before stderr, so lines after the reply are stderr of a failed
+    /// command, for example `mktemp`.
+    fn parse_start_reply(output: &str) -> Result<Self, ListenerError> {
+        match output.lines().next().map(str::trim) {
+            Some("LISTENING") => Ok(Self::Listening),
+            Some("FAILED") => Ok(Self::Failed(ListenerFailure::NotListening)),
+            Some("CERT_FAILED") => {
+                Ok(Self::Failed(ListenerFailure::Certificate))
+            }
+            Some("TEMP_FAILED") => Ok(Self::Failed(ListenerFailure::TempDir)),
+            _ => Err(ListenerError::InvalidStartResponse(output.to_owned())),
+        }
+    }
 }
 
 /// A successful preflight describes one actionable state. Transport and
@@ -23,13 +76,15 @@ pub enum ListenerReadiness {
 }
 
 impl ListenerReadiness {
-    fn parse(output: &str) -> Result<Self, SshError> {
+    fn parse(output: &str) -> Result<Self, ListenerError> {
         match output.trim() {
             "READY" => Ok(Self::Ready),
             "BUSY" => Ok(Self::PortInUse),
             "MISSING_OPENSSL" => Ok(Self::MissingOpenSsl),
             "MISSING_SS" => Ok(Self::MissingSocketInspector),
-            _ => Err(SshError::InvalidPreflightResponse(output.to_owned())),
+            _ => {
+                Err(ListenerError::InvalidPreflightResponse(output.to_owned()))
+            }
         }
     }
 }
@@ -56,10 +111,10 @@ impl ListenerSlot {
         *self.lock()
     }
 
-    fn claim(&self, port: NonZeroU16) -> Result<(), SshError> {
+    fn claim(&self, port: NonZeroU16) -> Result<(), ListenerError> {
         let mut owned = self.lock();
         if let Some(current) = *owned {
-            return Err(SshError::ListenerAlreadyStarted {
+            return Err(ListenerError::AlreadyStarted {
                 port: current.get(),
             });
         }
@@ -82,20 +137,6 @@ impl ListenerSlot {
         // held cannot leave it half-written.
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
-
-fn parse_proc_stat(text: &str) -> Option<ProcStatSnapshot> {
-    let line = text.lines().find(|l| l.starts_with("cpu "))?;
-    let fields: Vec<u64> = line
-        .split_whitespace()
-        .skip(1)
-        .map(str::parse)
-        .collect::<Result<_, _>>()
-        .ok()?;
-    if fields.len() < 8 {
-        return None;
-    }
-    ProcStatSnapshot::new(fields[7], fields.iter().sum()).ok()
 }
 
 fn listener_start_script(port: u16) -> String {
@@ -141,12 +182,13 @@ fn listener_stop_script(port: u16) -> String {
 impl SshSession {
     /// # Errors
     ///
-    /// Returns `SshError` when the preflight command fails or its output is
-    /// not a known readiness answer.
+    /// Returns `ListenerError::Ssh` when the preflight command fails, and
+    /// `ListenerError::InvalidPreflightResponse` when its output is not a
+    /// known readiness answer.
     pub async fn listener_readiness(
         &self,
         port: NonZeroU16,
-    ) -> Result<ListenerReadiness, SshError> {
+    ) -> Result<ListenerReadiness, ListenerError> {
         let output = self
             .run_shell(&listener_preflight_script(port), self.command_timeout())
             .await?;
@@ -161,15 +203,18 @@ impl SshSession {
     ///
     /// # Errors
     ///
-    /// Returns `SshError::ListenerAlreadyStarted` when this session already
-    /// owns a listener, and `SshError` when a remote command fails. A listener
-    /// that does not come up is an `Ok` outcome.
+    /// Returns `ListenerError::AlreadyStarted` when this session already
+    /// owns a listener, `ListenerError::Ssh` when a remote command fails,
+    /// and `ListenerError::InvalidPreflightResponse` or
+    /// `ListenerError::InvalidStartResponse` when a remote script replies
+    /// with an unknown answer. A listener that does not come up is an `Ok`
+    /// outcome.
     pub async fn start_listener(
         &self,
         port: NonZeroU16,
-    ) -> Result<ListenerOutcome, SshError> {
+    ) -> Result<ListenerOutcome, ListenerError> {
         if let Some(owned) = self.listener.owned() {
-            return Err(SshError::ListenerAlreadyStarted { port: owned.get() });
+            return Err(ListenerError::AlreadyStarted { port: owned.get() });
         }
         match self.listener_readiness(port).await? {
             ListenerReadiness::Ready => {}
@@ -178,12 +223,12 @@ impl SshSession {
             }
             ListenerReadiness::MissingOpenSsl => {
                 return Ok(ListenerOutcome::Failed(
-                    "openssl is not installed on the candidate".to_string(),
+                    ListenerFailure::MissingOpenSsl,
                 ));
             }
             ListenerReadiness::MissingSocketInspector => {
                 return Ok(ListenerOutcome::Failed(
-                    "ss is not installed on the candidate".to_string(),
+                    ListenerFailure::MissingSocketInspector,
                 ));
             }
         }
@@ -198,11 +243,7 @@ impl SshSession {
         let output = self
             .run_command("sh", &["-c", &script, &tag], timeout)
             .await?;
-        if output.contains("LISTENING") {
-            Ok(ListenerOutcome::Listening)
-        } else {
-            Ok(ListenerOutcome::Failed(output.trim().to_string()))
-        }
+        ListenerOutcome::parse_start_reply(&output)
     }
 
     /// Stops the listener this session started and removes its remote
@@ -222,16 +263,6 @@ impl SshSession {
         self.listener.release(port);
         Ok(())
     }
-
-    /// # Errors
-    ///
-    /// Returns `SshError` when reading `/proc/stat` fails, and
-    /// `SshError::InvalidSnapshot` when its `cpu` line cannot be parsed.
-    pub async fn steal_snapshot(&self) -> Result<ProcStatSnapshot, SshError> {
-        let timeout = self.command_timeout();
-        let text = self.run_command("cat", &["/proc/stat"], timeout).await?;
-        parse_proc_stat(&text).ok_or(SshError::InvalidSnapshot)
-    }
 }
 
 /// Confirms the temporary listener answers TLS from the runner.
@@ -240,23 +271,39 @@ impl SshSession {
 /// throwaway self-signed certificate, so certificate verification is off on
 /// purpose.
 ///
+/// The client is built here rather than taken from the caller because it
+/// skips certificate verification, which the shared client must not do.
+/// `timeout` bounds the whole request.
+///
 /// # Errors
 ///
-/// Returns the `reqwest::Error` of building the client or of the request
-/// when the listener does not answer TLS.
+/// Returns `ListenerProbeError::Unreachable` when the listener does not
+/// answer TLS within `timeout`.
 pub async fn verify_listener(
     ip: Ipv4Addr,
     port: NonZeroU16,
-) -> Result<(), reqwest::Error> {
+    timeout: Duration,
+) -> Result<(), ListenerProbeError> {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(5))
-        .build()?;
+        .timeout(timeout)
+        .build()
+        .map_err(ListenerProbeError::Client)?;
     client
         .get(format!("https://{ip}:{port}/"))
         .send()
         .await
         .map(drop)
+        .map_err(ListenerProbeError::Unreachable)
+}
+
+/// Why the runner could not confirm the temporary listener.
+#[derive(Debug, Error)]
+pub enum ListenerProbeError {
+    #[error("could not build the TLS client for the listener probe")]
+    Client(#[source] reqwest::Error),
+    #[error("temporary TLS listener is not reachable from the runner")]
+    Unreachable(#[source] reqwest::Error),
 }
 
 #[cfg(test)]
@@ -264,35 +311,6 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
-
-    const PROC_STAT_LINE: &str = "cpu  1200 30 450 90111 12 0 34 250 0 0\ncpu0 600 15 225 45055 6 0 17 125 0 0\n";
-
-    #[test]
-    #[expect(
-        clippy::identity_op,
-        reason = "the zeros mirror the /proc/stat fields one to one"
-    )]
-    fn parse_proc_stat_reads_the_aggregate_cpu_line_only() {
-        let snap = parse_proc_stat(PROC_STAT_LINE).unwrap();
-        // fields after "cpu": 1200 30 450 90111 12 0 34 250 0 0 - steal is
-        // the 8th (250), total is their sum (92087).
-        assert_eq!(snap.steal_ticks(), 250);
-        assert_eq!(
-            snap.total_ticks(),
-            1200 + 30 + 450 + 90111 + 12 + 0 + 34 + 250 + 0 + 0
-        );
-    }
-
-    #[rstest::rstest]
-    #[case::too_few_fields("cpu  1 2 3\n")]
-    #[case::no_cpu_line("nonsense\n")]
-    fn parse_proc_stat_returns_none_for_an_unreadable_snapshot(
-        #[case] sut: &str,
-    ) {
-        let actual = parse_proc_stat(sut);
-
-        assert!(actual.is_none());
-    }
 
     #[cfg(unix)]
     fn write_stub(dir: &std::path::Path, name: &str, body: &str) {
@@ -367,28 +385,70 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn stop_script_is_valid_shell() {
-        for script in [listener_start_script(443), listener_stop_script(443)] {
-            let status = std::process::Command::new("sh")
-                .arg("-n")
-                .arg("-c")
-                .arg(&script)
-                .status()
-                .unwrap();
-            assert!(status.success(), "sh -n failed for: {script}");
-        }
-    }
     #[rstest::rstest]
-    #[case("READY\n", ListenerReadiness::Ready)]
-    #[case("BUSY\n", ListenerReadiness::PortInUse)]
-    #[case("MISSING_OPENSSL\n", ListenerReadiness::MissingOpenSsl)]
-    #[case("MISSING_SS\n", ListenerReadiness::MissingSocketInspector)]
+    #[case::start(listener_start_script(443))]
+    #[case::stop(listener_stop_script(443))]
+    fn the_listener_script_parses_as_shell(#[case] script: String) {
+        let status = std::process::Command::new("sh")
+            .arg("-n")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "sh -n failed for: {script}");
+    }
+
+    #[rstest::rstest]
+    #[case::free_port("READY\n", ListenerReadiness::Ready)]
+    #[case::busy_port("BUSY\n", ListenerReadiness::PortInUse)]
+    #[case::no_openssl("MISSING_OPENSSL\n", ListenerReadiness::MissingOpenSsl)]
+    #[case::no_ss("MISSING_SS\n", ListenerReadiness::MissingSocketInspector)]
     fn preflight_returns_one_actionable_state(
         #[case] response: &str,
         #[case] expected: ListenerReadiness,
     ) {
-        assert_eq!(ListenerReadiness::parse(response).unwrap(), expected);
+        let actual = ListenerReadiness::parse(response).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::listening("LISTENING\n", ListenerOutcome::Listening)]
+    #[case::no_socket(
+        "FAILED\n",
+        ListenerOutcome::Failed(ListenerFailure::NotListening)
+    )]
+    #[case::no_certificate(
+        "CERT_FAILED\n",
+        ListenerOutcome::Failed(ListenerFailure::Certificate)
+    )]
+    #[case::no_temp_dir_with_mktemp_stderr(
+        "TEMP_FAILED\nmktemp: failed to create directory\n",
+        ListenerOutcome::Failed(ListenerFailure::TempDir)
+    )]
+    fn the_start_reply_names_one_outcome(
+        #[case] reply: &str,
+        #[case] expected: ListenerOutcome,
+    ) {
+        let actual = ListenerOutcome::parse_start_reply(reply).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::empty("")]
+    #[case::stderr_only("sh: 1: ss: Permission denied\n")]
+    #[case::reply_inside_a_line("NOT LISTENING\n")]
+    fn an_unknown_start_reply_is_an_error_not_a_failed_listener(
+        #[case] reply: &str,
+    ) {
+        let actual = ListenerOutcome::parse_start_reply(reply);
+
+        assert!(
+            matches!(&actual, Err(ListenerError::InvalidStartResponse(text)) if text == reply),
+            "{actual:?}"
+        );
     }
 
     fn port(value: u16) -> NonZeroU16 {
@@ -418,7 +478,7 @@ mod tests {
 
         assert!(matches!(
             actual,
-            Err(SshError::ListenerAlreadyStarted { port: 443 })
+            Err(ListenerError::AlreadyStarted { port: 443 })
         ));
         assert_eq!(sut.owned(), Some(port(443)));
     }
@@ -445,7 +505,7 @@ mod tests {
     fn unreadable_preflight_is_not_a_free_or_busy_port() {
         assert!(matches!(
             ListenerReadiness::parse(""),
-            Err(SshError::InvalidPreflightResponse(_))
+            Err(ListenerError::InvalidPreflightResponse(_))
         ));
     }
 

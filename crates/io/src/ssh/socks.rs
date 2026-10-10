@@ -1,12 +1,22 @@
-use super::known_hosts::{HostKeyPolicy, KnownHostsFiles};
-use super::session::{SshConfig, SshError, secret_file};
+use super::credential_files::SshCredentialFiles;
+use super::known_hosts::HostKeyPolicy;
+use super::session::{SshConfig, SshError};
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroU16;
 use std::time::Duration;
-use tempfile::NamedTempFile;
+use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
+
+/// Why a SOCKS tunnel did not start.
+#[derive(Debug, Error)]
+pub enum SocksError {
+    #[error("SOCKS listener did not become ready")]
+    NotReady,
+    #[error(transparent)]
+    Ssh(#[from] SshError),
+}
 
 /// A dedicated `ssh -N -D` child process: a SOCKS5 proxy into the candidate.
 ///
@@ -17,26 +27,25 @@ use tokio::process::{Child, Command};
 pub struct SocksTunnel {
     child: Child,
     local_port: NonZeroU16,
-    _key_file: Option<NamedTempFile>,
-    _known_hosts: KnownHostsFiles,
+    _credentials: SshCredentialFiles,
 }
 
 struct PreparedTunnelCommand {
     command: Command,
-    key_file: Option<NamedTempFile>,
-    known_hosts: KnownHostsFiles,
+    credentials: SshCredentialFiles,
 }
 
 impl SocksTunnel {
     /// # Errors
     ///
-    /// Returns `SshError` when the credential files cannot be written, `ssh`
-    /// cannot be spawned or exits, or the SOCKS port does not become ready.
+    /// Returns `SocksError::NotReady` when the SOCKS port does not answer a
+    /// handshake in time, and `SocksError::Ssh` when the credential files
+    /// cannot be written or `ssh` cannot be spawned or exits.
     pub async fn start(
         address: Ipv4Addr,
         config: &SshConfig,
         local_port: NonZeroU16,
-    ) -> Result<Self, SshError> {
+    ) -> Result<Self, SocksError> {
         Self::start_with_program("ssh", address, config, local_port).await
     }
 
@@ -45,11 +54,10 @@ impl SocksTunnel {
         address: Ipv4Addr,
         config: &SshConfig,
         local_port: NonZeroU16,
-    ) -> Result<Self, SshError> {
+    ) -> Result<Self, SocksError> {
         let PreparedTunnelCommand {
             mut command,
-            key_file,
-            known_hosts,
+            credentials,
         } = prepare_tunnel_command(program, address, config, local_port)?;
         let mut child =
             command.spawn().map_err(|e| SshError::io("spawn ssh", e))?;
@@ -59,8 +67,7 @@ impl SocksTunnel {
         Ok(Self {
             child,
             local_port,
-            _key_file: key_file,
-            _known_hosts: known_hosts,
+            _credentials: credentials,
         })
     }
 
@@ -87,20 +94,9 @@ fn prepare_tunnel_command(
     config: &SshConfig,
     local_port: NonZeroU16,
 ) -> Result<PreparedTunnelCommand, SshError> {
-    let key_file = config
-        .private_key
-        .as_ref()
-        .map(|key| secret_file(key.expose()))
-        .transpose()
-        .map_err(|error| SshError::io("prepare SSH credentials", error))?;
-    let known_hosts = config.host_keys.known_hosts_files()?;
+    let credentials = SshCredentialFiles::prepare(config)?;
     let mut command = base_tunnel_command(program, config, local_port);
-    configure_authentication(
-        &mut command,
-        config,
-        key_file.as_ref(),
-        &known_hosts,
-    );
+    configure_authentication(&mut command, config, &credentials);
     command
         .arg("--")
         .arg(address.to_string())
@@ -110,8 +106,7 @@ fn prepare_tunnel_command(
         .kill_on_drop(true);
     Ok(PreparedTunnelCommand {
         command,
-        key_file,
-        known_hosts,
+        credentials,
     })
 }
 
@@ -136,8 +131,7 @@ fn base_tunnel_command(
 fn configure_authentication(
     command: &mut Command,
     config: &SshConfig,
-    key_file: Option<&NamedTempFile>,
-    known_hosts: &KnownHostsFiles,
+    credentials: &SshCredentialFiles,
 ) {
     let host_key_checking = match config.host_keys {
         HostKeyPolicy::Pinned(_) => "StrictHostKeyChecking=yes",
@@ -146,12 +140,12 @@ fn configure_authentication(
         }
     };
     let mut known_hosts_option = OsString::from("UserKnownHostsFile=");
-    known_hosts_option.push(known_hosts.option_value());
+    known_hosts_option.push(credentials.known_hosts().option_value());
     command
         .args(["-o", host_key_checking, "-o"])
         .arg(known_hosts_option);
-    if let Some(key) = key_file {
-        command.arg("-i").arg(key.path());
+    if let Some(key) = credentials.key() {
+        command.arg("-i").arg(key);
     }
     if let Some(user) = &config.user {
         command.arg("-l").arg(user);
@@ -162,14 +156,14 @@ async fn wait_for_socks(
     child: &mut Child,
     local_port: NonZeroU16,
     ready_timeout: Duration,
-) -> Result<(), SshError> {
+) -> Result<(), SocksError> {
     let ready_deadline = tokio::time::Instant::now() + ready_timeout;
     loop {
         if let Some(status) = child
             .try_wait()
             .map_err(|error| SshError::io("inspect ssh process", error))?
         {
-            return Err(child_error(child, status).await);
+            return Err(child_error(child, status).await.into());
         }
         if socks5_ready(local_port).await {
             return Ok(());
@@ -188,7 +182,7 @@ async fn wait_for_socks(
                 .wait()
                 .await
                 .map_err(|error| SshError::io("reap ssh process", error))?;
-            return Err(SshError::SocksNotReady);
+            return Err(SocksError::NotReady);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -269,10 +263,10 @@ mod tests {
     /// A stub written moments ago can fail to exec with `ETXTBSY` while a
     /// process forked by a parallel test still holds its write descriptor.
     /// That window closes at the fork's `exec`, so retrying is enough.
-    fn is_text_file_busy(error: &SshError) -> bool {
+    fn is_text_file_busy(error: &SocksError) -> bool {
         matches!(
             error,
-            SshError::Io { source, .. }
+            SocksError::Ssh(SshError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::ExecutableFileBusy
         )
     }
@@ -281,7 +275,7 @@ mod tests {
         program: &str,
         config: &SshConfig,
         local_port: NonZeroU16,
-    ) -> Result<SocksTunnel, SshError> {
+    ) -> Result<SocksTunnel, SocksError> {
         let address = "203.0.113.5".parse().unwrap();
         for _ in 0..50 {
             match SocksTunnel::start_with_program(
@@ -296,6 +290,14 @@ mod tests {
             }
         }
         panic!("{program} stayed busy");
+    }
+
+    /// A port that was free a moment ago, so a stub tunnel that never
+    /// listens cannot meet a stray listener on it.
+    fn free_port() -> NonZeroU16 {
+        let reservation =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        NonZeroU16::new(reservation.local_addr().unwrap().port()).unwrap()
     }
 
     async fn spawn_stub(program: &str) -> Child {
@@ -314,24 +316,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tunnel_whose_ssh_exits_immediately_is_a_connect_error_with_its_stderr()
-     {
+    async fn a_tunnel_whose_ssh_exits_immediately_reports_the_ssh_stderr() {
         let dir = tempfile::tempdir().unwrap();
         let program = stub(
             dir.path(),
             "echo 'Permission denied (publickey).' >&2\nexit 255",
         );
-        let result =
-            start_stub(&program, &config(), NonZeroU16::new(47080).unwrap())
-                .await;
-        match result {
-            Err(SshError::Exit { output: msg, .. }) => {
-                assert!(msg.contains("Permission denied"), "{msg}");
-            }
-            other => {
-                panic!("expected Connect error, got {:?}", other.map(|_| ()))
-            }
-        }
+
+        let result = start_stub(&program, &config(), free_port()).await;
+
+        let Err(SocksError::Ssh(SshError::Exit { output, .. })) = result else {
+            panic!("expected an ssh exit, got {result:?}");
+        };
+        assert!(output.contains("Permission denied"), "{output}");
     }
 
     #[tokio::test]
@@ -342,18 +339,12 @@ mod tests {
             "penultimate=\nlast=\nfor argument\ndo\n  penultimate=$last\n  last=$argument\ndone\nif [ \"$penultimate\" = \"--\" ] && [ \"$last\" = \"203.0.113.5\" ]; then\n  echo 'arguments accepted' >&2\nelse\n  echo 'destination was not last' >&2\nfi\nexit 255",
         );
 
-        let sut =
-            start_stub(&program, &config(), NonZeroU16::new(47080).unwrap())
-                .await;
+        let result = start_stub(&program, &config(), free_port()).await;
 
-        match sut {
-            Err(SshError::Exit { output: detail, .. }) => {
-                assert!(detail.contains("arguments accepted"), "{detail}");
-            }
-            other => {
-                panic!("expected Connect error, got {:?}", other.map(|_| ()))
-            }
-        }
+        let Err(SocksError::Ssh(SshError::Exit { output, .. })) = result else {
+            panic!("expected an ssh exit, got {result:?}");
+        };
+        assert!(output.contains("arguments accepted"), "{output}");
     }
 
     #[tokio::test]
@@ -406,7 +397,7 @@ mod tests {
 
         responder.abort();
         assert!(
-            matches!(result, Err(SshError::SocksNotReady)),
+            matches!(result, Err(SocksError::NotReady)),
             "unexpected result: {result:?}"
         );
     }
@@ -431,7 +422,7 @@ mod tests {
         let arguments = args(&sut.command);
         let expected = format!(
             r#"UserKnownHostsFile="{}" "/home/a user/.ssh/known_hosts""#,
-            sut.known_hosts.learned().display()
+            sut.credentials.known_hosts().learned().display()
         );
         assert!(arguments.contains(&expected), "{arguments:?}");
         assert!(
@@ -468,17 +459,14 @@ mod tests {
             "echo 'Connection closed' >&2\nsleep 5 &\nexit 255",
         );
 
-        let result =
-            start_stub(&program, &config(), NonZeroU16::new(47081).unwrap())
-                .await;
+        let result = start_stub(&program, &config(), free_port()).await;
 
-        match result {
-            Err(SshError::Exit { status, output }) => {
-                assert_eq!(status.code(), Some(255));
-                assert!(output.contains("Connection closed"), "{output}");
-            }
-            other => panic!("expected Exit, got {:?}", other.map(|_| ())),
-        }
+        let Err(SocksError::Ssh(SshError::Exit { status, output })) = result
+        else {
+            panic!("expected an ssh exit, got {result:?}");
+        };
+        assert_eq!(status.code(), Some(255));
+        assert!(output.contains("Connection closed"), "{output}");
     }
 
     #[tokio::test]
@@ -487,15 +475,11 @@ mod tests {
         let program =
             stub(dir.path(), "printf '\\377Permission denied' >&2\nexit 255");
 
-        let result =
-            start_stub(&program, &config(), NonZeroU16::new(47082).unwrap())
-                .await;
+        let result = start_stub(&program, &config(), free_port()).await;
 
-        match result {
-            Err(SshError::Exit { output, .. }) => {
-                assert!(output.contains("Permission denied"), "{output}");
-            }
-            other => panic!("expected Exit, got {:?}", other.map(|_| ())),
-        }
+        let Err(SocksError::Ssh(SshError::Exit { output, .. })) = result else {
+            panic!("expected an ssh exit, got {result:?}");
+        };
+        assert!(output.contains("Permission denied"), "{output}");
     }
 }

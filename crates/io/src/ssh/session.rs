@@ -1,16 +1,17 @@
-use super::known_hosts::{HostKeyPolicy, KnownHostsFiles};
+use super::credential_files::SshCredentialFiles;
+use super::known_hosts::HostKeyPolicy;
 use super::listener::ListenerSlot;
 use crate::credentials::SshPrivateKey;
 use openssh::{KnownHosts, Session, SessionBuilder, Stdio};
-use std::io::Write as _;
 use std::net::Ipv4Addr;
 use std::num::{NonZeroU16, NonZeroU64};
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
-use tempfile::NamedTempFile;
 use thiserror::Error;
 
+/// A failure of the SSH transport: preparing the connection files,
+/// connecting, or running a remote command. Operations with failures of
+/// their own wrap it in their error type.
 #[derive(Debug, Error)]
 pub enum SshError {
     #[error("ssh connect failed")]
@@ -30,16 +31,6 @@ pub enum SshError {
     },
     #[error("ssh command timed out")]
     Timeout,
-    #[error("SOCKS listener did not become ready")]
-    SocksNotReady,
-    #[error("could not parse /proc/stat")]
-    InvalidSnapshot,
-    #[error(
-        "a temporary listener on port {port} is already owned by this session"
-    )]
-    ListenerAlreadyStarted { port: u16 },
-    #[error("unexpected listener preflight response: {0}")]
-    InvalidPreflightResponse(String),
     #[error(
         "ssh would expand `${{...}}` or a leading `~` in known_hosts path {}",
         path.display()
@@ -56,24 +47,7 @@ impl SshError {
     }
 }
 
-pub(super) fn private_file() -> std::io::Result<NamedTempFile> {
-    tempfile::Builder::new()
-        .prefix("chip-")
-        .permissions(std::fs::Permissions::from_mode(0o600))
-        .tempfile()
-}
-
-pub(super) fn secret_file(content: &str) -> std::io::Result<NamedTempFile> {
-    let mut file = private_file()?;
-    file.write_all(content.as_bytes())?;
-    if !content.ends_with('\n') {
-        file.write_all(b"\n")?;
-    }
-    file.flush()?;
-    Ok(file)
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SshConfig {
     pub user: Option<String>,
     pub port: NonZeroU16,
@@ -113,8 +87,7 @@ pub struct SshSession {
     session: Session,
     default_timeout: Duration,
     pub(super) listener: ListenerSlot,
-    _key_file: Option<NamedTempFile>,
-    _known_hosts: KnownHostsFiles,
+    _credentials: SshCredentialFiles,
 }
 
 impl SshSession {
@@ -126,13 +99,7 @@ impl SshSession {
         address: Ipv4Addr,
         config: &SshConfig,
     ) -> Result<Self, SshError> {
-        let key_file = config
-            .private_key
-            .as_ref()
-            .map(|key| secret_file(key.expose()))
-            .transpose()
-            .map_err(|e| SshError::io("prepare SSH credentials", e))?;
-        let known_hosts = config.host_keys.known_hosts_files()?;
+        let credentials = SshCredentialFiles::prepare(config)?;
         let mut builder = SessionBuilder::default();
         if let Some(user) = &config.user {
             builder.user(user.clone());
@@ -149,9 +116,11 @@ impl SshSession {
             // openssh appends this "path" verbatim after
             // `UserKnownHostsFile=` and has no raw option setter, so the
             // quoted list of files goes through it unchanged.
-            .user_known_hosts_file(Path::new(&known_hosts.option_value()));
-        if let Some(key) = &key_file {
-            builder.keyfile(key.path());
+            .user_known_hosts_file(Path::new(
+                &credentials.known_hosts().option_value(),
+            ));
+        if let Some(key) = credentials.key() {
+            builder.keyfile(key);
         }
         let session = builder
             .connect(address.to_string())
@@ -161,8 +130,7 @@ impl SshSession {
             session,
             default_timeout: config.command_timeout,
             listener: ListenerSlot::default(),
-            _key_file: key_file,
-            _known_hosts: known_hosts,
+            _credentials: credentials,
         })
     }
 
@@ -301,37 +269,6 @@ mod tests {
         assert_eq!(error.to_string(), "ssh command failed");
     }
 
-    #[test]
-    fn a_secret_file_is_readable_only_by_its_owner_and_ends_with_a_newline() {
-        let file =
-            secret_file("-----BEGIN KEY-----\nabc\n-----END KEY-----").unwrap();
-
-        let mode = std::fs::metadata(file.path()).unwrap().permissions().mode()
-            & 0o777;
-        let text = std::fs::read_to_string(file.path()).unwrap();
-
-        assert_eq!(mode, 0o600);
-        assert!(text.ends_with("-----END KEY-----\n"));
-    }
-    #[test]
-    fn io_errors_retain_their_typed_source_and_full_detail() {
-        use std::error::Error as _;
-        let detail = "x".repeat(300);
-        let error = SshError::io(
-            "spawn ssh",
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                detail.clone(),
-            ),
-        );
-        let source = error
-            .source()
-            .unwrap()
-            .downcast_ref::<std::io::Error>()
-            .unwrap();
-        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
-        assert_eq!(source.to_string(), detail);
-    }
     #[tokio::test]
     async fn remote_command_errors_keep_the_complete_source_chain() {
         use std::error::Error as _;
