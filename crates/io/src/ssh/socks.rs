@@ -1,4 +1,6 @@
-use super::session::{HostKeyPolicy, SshConfig, SshError, secret_file};
+use super::known_hosts::{HostKeyPolicy, KnownHostsFiles};
+use super::session::{SshConfig, SshError, secret_file};
+use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroU16;
 use std::time::Duration;
@@ -16,13 +18,13 @@ pub struct SocksTunnel {
     child: Child,
     local_port: NonZeroU16,
     _key_file: Option<NamedTempFile>,
-    _known_hosts_file: NamedTempFile,
+    _known_hosts: KnownHostsFiles,
 }
 
 struct PreparedTunnelCommand {
     command: Command,
     key_file: Option<NamedTempFile>,
-    known_hosts_file: NamedTempFile,
+    known_hosts: KnownHostsFiles,
 }
 
 impl SocksTunnel {
@@ -47,7 +49,7 @@ impl SocksTunnel {
         let PreparedTunnelCommand {
             mut command,
             key_file,
-            known_hosts_file,
+            known_hosts,
         } = prepare_tunnel_command(program, address, config, local_port)?;
         let mut child =
             command.spawn().map_err(|e| SshError::io("spawn ssh", e))?;
@@ -58,7 +60,7 @@ impl SocksTunnel {
             child,
             local_port,
             _key_file: key_file,
-            _known_hosts_file: known_hosts_file,
+            _known_hosts: known_hosts,
         })
     }
 
@@ -89,16 +91,13 @@ fn prepare_tunnel_command(
         .map(|key| secret_file(key.expose()))
         .transpose()
         .map_err(|error| SshError::io("prepare SSH credentials", error))?;
-    let known_hosts_file = config
-        .host_keys
-        .known_hosts_file()
-        .map_err(|error| SshError::io("prepare SSH credentials", error))?;
+    let known_hosts = config.host_keys.known_hosts_files()?;
     let mut command = base_tunnel_command(program, config, local_port);
     configure_authentication(
         &mut command,
         config,
         key_file.as_ref(),
-        &known_hosts_file,
+        &known_hosts,
     );
     command
         .arg("--")
@@ -110,7 +109,7 @@ fn prepare_tunnel_command(
     Ok(PreparedTunnelCommand {
         command,
         key_file,
-        known_hosts_file,
+        known_hosts,
     })
 }
 
@@ -136,16 +135,19 @@ fn configure_authentication(
     command: &mut Command,
     config: &SshConfig,
     key_file: Option<&NamedTempFile>,
-    known_hosts_file: &NamedTempFile,
+    known_hosts: &KnownHostsFiles,
 ) {
     let host_key_checking = match config.host_keys {
         HostKeyPolicy::Pinned(_) => "StrictHostKeyChecking=yes",
-        HostKeyPolicy::TrustOnFirstUse => "StrictHostKeyChecking=accept-new",
+        HostKeyPolicy::TrustOnFirstUse { .. } => {
+            "StrictHostKeyChecking=accept-new"
+        }
     };
-    command.args(["-o", host_key_checking, "-o"]).arg(format!(
-        "UserKnownHostsFile={}",
-        known_hosts_file.path().display()
-    ));
+    let mut known_hosts_option = OsString::from("UserKnownHostsFile=");
+    known_hosts_option.push(known_hosts.option_value());
+    command
+        .args(["-o", host_key_checking, "-o"])
+        .arg(known_hosts_option);
     if let Some(key) = key_file {
         command.arg("-i").arg(key.path());
     }
@@ -244,7 +246,9 @@ mod tests {
             user: None,
             port: NonZeroU16::new(22).unwrap(),
             private_key: None,
-            host_keys: HostKeyPolicy::TrustOnFirstUse,
+            host_keys: HostKeyPolicy::TrustOnFirstUse {
+                user_known_hosts: None,
+            },
             connect_timeout: Duration::from_secs(5),
             command_timeout: Duration::from_secs(5),
         }
@@ -404,20 +408,26 @@ mod tests {
     }
 
     #[test]
-    fn trust_on_first_use_keeps_learned_keys_out_of_the_users_known_hosts() {
+    fn trust_on_first_use_appends_to_a_private_file_and_checks_the_users() {
+        let tofu_config = SshConfig {
+            host_keys: HostKeyPolicy::TrustOnFirstUse {
+                user_known_hosts: Some("/home/a user/.ssh/known_hosts".into()),
+            },
+            ..config()
+        };
+
         let sut = prepare_tunnel_command(
             "ssh",
             "203.0.113.5".parse().unwrap(),
-            &config(),
+            &tofu_config,
             NonZeroU16::new(47080).unwrap(),
         )
         .unwrap();
 
         let arguments = args(&sut.command);
-
         let expected = format!(
-            "UserKnownHostsFile={}",
-            sut.known_hosts_file.path().display()
+            r#"UserKnownHostsFile="{}" "/home/a user/.ssh/known_hosts""#,
+            sut.known_hosts.learned().display()
         );
         assert!(arguments.contains(&expected), "{arguments:?}");
         assert!(

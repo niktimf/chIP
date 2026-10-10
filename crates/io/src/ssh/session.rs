@@ -1,3 +1,4 @@
+use super::known_hosts::{HostKeyPolicy, KnownHostsFiles};
 use super::listener::ListenerSlot;
 use crate::credentials::SshPrivateKey;
 use openssh::{KnownHosts, Session, SessionBuilder, Stdio};
@@ -5,6 +6,7 @@ use std::io::Write as _;
 use std::net::Ipv4Addr;
 use std::num::{NonZeroU16, NonZeroU64};
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -38,6 +40,11 @@ pub enum SshError {
     ListenerAlreadyStarted { port: u16 },
     #[error("unexpected listener preflight response: {0}")]
     InvalidPreflightResponse(String),
+    #[error(
+        "ssh would expand `${{...}}` or a leading `~` in known_hosts path {}",
+        path.display()
+    )]
+    UnquotableKnownHostsPath { path: std::path::PathBuf },
 }
 
 impl SshError {
@@ -49,7 +56,7 @@ impl SshError {
     }
 }
 
-fn private_file() -> std::io::Result<NamedTempFile> {
+pub(super) fn private_file() -> std::io::Result<NamedTempFile> {
     tempfile::Builder::new()
         .prefix("chip-")
         .permissions(std::fs::Permissions::from_mode(0o600))
@@ -64,29 +71,6 @@ pub(super) fn secret_file(content: &str) -> std::io::Result<NamedTempFile> {
     }
     file.flush()?;
     Ok(file)
-}
-
-/// How ssh decides whether to trust the candidate's host key.
-///
-/// Both policies hand ssh a private temporary `UserKnownHostsFile`, so a
-/// scan never writes to the user's `~/.ssh/known_hosts`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HostKeyPolicy {
-    /// Accept only keys listed in this `known_hosts` content.
-    Pinned(String),
-    /// Accept whatever key the candidate presents on this connection.
-    TrustOnFirstUse,
-}
-
-impl HostKeyPolicy {
-    /// The `UserKnownHostsFile` for one connection: the pinned keys, or an
-    /// empty file that ssh may append the first-seen key to.
-    pub(super) fn known_hosts_file(&self) -> std::io::Result<NamedTempFile> {
-        match self {
-            Self::Pinned(known_hosts) => secret_file(known_hosts),
-            Self::TrustOnFirstUse => private_file(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -130,7 +114,7 @@ pub struct SshSession {
     default_timeout: Duration,
     pub(super) listener: ListenerSlot,
     _key_file: Option<NamedTempFile>,
-    _known_hosts_file: NamedTempFile,
+    _known_hosts: KnownHostsFiles,
 }
 
 impl SshSession {
@@ -148,10 +132,7 @@ impl SshSession {
             .map(|key| secret_file(key.expose()))
             .transpose()
             .map_err(|e| SshError::io("prepare SSH credentials", e))?;
-        let known_hosts_file = config
-            .host_keys
-            .known_hosts_file()
-            .map_err(|e| SshError::io("prepare SSH credentials", e))?;
+        let known_hosts = config.host_keys.known_hosts_files()?;
         let mut builder = SessionBuilder::default();
         if let Some(user) = &config.user {
             builder.user(user.clone());
@@ -163,9 +144,12 @@ impl SshSession {
             ))
             .known_hosts_check(match config.host_keys {
                 HostKeyPolicy::Pinned(_) => KnownHosts::Strict,
-                HostKeyPolicy::TrustOnFirstUse => KnownHosts::Add,
+                HostKeyPolicy::TrustOnFirstUse { .. } => KnownHosts::Add,
             })
-            .user_known_hosts_file(known_hosts_file.path());
+            // openssh appends this "path" verbatim after
+            // `UserKnownHostsFile=` and has no raw option setter, so the
+            // quoted list of files goes through it unchanged.
+            .user_known_hosts_file(Path::new(&known_hosts.option_value()));
         if let Some(key) = &key_file {
             builder.keyfile(key.path());
         }
@@ -178,7 +162,7 @@ impl SshSession {
             default_timeout: config.command_timeout,
             listener: ListenerSlot::default(),
             _key_file: key_file,
-            _known_hosts_file: known_hosts_file,
+            _known_hosts: known_hosts,
         })
     }
 
@@ -257,7 +241,9 @@ mod tests {
             user: None,
             port: NonZeroU16::new(22).unwrap(),
             private_key: None,
-            host_keys: HostKeyPolicy::TrustOnFirstUse,
+            host_keys: HostKeyPolicy::TrustOnFirstUse {
+                user_known_hosts: None,
+            },
             connect_timeout,
             command_timeout: Duration::from_secs(5),
         }
@@ -286,26 +272,6 @@ mod tests {
         let wait = sut.socks_ready_timeout();
 
         assert_eq!(wait, Duration::from_secs(20));
-    }
-
-    #[test]
-    fn trust_on_first_use_records_keys_in_a_fresh_empty_file() {
-        let sut = HostKeyPolicy::TrustOnFirstUse;
-
-        let file = sut.known_hosts_file().unwrap();
-
-        let content = std::fs::read(file.path()).unwrap();
-        assert!(content.is_empty());
-    }
-
-    #[test]
-    fn a_pinned_policy_writes_its_known_hosts_to_the_file() {
-        let sut = HostKeyPolicy::Pinned("203.0.113.5 ssh-ed25519 AAAA".into());
-
-        let file = sut.known_hosts_file().unwrap();
-
-        let content = std::fs::read_to_string(file.path()).unwrap();
-        assert_eq!(content, "203.0.113.5 ssh-ed25519 AAAA\n");
     }
 
     #[test]

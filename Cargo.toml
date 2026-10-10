@@ -26,7 +26,10 @@ country-code-enum = { version = "1", default-features = false }
 http = "1"
 ipnet = { version = "2.12", features = ["serde"] }
 itertools = "0.15"
-openssh = "0.11"
+# Exact pin: ssh/known_hosts.rs passes a quoted, two-file option value
+# through SessionBuilder::user_known_hosts_file, which 0.11.6 inserts
+# verbatim. Re-check builder.rs before bumping.
+openssh = "=0.11.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
 regex = "1.13"
 secrecy = "0.10.3"

@@ -53,7 +53,8 @@ pub struct Cli {
 const SCAN_AFTER_HELP: &str = "\
 Credentials (environment only):
   SSH_PRIVATE_KEY     private key for the candidate, the key itself, not a path
-  SSH_KNOWN_HOSTS     host key entries; without them the first key is accepted
+  SSH_KNOWN_HOSTS     host key entries; without them a host's first key is
+                      accepted unless ~/.ssh/known_hosts already lists it
   GLOBALPING_TOKEN    raises the Globalping quota from 250 to 500 tests/hour
   PROXYCHECK_API_KEY  raises the proxycheck.io limit to 1000 queries/day
 
@@ -99,14 +100,16 @@ where
         .map_err(|error| error.context(name))
 }
 
+/// Values a command takes from the environment instead of its flags.
 #[derive(Default)]
-struct SecretInputs {
+struct EnvironmentInputs {
     ssh_private_key: Option<SshPrivateKey>,
     globalping_token: Option<GlobalpingToken>,
     proxycheck_api_key: Option<ProxycheckApiKey>,
+    home: Option<PathBuf>,
 }
 
-impl SecretInputs {
+impl EnvironmentInputs {
     fn for_scan_environment() -> anyhow::Result<Self> {
         Ok(Self {
             ssh_private_key: secret_from_env(
@@ -121,6 +124,7 @@ impl SecretInputs {
                 "PROXYCHECK_API_KEY",
                 std::env::var_os("PROXYCHECK_API_KEY"),
             )?,
+            home: std::env::var_os("HOME").map(PathBuf::from),
         })
     }
 
@@ -133,6 +137,16 @@ impl SecretInputs {
             ..Self::default()
         })
     }
+
+    /// The user's `~/.ssh/known_hosts`, which ssh still checks known hosts
+    /// against under trust-on-first-use. A relative or empty `HOME` names no
+    /// usable directory. A missing file needs no check here: ssh skips it.
+    fn user_known_hosts(&self) -> Option<PathBuf> {
+        self.home
+            .as_deref()
+            .filter(|home| home.is_absolute())
+            .map(|home| home.join(".ssh").join("known_hosts"))
+    }
 }
 
 impl Cli {
@@ -140,12 +154,12 @@ impl Cli {
         match self.command {
             CliCommand::Scan(args) => ScanCommand::try_from((
                 *args,
-                SecretInputs::for_scan_environment()?,
+                EnvironmentInputs::for_scan_environment()?,
             ))
             .map(|command| Command::Scan(Box::new(command))),
             CliCommand::Calibrate(args) => CalibrateCommand::try_from((
                 args,
-                SecretInputs::for_calibrate_environment()?,
+                EnvironmentInputs::for_calibrate_environment()?,
             ))
             .map(Command::Calibrate),
         }
@@ -154,13 +168,15 @@ impl Cli {
     #[cfg(test)]
     fn into_command_with(
         self,
-        secrets: SecretInputs,
+        environment: EnvironmentInputs,
     ) -> anyhow::Result<Command> {
         match self.command {
-            CliCommand::Scan(args) => ScanCommand::try_from((*args, secrets))
-                .map(|command| Command::Scan(Box::new(command))),
+            CliCommand::Scan(args) => {
+                ScanCommand::try_from((*args, environment))
+                    .map(|command| Command::Scan(Box::new(command)))
+            }
             CliCommand::Calibrate(args) => {
-                CalibrateCommand::try_from((args, secrets))
+                CalibrateCommand::try_from((args, environment))
                     .map(Command::Calibrate)
             }
         }
@@ -191,7 +207,8 @@ struct ScanArgs {
     #[arg(long, env = "SSH_PORT", default_value = "22")]
     ssh_port: NonZeroU16,
     /// Known-hosts entries for strict host key checking; without them the
-    /// first key seen is accepted.
+    /// first key seen is accepted, unless `~/.ssh/known_hosts` already lists
+    /// a key for the host. That file is read, never written.
     #[arg(long, env = "SSH_KNOWN_HOSTS")]
     ssh_known_hosts: Option<String>,
     /// Fail the latency gate above this median excess over the best anchor of
@@ -367,11 +384,11 @@ pub struct ScanCommand {
     json: Option<PathBuf>,
 }
 
-impl TryFrom<(ScanArgs, SecretInputs)> for ScanCommand {
+impl TryFrom<(ScanArgs, EnvironmentInputs)> for ScanCommand {
     type Error = anyhow::Error;
 
     fn try_from(
-        (args, secrets): (ScanArgs, SecretInputs),
+        (args, environment): (ScanArgs, EnvironmentInputs),
     ) -> Result<Self, Self::Error> {
         let latency_thresholds =
             LatencyThresholds::new(args.max_excess_ms, args.max_loss_pct)
@@ -380,14 +397,17 @@ impl TryFrom<(ScanArgs, SecretInputs)> for ScanCommand {
         let ssh_access = if args.no_ssh {
             SshAccess::Disabled
         } else {
-            let host_keys = args
-                .ssh_known_hosts
-                .map_or(HostKeyPolicy::TrustOnFirstUse, HostKeyPolicy::Pinned);
+            let host_keys = args.ssh_known_hosts.map_or_else(
+                || HostKeyPolicy::TrustOnFirstUse {
+                    user_known_hosts: environment.user_known_hosts(),
+                },
+                HostKeyPolicy::Pinned,
+            );
             SshAccess::Enabled(SshSettings {
                 user: args.ssh_user,
                 port: args.ssh_port,
                 host_keys,
-                private_key: secrets.ssh_private_key,
+                private_key: environment.ssh_private_key,
             })
         };
         let neighbor_sweep = if args.no_neighbors {
@@ -405,8 +425,8 @@ impl TryFrom<(ScanArgs, SecretInputs)> for ScanCommand {
             country: args.country,
             city: args.city,
             ssh_access,
-            globalping_token: secrets.globalping_token,
-            proxycheck_api_key: secrets.proxycheck_api_key,
+            globalping_token: environment.globalping_token,
+            proxycheck_api_key: environment.proxycheck_api_key,
             latency_thresholds,
             reference_city: args.reference_city,
             probes,
@@ -524,11 +544,11 @@ pub struct CalibrateCommand {
     probes: ProbeSelection,
 }
 
-impl TryFrom<(CalibrateArgs, SecretInputs)> for CalibrateCommand {
+impl TryFrom<(CalibrateArgs, EnvironmentInputs)> for CalibrateCommand {
     type Error = anyhow::Error;
 
     fn try_from(
-        (args, secrets): (CalibrateArgs, SecretInputs),
+        (args, environment): (CalibrateArgs, EnvironmentInputs),
     ) -> Result<Self, Self::Error> {
         let targets = args
             .targets
@@ -538,7 +558,7 @@ impl TryFrom<(CalibrateArgs, SecretInputs)> for CalibrateCommand {
         let probes = ProbeSelection::new(args.eyeball_probes, args.dc_probes)?;
         Ok(Self {
             targets,
-            globalping_token: secrets.globalping_token,
+            globalping_token: environment.globalping_token,
             probes,
         })
     }
@@ -571,9 +591,9 @@ mod tests {
 
     fn scan_command_with(
         args: &[&str],
-        secrets: SecretInputs,
+        environment: EnvironmentInputs,
     ) -> anyhow::Result<Box<ScanCommand>> {
-        let command = parse(args).into_command_with(secrets)?;
+        let command = parse(args).into_command_with(environment)?;
         let Command::Scan(command) = command else {
             anyhow::bail!("expected scan command")
         };
@@ -581,7 +601,7 @@ mod tests {
     }
 
     fn scan_command(args: &[&str]) -> anyhow::Result<Box<ScanCommand>> {
-        scan_command_with(args, SecretInputs::default())
+        scan_command_with(args, EnvironmentInputs::default())
     }
 
     fn ssh_settings(command: &ScanCommand) -> &SshSettings {
@@ -609,11 +629,11 @@ mod tests {
     fn no_ssh_turns_off_every_ssh_connection() {
         let sut = scan_command_with(
             &["scan", "203.0.113.1", "--country", "FI", "--no-ssh"],
-            SecretInputs {
+            EnvironmentInputs {
                 ssh_private_key: Some(
                     SshPrivateKey::try_from("key-value".to_owned()).unwrap(),
                 ),
-                ..SecretInputs::default()
+                ..EnvironmentInputs::default()
             },
         )
         .unwrap();
@@ -638,11 +658,11 @@ mod tests {
                 "--ssh-port",
                 "2222",
             ],
-            SecretInputs {
+            EnvironmentInputs {
                 ssh_private_key: Some(
                     SshPrivateKey::try_from("key-value".to_owned()).unwrap(),
                 ),
-                ..SecretInputs::default()
+                ..EnvironmentInputs::default()
             },
         )
         .unwrap();
@@ -672,13 +692,47 @@ mod tests {
     }
 
     #[test]
-    fn without_known_hosts_the_first_host_key_is_trusted() {
-        let sut =
-            scan_command(&["scan", "203.0.113.1", "--country", "FI"]).unwrap();
+    fn without_known_hosts_the_first_key_is_trusted_unless_home_records_it() {
+        let sut = scan_command_with(
+            &["scan", "203.0.113.1", "--country", "FI"],
+            EnvironmentInputs {
+                home: Some(PathBuf::from("/home/a user")),
+                ..EnvironmentInputs::default()
+            },
+        )
+        .unwrap();
 
         assert_eq!(
             ssh_settings(&sut).host_keys(),
-            &HostKeyPolicy::TrustOnFirstUse
+            &HostKeyPolicy::TrustOnFirstUse {
+                user_known_hosts: Some(PathBuf::from(
+                    "/home/a user/.ssh/known_hosts"
+                )),
+            }
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::no_home(None)]
+    #[case::empty_home(Some(""))]
+    #[case::relative_home(Some("home/user"))]
+    fn without_a_usable_home_only_the_first_key_seen_is_trusted(
+        #[case] home: Option<&str>,
+    ) {
+        let sut = scan_command_with(
+            &["scan", "203.0.113.1", "--country", "FI"],
+            EnvironmentInputs {
+                home: home.map(PathBuf::from),
+                ..EnvironmentInputs::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            ssh_settings(&sut).host_keys(),
+            &HostKeyPolicy::TrustOnFirstUse {
+                user_known_hosts: None
+            }
         );
     }
 
@@ -831,7 +885,7 @@ mod tests {
     fn calibration_targets_are_parsed_before_orchestration() {
         let command =
             parse(&["calibrate", "203.0.113.7=Helsinki", "198.51.100.9=Turku"])
-                .into_command_with(SecretInputs::default())
+                .into_command_with(EnvironmentInputs::default())
                 .unwrap();
         let Command::Calibrate(sut) = command else {
             panic!("expected calibrate command")
@@ -851,7 +905,7 @@ mod tests {
         #[case] expected_detail: &str,
     ) {
         let error = parse(&["calibrate", raw])
-            .into_command_with(SecretInputs::default())
+            .into_command_with(EnvironmentInputs::default())
             .err()
             .expect("target must be rejected");
 

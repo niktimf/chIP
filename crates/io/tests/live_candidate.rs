@@ -49,8 +49,12 @@ fn config() -> SshConfig {
         private_key: std::env::var("SSH_PRIVATE_KEY")
             .ok()
             .and_then(|key| SshPrivateKey::try_from(key).ok()),
-        host_keys: std::env::var("SSH_KNOWN_HOSTS")
-            .map_or(HostKeyPolicy::TrustOnFirstUse, HostKeyPolicy::Pinned),
+        host_keys: std::env::var("SSH_KNOWN_HOSTS").map_or(
+            HostKeyPolicy::TrustOnFirstUse {
+                user_known_hosts: None,
+            },
+            HostKeyPolicy::Pinned,
+        ),
         connect_timeout: Duration::from_secs(15),
         command_timeout: Duration::from_secs(20),
     }
