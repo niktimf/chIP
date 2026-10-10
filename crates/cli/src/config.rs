@@ -1,16 +1,21 @@
 use std::ffi::OsString;
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{AddrParseError, Ipv4Addr};
 use std::num::{NonZeroU16, NonZeroU64};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use chip_core::verdict::latency::LatencyThresholds;
+use chip_core::model::InvalidCityName;
+use chip_core::verdict::latency::{
+    InvalidLatencyThresholds, LatencyThresholds,
+};
 use chip_core::{
     CheckResult, CityName, CountryCode, GateId, GateOverrides, ScanProfile,
     Severity,
 };
-use chip_io::credentials::{GlobalpingToken, ProxycheckApiKey, SshPrivateKey};
+use chip_io::credentials::{
+    EmptySecret, GlobalpingToken, ProxycheckApiKey, SshPrivateKey,
+};
 use chip_io::ssh::HostKeyPolicy;
 use clap::{Args, Parser, Subcommand};
 
@@ -75,6 +80,25 @@ pub enum Command {
     Calibrate(CalibrateCommand),
 }
 
+/// Why the command line and the environment do not make a valid command.
+/// Malformed single values are rejected earlier, by clap.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// The secret is not shown: the error names only the variable.
+    #[error("{name} must be valid UTF-8")]
+    SecretNotUtf8 { name: &'static str },
+    #[error("{name}")]
+    EmptySecret {
+        name: &'static str,
+        #[source]
+        source: EmptySecret,
+    },
+    #[error(transparent)]
+    LatencyThresholds(#[from] InvalidLatencyThresholds),
+    #[error(transparent)]
+    ProbeSelection(#[from] EmptyProbeSelection),
+}
+
 #[expect(
     clippy::map_err_ignore,
     reason = "the rejected value is a secret, so the error names only the \
@@ -83,21 +107,19 @@ pub enum Command {
 fn secret_from_env<T>(
     name: &'static str,
     value: Option<OsString>,
-) -> anyhow::Result<Option<T>>
+) -> Result<Option<T>, ConfigError>
 where
-    T: TryFrom<String>,
-    T::Error: std::error::Error + Send + Sync + 'static,
+    T: TryFrom<String, Error = EmptySecret>,
 {
     let Some(value) = value else {
         return Ok(None);
     };
     let value = value
         .into_string()
-        .map_err(|_| anyhow::anyhow!("{name} must be valid UTF-8"))?;
+        .map_err(|_| ConfigError::SecretNotUtf8 { name })?;
     T::try_from(value)
         .map(Some)
-        .map_err(anyhow::Error::new)
-        .map_err(|error| error.context(name))
+        .map_err(|source| ConfigError::EmptySecret { name, source })
 }
 
 /// Values a command takes from the environment instead of its flags.
@@ -110,7 +132,7 @@ struct EnvironmentInputs {
 }
 
 impl EnvironmentInputs {
-    fn for_scan_environment() -> anyhow::Result<Self> {
+    fn for_scan_environment() -> Result<Self, ConfigError> {
         Ok(Self {
             ssh_private_key: secret_from_env(
                 "SSH_PRIVATE_KEY",
@@ -128,7 +150,7 @@ impl EnvironmentInputs {
         })
     }
 
-    fn for_calibrate_environment() -> anyhow::Result<Self> {
+    fn for_calibrate_environment() -> Result<Self, ConfigError> {
         Ok(Self {
             globalping_token: secret_from_env(
                 "GLOBALPING_TOKEN",
@@ -150,7 +172,7 @@ impl EnvironmentInputs {
 }
 
 impl Cli {
-    pub fn into_command(self) -> anyhow::Result<Command> {
+    pub fn into_command(self) -> Result<Command, ConfigError> {
         match self.command {
             CliCommand::Scan(args) => ScanCommand::try_from((
                 *args,
@@ -169,7 +191,7 @@ impl Cli {
     fn into_command_with(
         self,
         environment: EnvironmentInputs,
-    ) -> anyhow::Result<Command> {
+    ) -> Result<Command, ConfigError> {
         match self.command {
             CliCommand::Scan(args) => {
                 ScanCommand::try_from((*args, environment))
@@ -265,8 +287,8 @@ struct ScanArgs {
 #[derive(Args)]
 struct CalibrateArgs {
     /// One or more `IP=City` targets.
-    #[arg(required = true)]
-    targets: Vec<String>,
+    #[arg(required = true, value_parser = parse_calibration_target)]
+    targets: Vec<CalibrationTarget>,
     /// How many probes in Russian home networks to measure from.
     #[arg(long, default_value_t = 8)]
     eyeball_probes: u8,
@@ -281,10 +303,18 @@ pub struct ProbeSelection {
     datacenter: u8,
 }
 
+/// Both probe counts are zero, so no probe would measure anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("--eyeball-probes and --dc-probes cannot both be 0")]
+pub struct EmptyProbeSelection;
+
 impl ProbeSelection {
-    fn new(eyeball: u8, datacenter: u8) -> anyhow::Result<Self> {
+    const fn new(
+        eyeball: u8,
+        datacenter: u8,
+    ) -> Result<Self, EmptyProbeSelection> {
         if eyeball == 0 && datacenter == 0 {
-            anyhow::bail!("--eyeball-probes and --dc-probes cannot both be 0");
+            return Err(EmptyProbeSelection);
         }
         Ok(Self {
             eyeball,
@@ -385,14 +415,13 @@ pub struct ScanCommand {
 }
 
 impl TryFrom<(ScanArgs, EnvironmentInputs)> for ScanCommand {
-    type Error = anyhow::Error;
+    type Error = ConfigError;
 
     fn try_from(
         (args, environment): (ScanArgs, EnvironmentInputs),
     ) -> Result<Self, Self::Error> {
         let latency_thresholds =
-            LatencyThresholds::new(args.max_excess_ms, args.max_loss_pct)
-                .map_err(|error| anyhow::anyhow!(error))?;
+            LatencyThresholds::new(args.max_excess_ms, args.max_loss_pct)?;
         let probes = ProbeSelection::new(args.eyeball_probes, args.dc_probes)?;
         let ssh_access = if args.no_ssh {
             SshAccess::Disabled
@@ -525,17 +554,60 @@ impl CalibrationTarget {
     }
 }
 
-fn parse_target(raw: &str) -> anyhow::Result<CalibrationTarget> {
-    let (ip, city) = raw
-        .split_once('=')
-        .ok_or_else(|| anyhow::anyhow!("expected IP=City, got '{raw}'"))?;
-    let ip = ip.parse().map_err(|error| {
-        anyhow::anyhow!("invalid IPv4 address in '{raw}': {error}")
-    })?;
-    let city = city
-        .parse()
-        .map_err(|error| anyhow::anyhow!("invalid city in '{raw}': {error}"))?;
-    Ok(CalibrationTarget { ip, city })
+/// Why an `IP=City` calibration target was rejected. Each variant keeps the
+/// whole rejected argument, since a run takes several targets.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CalibrationTargetError {
+    #[error("expected IP=City, got '{raw}'")]
+    MissingSeparator { raw: String },
+    #[error("invalid IPv4 address in '{raw}'")]
+    Ip {
+        raw: String,
+        #[source]
+        source: AddrParseError,
+    },
+    #[error("invalid city in '{raw}'")]
+    City {
+        raw: String,
+        #[source]
+        source: InvalidCityName,
+    },
+}
+
+/// clap prints only the `Display` of a value's parse error, not its source
+/// chain, so the parser hands clap the whole chain joined by ": ".
+fn parse_calibration_target(raw: &str) -> Result<CalibrationTarget, String> {
+    raw.parse::<CalibrationTarget>().map_err(|error| {
+        std::iter::successors(Some(&error as &dyn std::error::Error), |cause| {
+            cause.source()
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+    })
+}
+
+impl FromStr for CalibrationTarget {
+    type Err = CalibrationTargetError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let (ip, city) = raw.split_once('=').ok_or_else(|| {
+            CalibrationTargetError::MissingSeparator {
+                raw: raw.to_owned(),
+            }
+        })?;
+        let ip = ip.parse().map_err(|source| CalibrationTargetError::Ip {
+            raw: raw.to_owned(),
+            source,
+        })?;
+        let city =
+            city.parse()
+                .map_err(|source| CalibrationTargetError::City {
+                    raw: raw.to_owned(),
+                    source,
+                })?;
+        Ok(Self { ip, city })
+    }
 }
 
 pub struct CalibrateCommand {
@@ -545,19 +617,14 @@ pub struct CalibrateCommand {
 }
 
 impl TryFrom<(CalibrateArgs, EnvironmentInputs)> for CalibrateCommand {
-    type Error = anyhow::Error;
+    type Error = ConfigError;
 
     fn try_from(
         (args, environment): (CalibrateArgs, EnvironmentInputs),
     ) -> Result<Self, Self::Error> {
-        let targets = args
-            .targets
-            .iter()
-            .map(|target| parse_target(target))
-            .collect::<anyhow::Result<Vec<_>>>()?;
         let probes = ProbeSelection::new(args.eyeball_probes, args.dc_probes)?;
         Ok(Self {
-            targets,
+            targets: args.targets,
             globalping_token: environment.globalping_token,
             probes,
         })
@@ -594,15 +661,18 @@ mod tests {
     fn scan_command_with(
         args: &[&str],
         environment: EnvironmentInputs,
-    ) -> anyhow::Result<Box<ScanCommand>> {
-        let command = parse(args).into_command_with(environment)?;
-        let Command::Scan(command) = command else {
-            anyhow::bail!("expected scan command")
-        };
-        Ok(command)
+    ) -> Result<Box<ScanCommand>, ConfigError> {
+        parse(args).into_command_with(environment).map(into_scan)
     }
 
-    fn scan_command(args: &[&str]) -> anyhow::Result<Box<ScanCommand>> {
+    fn into_scan(command: Command) -> Box<ScanCommand> {
+        let Command::Scan(command) = command else {
+            panic!("expected scan command")
+        };
+        command
+    }
+
+    fn scan_command(args: &[&str]) -> Result<Box<ScanCommand>, ConfigError> {
         scan_command_with(args, EnvironmentInputs::default())
     }
 
@@ -853,17 +923,56 @@ mod tests {
         );
     }
 
-    #[rstest::rstest]
-    #[case::non_finite_latency_threshold(
-        &["scan", "203.0.113.1", "--country", "FI", "--max-excess-ms", "NaN"],
-        "finite and positive"
-    )]
-    #[case::negative_loss_threshold(
-        &["scan", "203.0.113.1", "--country", "FI", "--max-loss-pct=-0.1"],
-        "finite and non-negative"
-    )]
-    #[case::empty_probe_selection(
-        &[
+    #[test]
+    fn a_non_finite_latency_excess_threshold_is_rejected() {
+        let sut = [
+            "scan",
+            "203.0.113.1",
+            "--country",
+            "FI",
+            "--max-excess-ms",
+            "NaN",
+        ];
+
+        let error = scan_command(&sut).err().expect("input must be rejected");
+
+        assert!(
+            matches!(
+                error,
+                ConfigError::LatencyThresholds(
+                    InvalidLatencyThresholds::MaxExcess(value)
+                ) if value.is_nan()
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_negative_loss_threshold_is_rejected() {
+        let sut = [
+            "scan",
+            "203.0.113.1",
+            "--country",
+            "FI",
+            "--max-loss-pct=-0.1",
+        ];
+
+        let error = scan_command(&sut).err().expect("input must be rejected");
+
+        assert!(
+            matches!(
+                error,
+                ConfigError::LatencyThresholds(
+                    InvalidLatencyThresholds::MaxLossDelta(-0.1)
+                )
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_scan_without_any_probes_is_rejected() {
+        let sut = [
             "scan",
             "203.0.113.1",
             "--country",
@@ -872,16 +981,28 @@ mod tests {
             "0",
             "--dc-probes",
             "0",
-        ],
-        "--eyeball-probes and --dc-probes cannot both be 0"
-    )]
-    fn validation_rejects_values_that_parse_but_break_a_domain_rule(
-        #[case] sut: &[&str],
-        #[case] expected_detail: &str,
-    ) {
-        let error = scan_command(sut).err().expect("input must be rejected");
+        ];
 
-        assert!(error.to_string().contains(expected_detail), "{error:#}");
+        let error = scan_command(&sut).err().expect("input must be rejected");
+
+        assert!(
+            matches!(error, ConfigError::ProbeSelection(EmptyProbeSelection)),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn zero_probes_of_both_kinds_make_an_empty_selection() {
+        let actual = ProbeSelection::new(0, 0);
+
+        assert_eq!(actual, Err(EmptyProbeSelection));
+    }
+
+    #[test]
+    fn datacenter_probes_alone_make_a_selection() {
+        let sut = ProbeSelection::new(0, 4).unwrap();
+
+        assert_eq!((sut.eyeball(), sut.datacenter()), (0, 4));
     }
 
     #[test]
@@ -899,20 +1020,80 @@ mod tests {
         assert_eq!(sut.targets()[0].city().as_str(), "Helsinki");
     }
 
-    #[rstest::rstest]
-    #[case::empty_city("203.0.113.7=", "invalid city")]
-    #[case::invalid_ip("not-an-ip=Helsinki", "invalid IPv4 address")]
-    #[case::missing_separator("203.0.113.7", "expected IP=City")]
-    fn malformed_calibration_targets_never_reach_orchestration(
-        #[case] raw: &str,
-        #[case] expected_detail: &str,
-    ) {
-        let error = parse(&["calibrate", raw])
-            .into_command_with(EnvironmentInputs::default())
+    #[test]
+    fn a_malformed_calibration_target_is_rejected_by_the_parser() {
+        let sut = ["chip", "calibrate", "not-an-ip=Helsinki"];
+
+        let error = Cli::try_parse_from(sut)
             .err()
             .expect("target must be rejected");
 
-        assert!(error.to_string().contains(expected_detail), "{error:#}");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(
+            error.to_string().contains(
+                "invalid IPv4 address in 'not-an-ip=Helsinki': invalid IPv4 \
+                 address syntax"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_ip_and_a_city_joined_by_equals_make_a_target() {
+        let actual = "203.0.113.7=Helsinki".parse::<CalibrationTarget>();
+
+        assert_eq!(
+            actual,
+            Ok(CalibrationTarget {
+                ip: Ipv4Addr::new(203, 0, 113, 7),
+                city: "Helsinki".parse().unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_target_without_equals_is_missing_its_separator() {
+        let actual = "203.0.113.7".parse::<CalibrationTarget>();
+
+        assert!(
+            matches!(
+                &actual,
+                Err(CalibrationTargetError::MissingSeparator { raw })
+                    if raw == "203.0.113.7"
+            ),
+            "{actual:?}"
+        );
+    }
+
+    #[test]
+    fn a_target_with_a_malformed_ip_is_rejected_for_its_ip() {
+        let actual = "203.0.113=Helsinki".parse::<CalibrationTarget>();
+
+        assert!(
+            matches!(
+                &actual,
+                Err(CalibrationTargetError::Ip { raw, .. })
+                    if raw == "203.0.113=Helsinki"
+            ),
+            "{actual:?}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::empty_city("203.0.113.7=")]
+    #[case::blank_city("203.0.113.7=   ")]
+    fn a_target_without_a_city_name_is_rejected_for_its_city(
+        #[case] sut: &str,
+    ) {
+        let actual = sut.parse::<CalibrationTarget>();
+
+        assert!(
+            matches!(
+                &actual,
+                Err(CalibrationTargetError::City { raw, .. }) if raw == sut
+            ),
+            "{actual:?}"
+        );
     }
 
     #[test]
@@ -934,7 +1115,16 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("PROXYCHECK_API_KEY"), "{error:#}");
-        assert!(!error.to_string().contains("   "));
+        assert!(
+            matches!(
+                error,
+                ConfigError::EmptySecret {
+                    name: "PROXYCHECK_API_KEY",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.to_string(), "PROXYCHECK_API_KEY");
     }
 }

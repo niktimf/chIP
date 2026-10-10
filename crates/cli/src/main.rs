@@ -61,7 +61,7 @@ enum Completion {
 #[derive(Debug, thiserror::Error)]
 enum CliError {
     #[error("invalid configuration")]
-    Config(#[source] anyhow::Error),
+    Config(#[source] config::ConfigError),
     #[error("could not write output")]
     Output(#[source] std::io::Error),
     #[error("could not encode JSON report")]
