@@ -33,7 +33,9 @@ disallowed-methods = [
     { path = "tokio::sync::mpsc::unbounded_channel", reason = "unbounded queue: use tokio::sync::mpsc::channel with a capacity" },
     { path = "crossbeam_channel::unbounded", reason = "unbounded queue: use crossbeam_channel::bounded" },
     { path = "crossbeam::channel::unbounded", reason = "unbounded queue: use crossbeam::channel::bounded" },
-    { path = "futures::channel::mpsc::unbounded", reason = "unbounded queue: use futures::channel::mpsc::channel" },
+    # futures is built without default features, so `channel` may be absent;
+    # allow-invalid keeps the entry for builds that enable it.
+    { path = "futures::channel::mpsc::unbounded", reason = "unbounded queue: use futures::channel::mpsc::channel", allow-invalid = true },
     { path = "flume::unbounded", reason = "unbounded queue: use flume::bounded" },
     { path = "async_channel::unbounded", reason = "unbounded queue: use async_channel::bounded" },
 ]
