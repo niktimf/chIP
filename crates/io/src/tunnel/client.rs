@@ -161,7 +161,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_returns_status_body_and_final_url() {
+    async fn a_fetched_page_carries_its_status_body_and_final_url() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/premium"))
@@ -190,7 +190,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_sends_supplied_headers() {
+    async fn the_supplied_headers_reach_the_server() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/echo"))

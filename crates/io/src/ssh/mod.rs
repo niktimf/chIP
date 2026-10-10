@@ -4,7 +4,7 @@ mod listener;
 mod session;
 mod socks;
 mod steal;
-pub use known_hosts::HostKeyPolicy;
+pub use known_hosts::{EmptyKnownHosts, HostKeyPolicy, KnownHostsEntries};
 pub use listener::{
     ListenerError, ListenerFailure, ListenerOutcome, ListenerProbeError,
     ListenerReadiness, verify_listener,

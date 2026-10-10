@@ -15,8 +15,16 @@ lint_and_test() {
     cargo test --locked --workspace
 }
 
+# The minimum supported Rust version is `rust-version` in Cargo.toml; the
+# other groups build with the toolchain of rust-toolchain.toml.
 msrv() {
-    cargo +1.88.0 check --locked --workspace --all-targets --all-features
+    version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+    if [ -z "$version" ]; then
+        echo "ci/check.sh: no rust-version in Cargo.toml" >&2
+        exit 2
+    fi
+    rustup toolchain install "$version" --profile minimal
+    cargo +"$version" check --locked --workspace --all-targets --all-features
 }
 
 dependencies() {

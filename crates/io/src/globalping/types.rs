@@ -16,7 +16,8 @@ pub(super) enum MeasurementStatus {
 #[derive(Debug, Deserialize)]
 pub(super) struct RawMeasurement {
     pub(super) status: MeasurementStatus,
-    #[serde(default)]
+    /// Required by the API schema in every status, finished or not, so a
+    /// body without it is a decode error rather than "no probes answered".
     pub(super) results: Vec<RawProbeResult>,
 }
 

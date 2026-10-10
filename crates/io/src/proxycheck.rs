@@ -25,8 +25,56 @@ pub enum ProxycheckError {
         ip: Ipv4Addr,
         source: InvalidRiskScore,
     },
-    #[error(transparent)]
-    Reqwest(#[from] reqwest::Error),
+    #[error("proxycheck.io answered {operation} with HTTP {status}")]
+    Status {
+        operation: &'static str,
+        status: reqwest::StatusCode,
+    },
+    #[error("proxycheck.io answer to {operation} is not a v3 JSON object")]
+    MalformedResponse {
+        operation: &'static str,
+        source: serde_json::Error,
+    },
+    /// Built only by [`ProxycheckError::request`], which strips the URL:
+    /// the URL carries the API key.
+    #[error("proxycheck.io request failed: {operation}")]
+    Request {
+        operation: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
+}
+
+impl ProxycheckError {
+    /// Wraps a transport error of `operation` without its URL, which
+    /// carries the API key.
+    fn request(operation: &'static str) -> impl FnOnce(reqwest::Error) -> Self {
+        move |source| Self::Request {
+            operation,
+            source: source.without_url(),
+        }
+    }
+}
+
+/// The top level of a v3 answer: its status, an optional message and one
+/// entry per looked-up address, keyed by the address.
+#[derive(Deserialize)]
+struct RawAnswer {
+    status: Option<RawStatus>,
+    message: Option<String>,
+    #[serde(flatten)]
+    entries: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawStatus {
+    /// The daily query allowance is used up.
+    Denied,
+    Error,
+    /// `ok`, `warning` and any other status: the entries are read.
+    #[serde(other)]
+    Answered,
 }
 
 /// One address's entry in a v3 answer. The detection flags are required:
@@ -124,32 +172,54 @@ impl ProxycheckClient {
         &self,
         ip: Ipv4Addr,
     ) -> Result<ReputationFacts, ProxycheckError> {
+        const OPERATION: &str = "address lookup";
         let url = format!("{}/v3/{ip}", self.base_url);
-        let mut request = self.http.get(&url);
-        if let Some(key) = &self.api_key {
-            request = request.query(&[("key", key.expose())]);
-        }
-        // reqwest errors print the URL, which carries the key: strip it.
-        let response =
-            request.send().await.map_err(reqwest::Error::without_url)?;
-        let mut body: serde_json::Value =
-            response.json().await.map_err(reqwest::Error::without_url)?;
-        match body["status"].as_str() {
-            Some("denied") => return Err(ProxycheckError::QuotaExceeded),
-            Some("error") => {
+        let request = self.http.get(&url);
+        let request = match &self.api_key {
+            Some(key) => request.query(&[("key", key.expose())]),
+            None => request,
+        };
+        let response = request
+            .send()
+            .await
+            .map_err(ProxycheckError::request(OPERATION))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(ProxycheckError::request(OPERATION))?;
+        // A refusal can come with a non-success status, so the body is read
+        // first and its own status decides when it names one.
+        let answer = serde_json::from_slice::<RawAnswer>(&body);
+        let mut answer = match (answer, status.is_success()) {
+            (Ok(answer), _) if answer.status == Some(RawStatus::Denied) => {
+                return Err(ProxycheckError::QuotaExceeded);
+            }
+            (Ok(answer), _) if answer.status == Some(RawStatus::Error) => {
                 return Err(ProxycheckError::Api(
-                    body["message"]
-                        .as_str()
-                        .unwrap_or("unknown error")
-                        .to_string(),
+                    answer
+                        .message
+                        .unwrap_or_else(|| "unknown error".to_string()),
                 ));
             }
-            _ => {}
-        }
-        let entry = body
-            .get_mut(ip.to_string())
-            .ok_or(ProxycheckError::MissingEntry { ip })?
-            .take();
+            (_, false) => {
+                return Err(ProxycheckError::Status {
+                    operation: OPERATION,
+                    status,
+                });
+            }
+            (Ok(answer), true) => answer,
+            (Err(source), true) => {
+                return Err(ProxycheckError::MalformedResponse {
+                    operation: OPERATION,
+                    source,
+                });
+            }
+        };
+        let entry = answer
+            .entries
+            .remove(&ip.to_string())
+            .ok_or(ProxycheckError::MissingEntry { ip })?;
         let entry = serde_json::from_value::<RawEntry>(entry)
             .map_err(|source| ProxycheckError::MalformedEntry { ip, source })?;
         ReputationFacts::try_from(entry)
@@ -223,7 +293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_clean_hosting_address_parses_into_facts_with_no_hard_flags() {
+    async fn a_clean_hosting_address_has_no_flags_and_its_risk_score() {
         let server = MockServer::start().await;
         let sut = client_against(&server, "203.0.113.1", CLEAN_HOSTING).await;
 
@@ -308,6 +378,63 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ProxycheckError::QuotaExceeded), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_denied_status_with_a_failed_http_status_is_a_quota_exceeded_error()
+     {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/203.0.113.3"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_json(serde_json::json!({"status": "denied"})),
+            )
+            .mount(&server)
+            .await;
+        let sut = ProxycheckClient {
+            http: reqwest::Client::new(),
+            api_key: None,
+            base_url: server.uri(),
+        };
+
+        let err = sut
+            .lookup("203.0.113.3".parse().unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ProxycheckError::QuotaExceeded), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_http_status_without_a_v3_body_keeps_the_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/203.0.113.3"))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_string("<html>down</html>"),
+            )
+            .mount(&server)
+            .await;
+        let sut = ProxycheckClient {
+            http: reqwest::Client::new(),
+            api_key: None,
+            base_url: server.uri(),
+        };
+
+        let err = sut
+            .lookup("203.0.113.3".parse().unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                ProxycheckError::Status { status, .. }
+                    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            ),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

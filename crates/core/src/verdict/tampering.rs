@@ -49,23 +49,25 @@ mod tests {
 
     #[test]
     fn plain_http_dead_while_https_is_clean_fails_as_a_hoster_block() {
-        let checks = PortalChecks {
+        let sut = PortalChecks {
             https: vec![PortalOutcome::Ok; 3],
             http: vec![PortalOutcome::Unreachable; 3],
         };
-        let v = judge_tampering(&checks);
-        assert_eq!(v.severity, Severity::Fail, "{}", v.detail);
-        assert!(v.detail.contains("HTTP"), "{}", v.detail);
+
+        let verdict = judge_tampering(&sut);
+
+        assert_eq!(verdict.severity, Severity::Fail, "{}", verdict.detail);
+        assert!(verdict.detail.contains("HTTP"), "{}", verdict.detail);
     }
 
     #[test]
     fn no_plain_http_probes_are_no_evidence_of_an_http_block() {
-        let checks = PortalChecks {
+        let sut = PortalChecks {
             https: vec![PortalOutcome::Ok; 3],
             http: Vec::new(),
         };
 
-        let verdict = judge_tampering(&checks);
+        let verdict = judge_tampering(&sut);
 
         assert_eq!(verdict.severity, Severity::Ok, "{}", verdict.detail);
     }

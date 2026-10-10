@@ -1,3 +1,4 @@
+use super::locations::{Locations, LocationsBody};
 use super::types::{MeasurementStatus, RawMeasurement};
 use crate::credentials::GlobalpingToken;
 use chip_core::model::{HttpProbeOutcome, PingSample};
@@ -22,9 +23,9 @@ pub enum GlobalpingError {
         #[source]
         source: reqwest::Error,
     },
-    #[error(
-        "globalping rate limit exceeded (try again next hour, or set GLOBALPING_TOKEN)"
-    )]
+    /// The hourly quota is used up. The message names no remedy: raising
+    /// the quota is a setting of the application, not of this client.
+    #[error("globalping rate limit exceeded")]
     RateLimited,
     #[error("globalping found no suitable probes for this request")]
     NoSuitableProbes,
@@ -102,56 +103,6 @@ impl<K> std::fmt::Display for MeasurementId<K> {
     }
 }
 
-#[derive(Debug)]
-pub struct Locations(LocationsInner);
-
-#[derive(Debug)]
-enum LocationsInner {
-    Ru {
-        eyeball_limit: u8,
-        datacenter_limit: u8,
-    },
-    Reuse(String),
-}
-
-impl Locations {
-    /// # Errors
-    ///
-    /// Returns `InvalidProbeDistribution` when both limits are zero.
-    pub const fn ru(
-        eyeball_limit: u8,
-        datacenter_limit: u8,
-    ) -> Result<Self, InvalidProbeDistribution> {
-        if eyeball_limit == 0 && datacenter_limit == 0 {
-            Err(InvalidProbeDistribution)
-        } else {
-            Ok(Self(LocationsInner::Ru {
-                eyeball_limit,
-                datacenter_limit,
-            }))
-        }
-    }
-
-    /// Runs on the probe set of an earlier measurement of any kind, so
-    /// results of both measurements line up probe by probe.
-    pub fn reuse<K>(id: MeasurementId<K>) -> Self {
-        Self(LocationsInner::Reuse(id.0))
-    }
-
-    fn body(&self) -> LocationsBody<'_> {
-        match &self.0 {
-            LocationsInner::Ru {
-                eyeball_limit,
-                datacenter_limit,
-            } => LocationsBody::Probes([
-                ProbeLocation::ru("eyeball-network", *eyeball_limit),
-                ProbeLocation::ru("datacenter-network", *datacenter_limit),
-            ]),
-            LocationsInner::Reuse(id) => LocationsBody::Reuse(id),
-        }
-    }
-}
-
 /// Body of `POST /v1/measurements`.
 #[derive(Serialize)]
 struct CreateMeasurement<'a> {
@@ -182,36 +133,6 @@ struct HttpRequest {
     method: &'static str,
     path: &'static str,
 }
-
-/// Either a list of probe filters or, to reuse the probes of an earlier
-/// measurement, its id as a bare string.
-#[derive(Serialize)]
-#[serde(untagged)]
-enum LocationsBody<'a> {
-    Probes([ProbeLocation; 2]),
-    Reuse(&'a str),
-}
-
-#[derive(Serialize)]
-struct ProbeLocation {
-    country: &'static str,
-    limit: u8,
-    tags: [&'static str; 1],
-}
-
-impl ProbeLocation {
-    const fn ru(tag: &'static str, limit: u8) -> Self {
-        Self {
-            country: "RU",
-            limit,
-            tags: [tag],
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("eyeball and datacenter probe limits cannot both be zero")]
-pub struct InvalidProbeDistribution;
 
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 pub struct Limits {
@@ -388,6 +309,8 @@ impl GlobalpingClient {
 
     async fn poll(&self, id: &str) -> Result<RawMeasurement, GlobalpingError> {
         const OPERATION: &str = "poll measurement";
+        /// Pause between two reads of a measurement still in progress.
+        const POLL_INTERVAL: Duration = Duration::from_secs(1);
         loop {
             let resp = self
                 .request(
@@ -403,7 +326,7 @@ impl GlobalpingClient {
                 .map_err(GlobalpingError::request(OPERATION))?;
             match measurement.status {
                 MeasurementStatus::InProgress => {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(POLL_INTERVAL).await;
                 }
                 MeasurementStatus::Finished
                 | MeasurementStatus::Failed
@@ -447,6 +370,7 @@ impl GlobalpingClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::globalping::ProbeSelection;
     use std::time::Duration;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -464,13 +388,6 @@ mod tests {
         let error = MeasurementId::<Ping>::new(String::new()).unwrap_err();
 
         assert!(matches!(error, GlobalpingError::EmptyMeasurementId));
-    }
-
-    #[test]
-    fn an_empty_probe_distribution_is_rejected() {
-        let error = Locations::ru(0, 0).err().unwrap();
-
-        assert_eq!(error, InvalidProbeDistribution);
     }
 
     fn client_against(server: &MockServer) -> GlobalpingClient {
@@ -513,7 +430,10 @@ mod tests {
         let sut = client_against(&server);
 
         let id = sut
-            .create_ping(ip("192.0.2.1"), &Locations::ru(8, 4).unwrap())
+            .create_ping(
+                ip("192.0.2.1"),
+                &Locations::ru(ProbeSelection::new(8, 4).unwrap()),
+            )
             .await
             .unwrap();
 
@@ -534,6 +454,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_probe_group_without_probes_is_left_out_of_the_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/measurements"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .set_body_json(serde_json::json!({"id": "meas-1"})),
+            )
+            .mount(&server)
+            .await;
+        let sut = client_against(&server);
+
+        sut.create_ping(
+            ip("192.0.2.1"),
+            &Locations::ru(ProbeSelection::new(0, 4).unwrap()),
+        )
+        .await
+        .unwrap();
+
+        let body = received_body(&server).await;
+        assert_eq!(
+            body["locations"],
+            serde_json::json!([
+                {"country": "RU", "tags": ["datacenter-network"], "limit": 4}
+            ])
+        );
+    }
+
+    #[tokio::test]
     async fn a_measurement_on_earlier_probes_sends_their_id_as_a_bare_string() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -549,7 +498,7 @@ mod tests {
         let id = sut
             .create_ping(
                 ip("192.0.2.2"),
-                &Locations::reuse(measurement_id::<Ping>("meas-1")),
+                &Locations::reuse(&measurement_id::<Ping>("meas-1")),
             )
             .await
             .unwrap();
@@ -577,7 +526,7 @@ mod tests {
         sut.create_https(
             ip("192.0.2.1"),
             NonZeroU16::new(443).unwrap(),
-            &Locations::reuse(measurement_id::<Ping>("meas-1")),
+            &Locations::reuse(&measurement_id::<Ping>("meas-1")),
         )
         .await
         .unwrap();
@@ -603,7 +552,7 @@ mod tests {
         let err = sut
             .create_ping(
                 ip("192.0.2.1"),
-                &Locations::reuse(measurement_id::<Ping>("x")),
+                &Locations::reuse(&measurement_id::<Ping>("x")),
             )
             .await
             .unwrap_err();
@@ -624,7 +573,7 @@ mod tests {
         let err = sut
             .create_ping(
                 ip("192.0.2.1"),
-                &Locations::reuse(measurement_id::<Ping>("x")),
+                &Locations::reuse(&measurement_id::<Ping>("x")),
             )
             .await
             .unwrap_err();

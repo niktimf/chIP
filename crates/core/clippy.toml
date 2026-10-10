@@ -1,13 +1,13 @@
-# Copy to the directory of the functional core crate (next to its
-# Cargo.toml). Clippy does not merge this file with the root clippy.toml, so
-# it repeats every root setting and adds the effects that core must not
-# perform: core receives time, environment, randomness and I/O results as
-# arguments from the imperative shell.
+# Clippy settings of chip-core, the functional core. Clippy does not merge
+# this file with the root clippy.toml, so it repeats every root setting and
+# adds the effects that core must not perform: core receives time,
+# environment, randomness and I/O results as arguments from chip-io and the
+# cli.
 #
 # The default cognitive-complexity-threshold is intentional. Add an explicit
 # value only after measurements on a real codebase justify changing it.
 
-# Root settings, kept identical to templates/clippy.toml.
+# Root settings, kept identical to the workspace clippy.toml.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
@@ -29,7 +29,7 @@ disallowed-methods = [
     { path = "tokio::sync::mpsc::unbounded_channel", reason = "unbounded queue: use tokio::sync::mpsc::channel with a capacity" },
     { path = "crossbeam_channel::unbounded", reason = "unbounded queue: use crossbeam_channel::bounded" },
     { path = "crossbeam::channel::unbounded", reason = "unbounded queue: use crossbeam::channel::bounded" },
-    { path = "futures::channel::mpsc::unbounded", reason = "unbounded queue: use futures::channel::mpsc::channel" },
+    { path = "futures::channel::mpsc::unbounded", reason = "unbounded queue: use futures::channel::mpsc::channel", allow-invalid = true },
     { path = "flume::unbounded", reason = "unbounded queue: use flume::bounded" },
     { path = "async_channel::unbounded", reason = "unbounded queue: use async_channel::bounded" },
     # Core: time comes from the shell.

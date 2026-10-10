@@ -15,7 +15,8 @@ use chip_core::{
 use chip_io::credentials::{
     EmptySecret, GlobalpingToken, ProxycheckApiKey, SshPrivateKey,
 };
-use chip_io::ssh::HostKeyPolicy;
+use chip_io::globalping::{EmptyProbeSelection, ProbeSelection};
+use chip_io::ssh::{HostKeyPolicy, KnownHostsEntries};
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
@@ -71,7 +72,7 @@ pub enum ConfigError {
     },
     #[error(transparent)]
     LatencyThresholds(#[from] InvalidLatencyThresholds),
-    #[error(transparent)]
+    #[error("--eyeball-probes and --dc-probes cannot both be 0")]
     ProbeSelection(#[from] EmptyProbeSelection),
 }
 
@@ -98,9 +99,10 @@ where
         .map_err(|source| ConfigError::EmptySecret { name, source })
 }
 
-/// Values a command takes from the environment instead of its flags.
-#[derive(Default)]
-struct EnvironmentInputs {
+/// Values `scan` takes from the environment instead of its flags. `None`
+/// means the variable is not set. `calibrate` reads only the Globalping
+/// token and takes it as a plain `Option<GlobalpingToken>`.
+struct ScanEnvironment {
     ssh_private_key: Option<SshPrivateKey>,
     globalping_token: Option<GlobalpingToken>,
     proxycheck_api_key: Option<ProxycheckApiKey>,
@@ -111,8 +113,8 @@ struct EnvironmentInputs {
     step_summary: Option<PathBuf>,
 }
 
-impl EnvironmentInputs {
-    fn for_scan(
+impl ScanEnvironment {
+    fn read(
         environment: impl Fn(&str) -> Option<OsString>,
     ) -> Result<Self, ConfigError> {
         Ok(Self {
@@ -127,18 +129,6 @@ impl EnvironmentInputs {
             )?,
             home: environment("HOME").map(PathBuf::from),
             step_summary: environment("GITHUB_STEP_SUMMARY").map(PathBuf::from),
-        })
-    }
-
-    fn for_calibrate(
-        environment: impl Fn(&str) -> Option<OsString>,
-    ) -> Result<Self, ConfigError> {
-        Ok(Self {
-            globalping_token: secret_from_env(
-                "GLOBALPING_TOKEN",
-                &environment,
-            )?,
-            ..Self::default()
         })
     }
 
@@ -164,12 +154,12 @@ impl Cli {
         match self.command {
             CliCommand::Scan(args) => ScanCommand::try_from((
                 *args,
-                EnvironmentInputs::for_scan(environment)?,
+                ScanEnvironment::read(environment)?,
             ))
             .map(|command| Command::Scan(Box::new(command))),
             CliCommand::Calibrate(args) => CalibrateCommand::try_from((
                 args,
-                EnvironmentInputs::for_calibrate(environment)?,
+                secret_from_env("GLOBALPING_TOKEN", &environment)?,
             ))
             .map(Command::Calibrate),
         }
@@ -203,7 +193,7 @@ struct ScanArgs {
     /// first key seen is accepted, unless `~/.ssh/known_hosts` already lists
     /// a key for the host. That file is read, never written.
     #[arg(long, env = "SSH_KNOWN_HOSTS")]
-    ssh_known_hosts: Option<String>,
+    ssh_known_hosts: Option<KnownHostsEntries>,
     /// Fail the latency gate above this median excess over the best anchor of
     /// the candidate's city, in milliseconds.
     #[arg(long, default_value_t = 14.0)]
@@ -266,40 +256,6 @@ struct CalibrateArgs {
     /// How many probes in Russian datacenters to measure from.
     #[arg(long, default_value_t = 4)]
     dc_probes: u8,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProbeSelection {
-    eyeball: u8,
-    datacenter: u8,
-}
-
-/// Both probe counts are zero, so no probe would measure anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("--eyeball-probes and --dc-probes cannot both be 0")]
-pub struct EmptyProbeSelection;
-
-impl ProbeSelection {
-    const fn new(
-        eyeball: u8,
-        datacenter: u8,
-    ) -> Result<Self, EmptyProbeSelection> {
-        if eyeball == 0 && datacenter == 0 {
-            return Err(EmptyProbeSelection);
-        }
-        Ok(Self {
-            eyeball,
-            datacenter,
-        })
-    }
-
-    pub const fn eyeball(self) -> u8 {
-        self.eyeball
-    }
-
-    pub const fn datacenter(self) -> u8 {
-        self.datacenter
-    }
 }
 
 /// Whether phase B still runs after a phase-A gate failed.
@@ -386,11 +342,11 @@ pub struct ScanCommand {
     step_summary: Option<PathBuf>,
 }
 
-impl TryFrom<(ScanArgs, EnvironmentInputs)> for ScanCommand {
+impl TryFrom<(ScanArgs, ScanEnvironment)> for ScanCommand {
     type Error = ConfigError;
 
     fn try_from(
-        (args, environment): (ScanArgs, EnvironmentInputs),
+        (args, environment): (ScanArgs, ScanEnvironment),
     ) -> Result<Self, Self::Error> {
         let latency_thresholds = LatencyThresholds::from_millis_and_points(
             args.max_excess_ms,
@@ -589,16 +545,16 @@ pub struct CalibrateCommand {
     probes: ProbeSelection,
 }
 
-impl TryFrom<(CalibrateArgs, EnvironmentInputs)> for CalibrateCommand {
+impl TryFrom<(CalibrateArgs, Option<GlobalpingToken>)> for CalibrateCommand {
     type Error = ConfigError;
 
     fn try_from(
-        (args, environment): (CalibrateArgs, EnvironmentInputs),
+        (args, globalping_token): (CalibrateArgs, Option<GlobalpingToken>),
     ) -> Result<Self, Self::Error> {
         let probes = ProbeSelection::new(args.eyeball_probes, args.dc_probes)?;
         Ok(Self {
             targets: args.targets,
-            globalping_token: environment.globalping_token,
+            globalping_token,
             probes,
         })
     }
@@ -679,10 +635,7 @@ mod tests {
         assert_eq!(command.country().as_str(), "FI");
         assert_eq!(ssh_settings(&command).user(), "root");
         assert_eq!(command.reference_city().as_str(), "Helsinki");
-        assert_eq!(
-            (command.probes().eyeball(), command.probes().datacenter()),
-            (8, 4)
-        );
+        assert_eq!(command.probes(), ProbeSelection::new(8, 4).unwrap());
         assert_eq!(command.neighbor_sweep(), NeighborSweep::Enabled);
         assert_eq!(command.failure_policy(), FailurePolicy::FailFast);
     }
@@ -739,7 +692,9 @@ mod tests {
 
         assert_eq!(
             ssh_settings(&command).host_keys(),
-            &HostKeyPolicy::Pinned("203.0.113.1 ssh-ed25519 AAAA".to_owned())
+            &HostKeyPolicy::Pinned(
+                "203.0.113.1 ssh-ed25519 AAAA".parse().unwrap()
+            )
         );
     }
 
@@ -850,6 +805,10 @@ mod tests {
     #[case::empty_city(
         &["scan", "203.0.113.1", "--country", "FI", "--city", "   "],
         "city name must not be empty"
+    )]
+    #[case::blank_known_hosts(
+        &["scan", "203.0.113.1", "--country", "FI", "--ssh-known-hosts", " "],
+        "known-hosts entries must not be empty"
     )]
     #[case::misspelled_gate(
         &["scan", "203.0.113.1", "--country", "FI", "--gate", "service:clade"],
@@ -963,20 +922,6 @@ mod tests {
             matches!(error, ConfigError::ProbeSelection(EmptyProbeSelection)),
             "{error:?}"
         );
-    }
-
-    #[test]
-    fn zero_probes_of_both_kinds_make_an_empty_selection() {
-        let actual = ProbeSelection::new(0, 0);
-
-        assert_eq!(actual, Err(EmptyProbeSelection));
-    }
-
-    #[test]
-    fn datacenter_probes_alone_make_a_selection() {
-        let selection = ProbeSelection::new(0, 4).unwrap();
-
-        assert_eq!((selection.eyeball(), selection.datacenter()), (0, 4));
     }
 
     #[test]

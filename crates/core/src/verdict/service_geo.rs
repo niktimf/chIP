@@ -581,6 +581,35 @@ mod tests {
         assert_eq!(verdict.severity, expected, "{}", verdict.detail);
     }
 
+    #[rstest::rstest]
+    #[case::first_request_failed(
+        CaptchaObservation::Unavailable("timed out".to_owned()),
+        CaptchaObservation::Clear
+    )]
+    #[case::retry_failed_after_a_captcha(
+        CaptchaObservation::Triggered,
+        CaptchaObservation::Unavailable("timed out".to_owned())
+    )]
+    fn a_captcha_request_that_got_no_page_is_an_error(
+        #[case] first: CaptchaObservation,
+        #[case] retry: CaptchaObservation,
+    ) {
+        let sut = CaptchaRetry {
+            first,
+            retry,
+            interval: std::time::Duration::from_secs(30),
+        };
+
+        let verdict = judge_search_captcha(&sut);
+
+        assert_eq!(
+            verdict,
+            Verdict::error(
+                "Google Search captcha check unavailable: timed out"
+            )
+        );
+    }
+
     #[test]
     fn a_reproduced_captcha_names_the_pause_between_the_requests() {
         let sut = CaptchaRetry {
@@ -628,9 +657,9 @@ mod tests {
         #[case] body: &str,
         #[case] expected: CaptchaObservation,
     ) {
-        let sut = classify_search_captcha(status, body);
+        let actual = classify_search_captcha(status, body);
 
-        assert_eq!(sut, expected);
+        assert_eq!(actual, expected);
     }
 
     #[rstest::rstest]
@@ -698,9 +727,9 @@ mod tests {
         #[case] code: &str,
         #[case] expected: &str,
     ) {
-        let sut = airport_country(code);
+        let actual = airport_country(code);
 
-        assert_eq!(sut, Some(cc(expected)));
+        assert_eq!(actual, Some(cc(expected)));
     }
 
     #[test]
@@ -716,8 +745,8 @@ mod tests {
 
     #[test]
     fn an_unknown_airport_code_is_no_country_rather_than_a_guess() {
-        let sut = airport_country("ZZZ");
+        let actual = airport_country("ZZZ");
 
-        assert_eq!(sut, None);
+        assert_eq!(actual, None);
     }
 }

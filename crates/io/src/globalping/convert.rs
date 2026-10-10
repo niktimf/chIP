@@ -197,11 +197,11 @@ mod tests {
     }
 
     #[test]
-    fn a_measurement_without_results_reads_as_an_empty_series() {
-        let sut = measurement(r#"{"id": "meas-8", "status": "finished"}"#);
+    fn a_measurement_without_results_is_not_read_as_an_empty_series() {
+        let body = r#"{"id": "meas-8", "status": "finished"}"#;
 
-        let samples = sut.ping_samples();
+        let decoded = serde_json::from_str::<RawMeasurement>(body);
 
-        assert_eq!(samples, []);
+        assert!(decoded.is_err(), "{decoded:?}");
     }
 }

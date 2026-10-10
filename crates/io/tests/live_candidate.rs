@@ -12,11 +12,13 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::panic,
     reason = "test helpers fail fast on broken setup"
 )]
 
 use std::net::{Ipv4Addr, TcpStream};
 use std::num::NonZeroU16;
+use std::str::FromStr;
 use std::time::Duration;
 
 use chip_io::credentials::SshPrivateKey;
@@ -33,10 +35,32 @@ fn candidate() -> Ipv4Addr {
         .expect("CHIP_LIVE_IP must be an IPv4 address")
 }
 
+/// The value of the variable `name`; `None` only when it is unset. A value
+/// that is set but not Unicode fails the test instead of reading as unset.
+fn env(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => panic!("{name} must be Unicode: {error}"),
+    }
+}
+
+/// The variable `name` parsed as `T`; `None` only when it is unset. A
+/// value that does not parse fails the test, so a typo is not replaced by
+/// the default.
+fn env_parsed<T: FromStr>(name: &str) -> Option<T>
+where
+    T::Err: std::fmt::Display,
+{
+    env(name).map(|value| {
+        value.parse().unwrap_or_else(|error| {
+            panic!("{name}={value:?} must parse: {error}")
+        })
+    })
+}
+
 fn listener_port() -> NonZeroU16 {
-    std::env::var("CHIP_LIVE_PORT")
-        .ok()
-        .and_then(|value| value.parse().ok())
+    env_parsed("CHIP_LIVE_PORT")
         .unwrap_or_else(|| NonZeroU16::new(8443).expect("8443 is non-zero"))
 }
 
@@ -45,14 +69,13 @@ fn config() -> SshConfig {
         user: Some(
             std::env::var("SSH_USER").unwrap_or_else(|_| "root".to_string()),
         ),
-        port: std::env::var("SSH_PORT")
-            .ok()
-            .and_then(|value| value.parse().ok())
+        port: env_parsed("SSH_PORT")
             .unwrap_or_else(|| NonZeroU16::new(22).expect("22 is non-zero")),
-        private_key: std::env::var("SSH_PRIVATE_KEY")
-            .ok()
-            .and_then(|key| SshPrivateKey::try_from(key).ok()),
-        host_keys: std::env::var("SSH_KNOWN_HOSTS").map_or(
+        private_key: env("SSH_PRIVATE_KEY").map(|key| {
+            SshPrivateKey::try_from(key)
+                .expect("SSH_PRIVATE_KEY, when set, must not be empty")
+        }),
+        host_keys: env_parsed("SSH_KNOWN_HOSTS").map_or(
             HostKeyPolicy::TrustOnFirstUse {
                 user_known_hosts: None,
             },

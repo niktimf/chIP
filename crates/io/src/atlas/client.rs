@@ -1,4 +1,4 @@
-use chip_core::anchor::Anchor;
+use chip_core::anchor::{Anchor, AnchorFields};
 use futures::{TryStreamExt as _, stream};
 use serde::Deserialize;
 use thiserror::Error;
@@ -6,10 +6,12 @@ use thiserror::Error;
 #[derive(Deserialize)]
 struct RawAnchor {
     fqdn: String,
-    ip_v4: String,
+    /// `null` for an anchor without IPv4.
+    ip_v4: Option<String>,
     city: String,
     country: String,
-    as_v4: u32,
+    /// `null` for an anchor without IPv4.
+    as_v4: Option<u32>,
     is_disabled: bool,
     date_decommissioned: Option<String>,
 }
@@ -19,13 +21,19 @@ impl RawAnchor {
         if self.is_disabled || self.date_decommissioned.is_some() {
             return None;
         }
-        let ip_v4 = self
-            .ip_v4
+        let (Some(ip_v4), Some(as_v4)) = (self.ip_v4, self.as_v4) else {
+            tracing::debug!(
+                fqdn = %self.fqdn,
+                "active anchor dropped: no IPv4 address or AS number"
+            );
+            return None;
+        };
+        let ip_v4 = ip_v4
             .parse()
             .inspect_err(|error| {
                 tracing::debug!(
                     fqdn = %self.fqdn,
-                    ip_v4 = %self.ip_v4,
+                    %ip_v4,
                     %error,
                     "active anchor dropped: invalid IPv4 address"
                 );
@@ -42,7 +50,13 @@ impl RawAnchor {
                 );
             })
             .ok()?;
-        Some(Anchor::new(self.fqdn, ip_v4, self.city, country, self.as_v4))
+        Some(Anchor::new(AnchorFields {
+            fqdn: self.fqdn,
+            ip_v4,
+            city: self.city,
+            country,
+            as_v4,
+        }))
     }
 }
 
@@ -171,6 +185,33 @@ mod tests {
         assert_eq!(
             anchors.iter().map(Anchor::fqdn).collect::<Vec<_>>(),
             vec!["fi-hel-as1", "de-fra-as4"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_anchor_with_null_ipv4_is_skipped_and_the_page_still_reads() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/anchors"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [
+                    {"fqdn": "fi-hel-as5-v6only", "ip_v4": null, "city": "Helsinki", "country": "FI", "as_v4": null, "is_disabled": false, "date_decommissioned": null},
+                    {"fqdn": "fi-hel-as1", "ip_v4": "192.0.2.1", "city": "Helsinki", "country": "FI", "as_v4": 1, "is_disabled": false, "date_decommissioned": null}
+                ],
+                "next": null
+            })))
+            .mount(&server)
+            .await;
+        let sut = AnchorClient::with_base_url(
+            reqwest::Client::new(),
+            format!("{}/anchors", server.uri()),
+        );
+
+        let anchors = sut.anchors().await.unwrap();
+
+        assert_eq!(
+            anchors.iter().map(Anchor::fqdn).collect::<Vec<_>>(),
+            vec!["fi-hel-as1"]
         );
     }
 

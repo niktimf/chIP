@@ -116,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn the_16_count_reaches_the_detail_for_the_json_report() {
+    fn the_detail_names_the_listed_neighbors_of_the_16() {
         let sut = RknRegistryFacts::new(RknListing::NotListed, 1, 37).unwrap();
 
         let verdict = judge_rkn_registry(&sut);

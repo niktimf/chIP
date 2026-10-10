@@ -1,16 +1,18 @@
 use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
 use std::process::{Output, Stdio};
-use std::sync::Arc;
 use std::time::Duration;
 
 use chip_core::model::{
     NeighborHttps, NeighborProbe, PtrLookup, PtrName, TlsHandshake,
     TlsHandshakeFacts,
 };
+use futures::{StreamExt as _, stream};
 use ipnet::Ipv4Net;
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+
+/// The port every neighbor is probed on, by TCP connect and TLS handshake.
+const HTTPS_PORT: u16 = 443;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SweepConfig {
@@ -38,9 +40,12 @@ impl Default for SweepConfig {
 }
 
 async fn tcp_open(ip: Ipv4Addr, timeout: Duration) -> bool {
-    tokio::time::timeout(timeout, tokio::net::TcpStream::connect((ip, 443)))
-        .await
-        .is_ok_and(|result| result.is_ok())
+    tokio::time::timeout(
+        timeout,
+        tokio::net::TcpStream::connect((ip, HTTPS_PORT)),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
 }
 
 fn parse_cert_block(raw: &str) -> Option<TlsHandshakeFacts> {
@@ -88,7 +93,12 @@ fn parse_cert_block(raw: &str) -> Option<TlsHandshakeFacts> {
 async fn handshake(ip: Ipv4Addr, timeout: Duration) -> TlsHandshake {
     let mut command = Command::new("openssl");
     command
-        .args(["s_client", "-showcerts", "-connect", &format!("{ip}:443")])
+        .args([
+            "s_client",
+            "-showcerts",
+            "-connect",
+            &format!("{ip}:{HTTPS_PORT}"),
+        ])
         .stdin(Stdio::null())
         .kill_on_drop(true);
     match tokio::time::timeout(timeout, command.output()).await {
@@ -125,8 +135,13 @@ fn handshake_from_openssl(output: &Output) -> TlsHandshake {
 }
 
 async fn reverse_dns(ip: Ipv4Addr, timeout: Duration) -> PtrLookup {
+    /// dig's wait for one answer, in whole seconds as dig takes it; the
+    /// probe `timeout` bounds the whole lookup.
+    const DIG_WAIT: &str = "+time=2";
+    /// One try: a retry would not fit in the probe timeout.
+    const DIG_TRIES: &str = "+tries=1";
     let dig = Command::new("dig")
-        .args(["+short", "+time=2", "+tries=1", "-x", &ip.to_string()])
+        .args(["+short", DIG_WAIT, DIG_TRIES, "-x", &ip.to_string()])
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .output();
@@ -165,48 +180,32 @@ fn first_nonempty_line(text: &str) -> Option<&str> {
     text.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
-/// Surveys every host in a subnet with bounded concurrency. A task owns its
-/// permit for its complete TCP/TLS/PTR sequence and every task is joined.
-///
-/// # Errors
-///
-/// Returns `JoinError` when a probe task panics or is cancelled.
+/// Surveys every host in a subnet, at most `config.concurrency` hosts at
+/// once, and returns one probe per host, sorted by address.
 pub async fn sweep(
     network: Ipv4Net,
     config: &SweepConfig,
-) -> Result<Vec<NeighborProbe>, tokio::task::JoinError> {
-    let semaphore = Arc::new(Semaphore::new(config.concurrency.get()));
-    let mut tasks = tokio::task::JoinSet::new();
-    // One task per host, all spawned up front: the scan passes a /24, so at
-    // most 254 tasks wait here, and the semaphore bounds how many probe at
-    // once.
-    for ip in network.hosts() {
-        let semaphore = Arc::clone(&semaphore);
-        let timeout = config.timeout;
-        tasks.spawn(async move {
-            let Ok(_permit) = semaphore.acquire_owned().await else {
-                return None;
-            };
-            let (https, ptr) = if tcp_open(ip, timeout).await {
-                let (handshake, ptr) = tokio::join!(
-                    handshake(ip, timeout),
-                    reverse_dns(ip, timeout)
-                );
-                (NeighborHttps::Open { handshake }, ptr)
-            } else {
-                (NeighborHttps::Closed, reverse_dns(ip, timeout).await)
-            };
-            Some(NeighborProbe { ip, ptr, https })
-        });
-    }
-
-    let mut probes: Vec<_> = crate::tasks::collect(tasks)
-        .await?
-        .into_iter()
-        .flatten()
-        .collect();
+) -> Vec<NeighborProbe> {
+    let timeout = config.timeout;
+    let mut probes: Vec<NeighborProbe> = stream::iter(network.hosts())
+        .map(|ip| probe(ip, timeout))
+        .buffer_unordered(config.concurrency.get())
+        .collect()
+        .await;
     probes.sort_by_key(|probe| probe.ip);
-    Ok(probes)
+    probes
+}
+
+/// The TCP, TLS and PTR sequence of one host.
+async fn probe(ip: Ipv4Addr, timeout: Duration) -> NeighborProbe {
+    let (https, ptr) = if tcp_open(ip, timeout).await {
+        let (handshake, ptr) =
+            tokio::join!(handshake(ip, timeout), reverse_dns(ip, timeout));
+        (NeighborHttps::Open { handshake }, ptr)
+    } else {
+        (NeighborHttps::Closed, reverse_dns(ip, timeout).await)
+    };
+    NeighborProbe { ip, ptr, https }
 }
 
 #[cfg(test)]
@@ -216,7 +215,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn certificate_is_read_from_openssl_output_without_manual_pem_slicing() {
+    fn a_certificate_in_openssl_output_yields_its_common_name_and_dns_names() {
         let raw = format!(
             "CONNECTED(00000003)\n{}\n---\nhandshake details",
             include_str!("testdata/neighbor-cert.pem")
@@ -233,7 +232,9 @@ mod tests {
 
     #[test]
     fn text_without_a_certificate_is_not_a_handshake() {
-        assert!(parse_cert_block("connect: Connection refused\n").is_none());
+        let facts = parse_cert_block("connect: Connection refused\n");
+
+        assert!(facts.is_none());
     }
 
     /// What a command printed, as `Command::output` returns it. `exit_code`

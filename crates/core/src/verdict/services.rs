@@ -24,39 +24,42 @@ pub fn classify_chatgpt_web(body: &str) -> ServiceState {
     }
 }
 
+/// The reason an `Inconclusive` state gives for a Cloudflare challenge,
+/// the same for every service and AI API.
+pub(crate) const CLOUDFLARE_CHALLENGED: &str =
+    "Cloudflare challenged the request";
+
 /// Whether the response is a Cloudflare challenge page instead of the
 /// service's own answer. Shared with `verdict::ai`: the API endpoints sit
-/// behind the same Cloudflare front, so one marker list serves both.
-pub(crate) fn is_cloudflare_challenge(
-    status: StatusCode,
-    body_lower: &str,
-) -> bool {
-    [
+/// behind the same Cloudflare front, so one marker list serves both. The
+/// markers are matched in any case; the body is lowercased only for a
+/// status Cloudflare challenges with.
+pub(crate) fn is_cloudflare_challenge(status: StatusCode, body: &str) -> bool {
+    const CHALLENGE_STATUSES: &[StatusCode] = &[
         StatusCode::FORBIDDEN,
         StatusCode::TOO_MANY_REQUESTS,
         StatusCode::SERVICE_UNAVAILABLE,
-    ]
-    .contains(&status)
-        && [
-            "cf_chl_opt",
-            "_cf_chl",
-            "just a moment",
-            "cf-browser-verification",
-            "enable javascript and cookies to continue",
-            "cf-mitigated",
-            "checking your browser",
-        ]
-        .iter()
-        .any(|marker| body_lower.contains(marker))
+    ];
+    const MARKERS: &[&str] = &[
+        "cf_chl_opt",
+        "_cf_chl",
+        "just a moment",
+        "cf-browser-verification",
+        "enable javascript and cookies to continue",
+        "cf-mitigated",
+        "checking your browser",
+    ];
+    CHALLENGE_STATUSES.contains(&status) && {
+        let body = body.to_lowercase();
+        MARKERS.iter().any(|marker| body.contains(marker))
+    }
 }
 
 pub fn classify_chatgpt_app(status: StatusCode, body: &str) -> ServiceState {
-    let lower = body.to_lowercase();
-    if is_cloudflare_challenge(status, &lower) {
-        return ServiceState::Inconclusive(
-            "Cloudflare challenged the request".into(),
-        );
+    if is_cloudflare_challenge(status, body) {
+        return ServiceState::Inconclusive(CLOUDFLARE_CHALLENGED.into());
     }
+    let lower = body.to_lowercase();
     if lower.contains("disallowed isp") {
         return ServiceState::Blocked;
     }
@@ -90,33 +93,24 @@ fn extract_gemini_region(body: &str) -> Option<&str> {
         .map(|matched| matched.as_str())
 }
 
-/// Countries where Google does not offer Gemini, ported verbatim from
-/// geocheck's `geminiUnsupported` map (`internal/access/checks.go`, v0.3.0,
-/// confirmed against v0.3.0).
-///
-/// The upstream mechanism is not a body-marker match: it extracts a region
-/// code and checks it against this list.
-pub const fn gemini_unsupported_regions() -> &'static [&'static str] {
-    &["RUS", "BLR", "CHN", "PRK", "IRN", "CUB", "SYR"]
-}
-
 /// Classifies a Gemini probe by the region Google's page says it served.
 ///
 /// Unlike `classify_claude`/`classify_tiktok`, this is not a body-marker
 /// match: geocheck's real `classifyGemini` extracts that region and checks it
-/// against [`gemini_unsupported_regions`].
+/// against the list of countries where Google does not offer Gemini.
 pub fn classify_gemini(status: StatusCode, body: &str) -> ServiceState {
-    let lower = body.to_lowercase();
-    if is_cloudflare_challenge(status, &lower) {
-        return ServiceState::Inconclusive(
-            "Cloudflare challenged the request, so availability was never tested".into(),
-        );
+    // Ported verbatim from geocheck's `geminiUnsupported` map
+    // (`internal/access/checks.go`, v0.3.0).
+    const UNSUPPORTED_REGIONS: &[&str] =
+        &["RUS", "BLR", "CHN", "PRK", "IRN", "CUB", "SYR"];
+    if is_cloudflare_challenge(status, body) {
+        return ServiceState::Inconclusive(CLOUDFLARE_CHALLENGED.into());
     }
     if !(status.is_success() || status.is_redirection()) {
         return ServiceState::Inconclusive(format!("unexpected HTTP {status}"));
     }
     match extract_gemini_region(body) {
-        Some(region) if gemini_unsupported_regions().contains(&region) => {
+        Some(region) if UNSUPPORTED_REGIONS.contains(&region) => {
             ServiceState::Blocked
         }
         Some(_) => ServiceState::Available,
@@ -131,10 +125,8 @@ pub fn classify_notebooklm(
     final_url: &Url,
     body: &str,
 ) -> ServiceState {
-    if is_cloudflare_challenge(status, &body.to_lowercase()) {
-        return ServiceState::Inconclusive(
-            "Cloudflare challenged the request, so availability was never tested".into(),
-        );
+    if is_cloudflare_challenge(status, body) {
+        return ServiceState::Inconclusive(CLOUDFLARE_CHALLENGED.into());
     }
     if final_url
         .query_pairs()
@@ -193,12 +185,10 @@ const CLAUDE_UNAVAILABLE_MARKERS: &[&str] = &[
 ];
 
 pub fn classify_claude(status: StatusCode, body: &str) -> ServiceState {
-    let lower = body.to_lowercase();
-    if is_cloudflare_challenge(status, &lower) {
-        return ServiceState::Inconclusive(
-            "Cloudflare challenged the request".into(),
-        );
+    if is_cloudflare_challenge(status, body) {
+        return ServiceState::Inconclusive(CLOUDFLARE_CHALLENGED.into());
     }
+    let lower = body.to_lowercase();
     if CLAUDE_UNAVAILABLE_MARKERS
         .iter()
         .any(|marker| lower.contains(marker))
@@ -317,7 +307,12 @@ mod tests {
 
         let actual = classify_chatgpt_app(status(403), sut);
 
-        assert!(matches!(actual, ServiceState::Inconclusive(_)), "{actual:?}");
+        assert_eq!(
+            actual,
+            ServiceState::Inconclusive(
+                "Cloudflare challenged the request".into()
+            )
+        );
     }
 
     #[rstest]
@@ -468,6 +463,20 @@ mod tests {
         let actual = classify_claude(status(200), sut);
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn claude_treats_a_cloudflare_challenge_as_unproven_not_blocked() {
+        let sut = CLOUDFLARE_CHALLENGE;
+
+        let actual = classify_claude(status(429), sut);
+
+        assert_eq!(
+            actual,
+            ServiceState::Inconclusive(
+                "Cloudflare challenged the request".into()
+            )
+        );
     }
 
     #[test]

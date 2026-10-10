@@ -3,7 +3,46 @@ use super::session::SshError;
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use tempfile::NamedTempFile;
+use thiserror::Error;
+
+/// `known_hosts` content that pins the candidate's host key.
+///
+/// It is never blank: ssh with an empty known-hosts file rejects every key,
+/// and the scan would report that as "Host key verification failed".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnownHostsEntries(String);
+
+impl KnownHostsEntries {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("known-hosts entries must not be empty")]
+pub struct EmptyKnownHosts;
+
+impl TryFrom<String> for KnownHostsEntries {
+    type Error = EmptyKnownHosts;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.trim().is_empty() {
+            Err(EmptyKnownHosts)
+        } else {
+            Ok(Self(value))
+        }
+    }
+}
+
+impl FromStr for KnownHostsEntries {
+    type Err = EmptyKnownHosts;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value.to_owned())
+    }
+}
 
 /// How ssh decides whether to trust the candidate's host key.
 ///
@@ -13,7 +52,7 @@ use tempfile::NamedTempFile;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostKeyPolicy {
     /// Accept only keys listed in this `known_hosts` content.
-    Pinned(String),
+    Pinned(KnownHostsEntries),
     /// Accept the key of a host that no known-hosts file lists yet.
     ///
     /// ssh reads `user_known_hosts` too, so a host recorded there must still
@@ -22,7 +61,27 @@ pub enum HostKeyPolicy {
     TrustOnFirstUse { user_known_hosts: Option<PathBuf> },
 }
 
+/// ssh's `StrictHostKeyChecking` for a `HostKeyPolicy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
+pub(super) enum StrictHostKeyChecking {
+    #[strum(to_string = "yes")]
+    Yes,
+    #[strum(to_string = "accept-new")]
+    AcceptNew,
+}
+
 impl HostKeyPolicy {
+    /// One mapping for the session (through openssh) and the SOCKS tunnel
+    /// (through ssh arguments), so both connections check keys alike.
+    pub(super) const fn strict_host_key_checking(
+        &self,
+    ) -> StrictHostKeyChecking {
+        match self {
+            Self::Pinned(_) => StrictHostKeyChecking::Yes,
+            Self::TrustOnFirstUse { .. } => StrictHostKeyChecking::AcceptNew,
+        }
+    }
+
     /// The known-hosts files for one connection: the pinned keys, or an
     /// empty file that ssh may append the first-seen key to, followed by
     /// the user's file.
@@ -30,7 +89,7 @@ impl HostKeyPolicy {
         &self,
     ) -> Result<KnownHostsFiles, SshError> {
         let (learned, consulted) = match self {
-            Self::Pinned(entries) => (secret_file(entries), None),
+            Self::Pinned(entries) => (secret_file(entries.as_str()), None),
             Self::TrustOnFirstUse { user_known_hosts } => {
                 (private_file(), user_known_hosts.clone())
             }
@@ -106,6 +165,10 @@ fn quote(path: &Path) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn pinned(entries: &str) -> HostKeyPolicy {
+        HostKeyPolicy::Pinned(entries.parse().unwrap())
+    }
+
     fn trust_on_first_use(user_known_hosts: &str) -> HostKeyPolicy {
         HostKeyPolicy::TrustOnFirstUse {
             user_known_hosts: Some(PathBuf::from(user_known_hosts)),
@@ -126,7 +189,7 @@ mod tests {
 
     #[test]
     fn a_pinned_policy_writes_its_known_hosts_to_the_file() {
-        let sut = HostKeyPolicy::Pinned("203.0.113.5 ssh-ed25519 AAAA".into());
+        let sut = pinned("203.0.113.5 ssh-ed25519 AAAA");
 
         let files = sut.known_hosts_files().unwrap();
 
@@ -136,7 +199,7 @@ mod tests {
 
     #[test]
     fn a_pinned_policy_lists_only_its_own_file() {
-        let sut = HostKeyPolicy::Pinned("203.0.113.5 ssh-ed25519 AAAA".into());
+        let sut = pinned("203.0.113.5 ssh-ed25519 AAAA");
 
         let files = sut.known_hosts_files().unwrap();
 
@@ -168,6 +231,15 @@ mod tests {
             files.learned().display()
         );
         assert_eq!(files.option_value(), OsString::from(expected));
+    }
+
+    #[rstest::rstest]
+    #[case::empty("")]
+    #[case::whitespace(" \n\t ")]
+    fn blank_known_hosts_entries_are_rejected(#[case] raw: &str) {
+        let actual = raw.parse::<KnownHostsEntries>();
+
+        assert_eq!(actual, Err(EmptyKnownHosts));
     }
 
     #[rstest::rstest]

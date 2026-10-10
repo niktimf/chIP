@@ -1,5 +1,4 @@
 use super::credential_files::SshCredentialFiles;
-use super::known_hosts::HostKeyPolicy;
 use super::session::{SshConfig, SshError, SshSession};
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -81,15 +80,13 @@ impl SocksTunnel {
         SocketAddr::from(([127, 0, 0, 1], self.local_port.get()))
     }
 
-    /// Best-effort teardown: the caller has no recovery, so a failed kill or
-    /// reap is logged and the tunnel is dropped anyway.
+    /// Best-effort teardown: the caller has no recovery, so a failed kill is
+    /// logged and the tunnel is dropped anyway. `Child::kill` also waits for
+    /// the process, so a killed ssh is reaped.
     pub async fn stop(mut self) {
-        let port = self.local_port.get();
         if let Err(error) = self.child.kill().await {
+            let port = self.local_port.get();
             tracing::warn!(port, %error, "ssh tunnel kill failed");
-        }
-        if let Err(error) = self.child.wait().await {
-            tracing::warn!(port, %error, "ssh tunnel reap failed");
         }
     }
 }
@@ -136,16 +133,16 @@ fn configure_authentication(
     config: &SshConfig,
     credentials: &SshCredentialFiles,
 ) {
-    let host_key_checking = match config.host_keys {
-        HostKeyPolicy::Pinned(_) => "StrictHostKeyChecking=yes",
-        HostKeyPolicy::TrustOnFirstUse { .. } => {
-            "StrictHostKeyChecking=accept-new"
-        }
-    };
+    let host_key_checking = format!(
+        "StrictHostKeyChecking={}",
+        config.host_keys.strict_host_key_checking()
+    );
     let mut known_hosts_option = OsString::from("UserKnownHostsFile=");
     known_hosts_option.push(credentials.known_hosts().option_value());
     command
-        .args(["-o", host_key_checking, "-o"])
+        .arg("-o")
+        .arg(host_key_checking)
+        .arg("-o")
         .arg(known_hosts_option);
     if let Some(key) = credentials.key() {
         command.arg("-i").arg(key);
@@ -173,7 +170,7 @@ async fn wait_for_socks(
         }
         if tokio::time::Instant::now() >= ready_deadline {
             // The readiness timeout stays the reported error; a failed kill
-            // is only logged, and the wait below still reaps the process.
+            // is only logged. `Child::kill` also reaps a killed process.
             if let Err(error) = child.kill().await {
                 tracing::warn!(
                     port = local_port.get(),
@@ -181,10 +178,6 @@ async fn wait_for_socks(
                     "ssh tunnel kill after the readiness timeout failed"
                 );
             }
-            child
-                .wait()
-                .await
-                .map_err(|error| SshError::io("reap ssh process", error))?;
             return Err(SocksError::NotReady);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -232,6 +225,7 @@ async fn child_error(
 #[cfg(unix)]
 mod tests {
     use super::*;
+    use crate::ssh::HostKeyPolicy;
     use std::os::unix::fs::PermissionsExt;
 
     fn args(command: &Command) -> Vec<String> {
@@ -358,20 +352,31 @@ mod tests {
         assert!(output.contains("Permission denied"), "{output}");
     }
 
-    #[tokio::test]
-    async fn ssh_options_precede_end_of_options_and_destination() {
-        let dir = tempfile::tempdir().unwrap();
-        let program = stub(
-            dir.path(),
-            "penultimate=\nlast=\nfor argument\ndo\n  penultimate=$last\n  last=$argument\ndone\nif [ \"$penultimate\" = \"--\" ] && [ \"$last\" = \"203.0.113.5\" ]; then\n  echo 'arguments accepted' >&2\nelse\n  echo 'destination was not last' >&2\nfi\nexit 255",
+    #[test]
+    fn ssh_options_precede_end_of_options_and_destination() {
+        let user_config = SshConfig {
+            user: Some("admin".to_owned()),
+            ..config()
+        };
+
+        let sut = tunnel_command(
+            "ssh",
+            "203.0.113.5".parse().unwrap(),
+            &user_config,
+            &session_credentials(&user_config),
+            NonZeroU16::new(47080).unwrap(),
         );
 
-        let result = start_stub(&program, &config(), free_port()).await;
-
-        let Err(SocksError::Ssh(SshError::Exit { output, .. })) = result else {
-            panic!("expected an ssh exit, got {result:?}");
-        };
-        assert!(output.contains("arguments accepted"), "{output}");
+        let arguments = args(&sut);
+        assert!(
+            arguments.ends_with(&[
+                "-l".to_owned(),
+                "admin".to_owned(),
+                "--".to_owned(),
+                "203.0.113.5".to_owned(),
+            ]),
+            "{arguments:?}"
+        );
     }
 
     #[tokio::test]
@@ -498,8 +503,10 @@ exit 255"#,
 
     #[test]
     fn a_sub_second_connect_timeout_still_reaches_ssh_as_one_second() {
-        let mut short_config = config();
-        short_config.connect_timeout = Duration::from_millis(250);
+        let short_config = SshConfig {
+            connect_timeout: Duration::from_millis(250),
+            ..config()
+        };
 
         let sut = tunnel_command(
             "ssh",

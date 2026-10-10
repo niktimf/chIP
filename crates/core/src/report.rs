@@ -262,7 +262,9 @@ mod tests {
                 cr(REPUTATION, Verdict::fail("vpn flag")),
             ],
         };
+
         let table = sut.table();
+
         let fail_pos = table.find("FAIL").unwrap();
         let ok_pos = table.find("OK").unwrap();
         assert!(fail_pos < ok_pos, "table:\n{table}");

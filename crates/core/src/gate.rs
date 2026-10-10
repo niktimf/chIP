@@ -75,18 +75,6 @@ impl fmt::Display for GateId {
     }
 }
 
-impl PartialEq<str> for GateId {
-    fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
-    }
-}
-
-impl PartialEq<&str> for GateId {
-    fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("'{0}' is not a known gate id")]
 pub struct UnknownGateId(String);

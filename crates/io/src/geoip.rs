@@ -3,38 +3,36 @@ use chip_core::model::{
 };
 
 use crate::error_chain::describe_error;
-use itertools::Itertools as _;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
 /// One keyless `GeoIP` service: where to ask about an address and where
 /// the answer keeps the country code.
+#[derive(Debug)]
 struct GeoSource {
     name: &'static str,
-    url: Box<dyn Fn(Ipv4Addr) -> String + Send + Sync>,
+    /// The request URL, with [`GeoSource::IP`] where the address goes.
+    url_template: String,
     pointer: &'static str,
 }
 
 impl GeoSource {
+    const IP: &'static str = "{ip}";
+
     fn new(
         name: &'static str,
-        url: impl Fn(Ipv4Addr) -> String + Send + Sync + 'static,
+        url_template: impl Into<String>,
         pointer: &'static str,
     ) -> Self {
         Self {
             name,
-            url: Box::new(url),
+            url_template: url_template.into(),
             pointer,
         }
     }
-}
 
-impl std::fmt::Debug for GeoSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GeoSource")
-            .field("name", &self.name)
-            .field("pointer", &self.pointer)
-            .finish_non_exhaustive()
+    fn url(&self, ip: Ipv4Addr) -> String {
+        self.url_template.replace(Self::IP, &ip.to_string())
     }
 }
 
@@ -51,7 +49,7 @@ enum NoVote {
     #[error("answer is not JSON")]
     Body(#[source] reqwest::Error),
     #[error("answer has no string at {0}")]
-    MissingField(String),
+    MissingField(&'static str),
     #[error("answer has no country code")]
     Country(#[source] InvalidCountryCode),
 }
@@ -74,12 +72,12 @@ impl NoVote {
 /// case that constructor already rejects.
 fn extract(
     value: &serde_json::Value,
-    pointer: &str,
+    pointer: &'static str,
 ) -> Result<CountryCode, NoVote> {
     let raw = value
         .pointer(pointer)
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| NoVote::MissingField(pointer.to_owned()))?;
+        .ok_or(NoVote::MissingField(pointer))?;
     CountryCode::try_from(raw).map_err(NoVote::Country)
 }
 
@@ -87,42 +85,26 @@ fn default_sources() -> Vec<GeoSource> {
     vec![
         GeoSource::new(
             "ripe-rdap",
-            |ip| format!("https://rdap.db.ripe.net/ip/{ip}"),
+            "https://rdap.db.ripe.net/ip/{ip}",
             "/country",
         ),
-        GeoSource::new(
-            "ipinfo",
-            |ip| format!("https://ipinfo.io/{ip}/json"),
-            "/country",
-        ),
-        GeoSource::new(
-            "country.is",
-            |ip| format!("https://api.country.is/{ip}"),
-            "/country",
-        ),
+        GeoSource::new("ipinfo", "https://ipinfo.io/{ip}/json", "/country"),
+        GeoSource::new("country.is", "https://api.country.is/{ip}", "/country"),
         GeoSource::new(
             "geojs",
-            |ip| format!("https://get.geojs.io/v1/ip/country.json?ip={ip}"),
+            "https://get.geojs.io/v1/ip/country.json?ip={ip}",
             "/0/country",
         ),
-        GeoSource::new(
-            "ipwho",
-            |ip| format!("https://ipwho.is/{ip}"),
-            "/country_code",
-        ),
-        GeoSource::new(
-            "ipapi.co",
-            |ip| format!("https://ipapi.co/{ip}/json/"),
-            "/country",
-        ),
+        GeoSource::new("ipwho", "https://ipwho.is/{ip}", "/country_code"),
+        GeoSource::new("ipapi.co", "https://ipapi.co/{ip}/json/", "/country"),
         GeoSource::new(
             "ipquery",
-            |ip| format!("https://api.ipquery.io/{ip}"),
+            "https://api.ipquery.io/{ip}",
             "/location/country_code",
         ),
         GeoSource::new(
             "ipbase",
-            |ip| format!("https://api.ipbase.com/v2/info?ip={ip}"),
+            "https://api.ipbase.com/v2/info?ip={ip}",
             "/data/location/country/alpha2",
         ),
         // ipapi.is used to sit here. Its free tier answers `country` with a
@@ -161,53 +143,41 @@ impl GeoIpClient {
         }
     }
 
-    /// # Errors
-    ///
-    /// Returns `JoinError` when a source query task panics or is cancelled.
+    /// Asks every source at once and returns their votes in source order.
     /// A source that fails to answer is a missing vote, not an error.
-    pub async fn consensus(
-        &self,
-        ip: Ipv4Addr,
-    ) -> Result<GeoConsensusFacts, tokio::task::JoinError> {
-        let mut tasks = tokio::task::JoinSet::new();
-        // Tasks finish in any order; the index restores the source order.
-        for (index, source) in self.sources.iter().enumerate() {
-            let http = self.http.clone();
-            let timeout = self.timeout;
-            let url = (source.url)(ip);
-            let name = source.name;
-            let pointer = source.pointer;
-            tasks.spawn(async move {
-                let vote = Self::query_one(&http, timeout, &url, pointer)
-                    .await
-                    .map_or_else(
-                        |error| {
-                            tracing::debug!(
-                                source = name,
-                                error = %describe_error(&error),
-                                "geo source named no country"
-                            );
-                            error.vote()
-                        },
-                        GeoVote::Country,
-                    );
-                (index, vote)
-            });
+    pub async fn consensus(&self, ip: Ipv4Addr) -> GeoConsensusFacts {
+        let queries = self.sources.iter().map(|source| self.vote(source, ip));
+        GeoConsensusFacts {
+            votes: futures::future::join_all(queries).await,
         }
-        let votes = crate::tasks::collect(tasks)
-            .await?
-            .into_iter()
-            .sorted_unstable_by_key(|(index, _)| *index)
-            .map(|(_, vote)| vote)
-            .collect();
-        Ok(GeoConsensusFacts { votes })
+    }
+
+    async fn vote(&self, source: &GeoSource, ip: Ipv4Addr) -> GeoVote {
+        Self::query_one(
+            &self.http,
+            self.timeout,
+            &source.url(ip),
+            source.pointer,
+        )
+        .await
+        .map_or_else(
+            |error| {
+                tracing::debug!(
+                    source = source.name,
+                    error = %describe_error(&error),
+                    "geo source named no country"
+                );
+                error.vote()
+            },
+            GeoVote::Country,
+        )
     }
 
     async fn query_one(
         http: &reqwest::Client,
         timeout: Duration,
         url: &str,
-        pointer: &str,
+        pointer: &'static str,
     ) -> Result<CountryCode, NoVote> {
         tokio::time::timeout(timeout, async {
             let response =
@@ -240,32 +210,40 @@ mod tests {
     #[case::a_plain_top_level_field(
         serde_json::json!({"country": "fi"}),
         "/country",
-        Some("FI")
+        "FI"
     )]
     #[case::an_array_index_then_an_object_key(
         serde_json::json!([{"country": "de"}]),
         "/0/country",
-        Some("DE")
-    )]
-    // ipapi.is's free tier answers with a full name, not a 2-letter code.
-    #[case::a_full_country_name_is_no_vote(
-        serde_json::json!({"country": "Germany"}),
-        "/country",
-        None
-    )]
-    #[case::a_missing_path(
-        serde_json::json!({"unrelated": "value"}),
-        "/country",
-        None
+        "DE"
     )]
     fn a_vote_is_the_country_code_found_at_the_source_pointer(
         #[case] answer: serde_json::Value,
-        #[case] pointer: &str,
-        #[case] expected: Option<&str>,
+        #[case] pointer: &'static str,
+        #[case] expected: &str,
     ) {
-        let actual = extract(&answer, pointer).ok();
+        let actual = extract(&answer, pointer).unwrap();
 
-        assert_eq!(actual, expected.map(cc));
+        assert_eq!(actual, cc(expected));
+    }
+
+    /// ipapi.is's free tier answers with a full name, not a 2-letter code.
+    #[test]
+    fn a_full_country_name_is_no_country_code() {
+        let answer = serde_json::json!({"country": "Germany"});
+
+        let error = extract(&answer, "/country").unwrap_err();
+
+        assert!(matches!(error, NoVote::Country(_)), "{error:?}");
+    }
+
+    #[test]
+    fn an_answer_without_the_pointer_names_the_missing_field() {
+        let answer = serde_json::json!({"unrelated": "value"});
+
+        let error = extract(&answer, "/country").unwrap_err();
+
+        assert!(matches!(error, NoVote::MissingField("/country")), "{error:?}");
     }
 
     #[tokio::test]
@@ -294,8 +272,7 @@ mod tests {
             sources,
         );
 
-        let facts =
-            sut.consensus("203.0.113.1".parse().unwrap()).await.unwrap();
+        let facts = sut.consensus("203.0.113.1".parse().unwrap()).await;
 
         assert_eq!(
             facts.votes,
@@ -320,14 +297,13 @@ mod tests {
             vec![source_at("named", format!("{}/name", server.uri()))],
         );
 
-        let facts =
-            sut.consensus("203.0.113.1".parse().unwrap()).await.unwrap();
+        let facts = sut.consensus("203.0.113.1".parse().unwrap()).await;
 
         assert_eq!(facts.votes, [GeoVote::NoCountryCode]);
     }
 
     fn source_at(name: &'static str, url: String) -> GeoSource {
-        GeoSource::new(name, move |_ip| url.clone(), "/country")
+        GeoSource::new(name, url, "/country")
     }
 
     /// A server that sends the headers and the first byte of a 100-byte body,

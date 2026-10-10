@@ -6,18 +6,18 @@ const MIN_VALID_PROBES: usize = 6;
 
 pub fn judge_reach(facts: &ReachFacts) -> Verdict {
     let valid = facts
-        .probes
+        .probes()
         .iter()
         .filter(|probe| probe.control == HttpProbeOutcome::Ok)
         .count();
     if valid < MIN_VALID_PROBES {
         return Verdict::error(format!(
             "only {valid} of {} probes had a working control anchor (need >= {MIN_VALID_PROBES})",
-            facts.probes.len()
+            facts.probes().len()
         ));
     }
     let failed = facts
-        .probes
+        .probes()
         .iter()
         .filter(|probe| probe.control == HttpProbeOutcome::Ok)
         .filter(|probe| probe.candidate == HttpProbeOutcome::Failed)
@@ -43,31 +43,25 @@ pub fn judge_reach(facts: &ReachFacts) -> Verdict {
 mod tests {
     use super::*;
     use crate::model::HttpProbeOutcome::{Failed, Ok as HttpOk};
-    use crate::model::{ReachProbe, Severity};
+    use crate::model::Severity;
 
-    fn facts(candidate: &[bool], control: &[bool]) -> ReachFacts {
-        // true = Ok, false = Failed, for readability in each test.
-        ReachFacts {
-            probes: candidate
-                .iter()
-                .zip(control)
-                .map(|(&candidate_ok, &control_ok)| ReachProbe {
-                    candidate: if candidate_ok { HttpOk } else { Failed },
-                    control: if control_ok { HttpOk } else { Failed },
-                })
-                .collect(),
-        }
+    fn facts(
+        candidate: &[HttpProbeOutcome],
+        control: &[HttpProbeOutcome],
+    ) -> ReachFacts {
+        ReachFacts::new(candidate.to_vec(), control.to_vec()).unwrap()
     }
 
     #[test]
     fn a_probe_where_the_control_itself_failed_does_not_count_against_the_candidate()
      {
-        // Control fails on probes 0-1 (excluded); of the remaining 10, candidate fails none.
-        let candidate = vec![true; 12];
-        let mut control = vec![true; 12];
-        control[0] = false;
-        control[1] = false;
-        let sut = facts(&candidate, &control);
+        // Control fails on probes 0-1 (excluded); of the remaining 10,
+        // candidate fails none.
+        let control = [
+            Failed, Failed, HttpOk, HttpOk, HttpOk, HttpOk, HttpOk, HttpOk,
+            HttpOk, HttpOk, HttpOk, HttpOk,
+        ];
+        let sut = facts(&[HttpOk; 12], &control);
 
         let verdict = judge_reach(&sut);
 
@@ -76,13 +70,12 @@ mod tests {
 
     #[test]
     fn fewer_than_six_valid_probes_is_an_error() {
-        // Control fails everywhere except 4 probes — too few to judge.
-        let mut control = vec![false; 10];
-        control[0] = true;
-        control[1] = true;
-        control[2] = true;
-        control[3] = true;
-        let sut = facts(&[true; 10], &control);
+        // Control fails everywhere except 4 probes, too few to judge.
+        let control = [
+            HttpOk, HttpOk, HttpOk, HttpOk, Failed, Failed, Failed, Failed,
+            Failed, Failed,
+        ];
+        let sut = facts(&[HttpOk; 10], &control);
 
         let verdict = judge_reach(&sut);
 
@@ -99,9 +92,10 @@ mod tests {
         #[case] failed: usize,
         #[case] expected: Severity,
     ) {
-        let candidate: Vec<bool> =
-            (0..10).map(|probe| probe >= failed).collect();
-        let sut = facts(&candidate, &[true; 10]);
+        let candidate: Vec<HttpProbeOutcome> = (0..10)
+            .map(|probe| if probe < failed { Failed } else { HttpOk })
+            .collect();
+        let sut = facts(&candidate, &[HttpOk; 10]);
 
         let verdict = judge_reach(&sut);
 

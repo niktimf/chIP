@@ -178,3 +178,28 @@ fn a_reader_closing_the_pipe_early_ends_the_scan_with_exit_two_not_a_panic() {
     assert!(!stderr.contains("panicked"), "{stderr}");
     assert!(!stderr.lines().any(|line| line.starts_with("error:")), "{stderr}");
 }
+
+#[test]
+fn a_closed_stdout_still_leaves_the_json_report_and_the_step_summary() {
+    let directory = tempfile::tempdir().unwrap();
+    let json = directory.path().join("report.json");
+    let summary = directory.path().join("summary.md");
+    let mut sut = offline_scan()
+        .env("GITHUB_STEP_SUMMARY", &summary)
+        .arg("--json")
+        .arg(&json)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(sut.stdout.take());
+
+    let output = sut.wait_with_output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+    assert_eq!(document["overall"], "OK");
+    assert!(!std::fs::read_to_string(&summary).unwrap().is_empty());
+}

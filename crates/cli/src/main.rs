@@ -3,6 +3,7 @@ mod config;
 mod scan;
 
 use std::io::Write as _;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -62,11 +63,20 @@ fn log_filter() -> EnvFilter {
     })
 }
 
+/// The timeout of one HTTP request of `scan` and `calibrate`, direct or
+/// through the SOCKS tunnel.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long polling waits for one Globalping measurement to finish.
+const GLOBALPING_DEADLINE: Duration = Duration::from_secs(90);
+/// How many RIPE Atlas anchors of a city the latency gate and the
+/// calibration ping.
+const CITY_ANCHORS: NonZeroUsize = NonZeroUsize::new(3).expect("3 is non-zero");
+
 /// The HTTP client of a command's direct requests: every command sends the
-/// same user agent, and each picks its own per-request timeout.
-fn http_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
+/// same user agent and uses [`REQUEST_TIMEOUT`].
+fn http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
-        .timeout(timeout)
+        .timeout(REQUEST_TIMEOUT)
         .user_agent(concat!("chip/", env!("CARGO_PKG_VERSION")))
         .build()
 }
@@ -134,7 +144,7 @@ fn print_error(message: std::fmt::Arguments<'_>) {
 }
 
 /// Appends the Markdown report to the GitHub Actions step summary. A
-/// failure only warns: the report is already on stdout.
+/// failure only warns: the report still goes to stdout.
 async fn append_step_summary(path: &Path, report: &Report) {
     let write_result = async {
         let mut file = tokio::fs::OpenOptions::new()
@@ -218,24 +228,35 @@ async fn run_scan_command(
     command: config::ScanCommand,
 ) -> Result<ScanOutcome, CliError> {
     let report = scan::run_scan(&command).await;
-    print_output(&report.table())?;
-
-    if let Some(path) = command.json_path() {
-        let encoded = serde_json::to_vec_pretty(&JsonReport::from(&report))
-            .map_err(CliError::EncodeJson)?;
-        tokio::fs::write(path, encoded).await.map_err(|source| {
-            CliError::WriteJson {
-                path: path.to_owned(),
-                source,
-            }
-        })?;
-    }
-
+    // The files go first: a closed stdout (`chip scan ... | head`) must not
+    // cost a pipeline its `--json` report or the job summary. Every output
+    // is attempted, and the first error decides how the run ends.
+    let json = match command.json_path() {
+        Some(path) => write_json_report(path, &report).await,
+        None => Ok(()),
+    };
     if let Some(path) = command.step_summary_path() {
         append_step_summary(path, &report).await;
     }
+    let table = print_output(&report.table());
+    json.and(table)?;
 
     Ok(report.outcome())
+}
+
+/// Writes the `--json` report to `path`.
+async fn write_json_report(
+    path: &Path,
+    report: &Report,
+) -> Result<(), CliError> {
+    let encoded = serde_json::to_vec_pretty(&JsonReport::from(report))
+        .map_err(CliError::EncodeJson)?;
+    tokio::fs::write(path, encoded).await.map_err(|source| {
+        CliError::WriteJson {
+            path: path.to_owned(),
+            source,
+        }
+    })
 }
 
 async fn run_calibrate_command(
@@ -289,6 +310,8 @@ mod tests {
         let report = Report {
             results: vec![
                 CheckResult::new(REPUTATION, Verdict::fail("vpn")),
+                CheckResult::new(GEO, Verdict::warn("RU 60%")),
+                CheckResult::new(LATENCY, Verdict::error("no probes")),
                 CheckResult::skipped(REACH, "ports are already in use"),
             ],
         };
@@ -306,6 +329,18 @@ mod tests {
       "detail": "vpn",
       "gate": "reputation",
       "severity": "FAIL",
+      "skipped": false
+    },
+    {
+      "detail": "RU 60%",
+      "gate": "geo",
+      "severity": "WARN",
+      "skipped": false
+    },
+    {
+      "detail": "no probes",
+      "gate": "latency",
+      "severity": "ERROR",
       "skipped": false
     },
     {

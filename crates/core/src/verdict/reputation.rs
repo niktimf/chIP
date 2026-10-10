@@ -70,8 +70,11 @@ mod tests {
 
     #[test]
     fn a_clean_hosting_address_at_datacenter_floor_risk_is_ok() {
-        let v = judge_reputation(&clean());
-        assert_eq!(v.severity, Severity::Ok, "{}", v.detail);
+        let sut = clean();
+
+        let verdict = judge_reputation(&sut);
+
+        assert_eq!(verdict.severity, Severity::Ok, "{}", verdict.detail);
     }
 
     #[rstest::rstest]

@@ -1,5 +1,5 @@
-# Copy to the directory of the functional core crate (next to its
-# Cargo.toml). CI checks the dependency graph rooted at core only:
+# Dependency bans of chip-core, the functional core. The dependencies group
+# of ci/check.sh checks the graph rooted at core only:
 #
 #     cargo deny --manifest-path crates/core/Cargo.toml \
 #         --config crates/core/deny.toml check bans

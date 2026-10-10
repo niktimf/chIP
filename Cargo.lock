@@ -193,6 +193,7 @@ dependencies = [
  "chip-core",
  "chip-io",
  "clap",
+ "futures",
  "ipnet",
  "itertools",
  "pretty_assertions",

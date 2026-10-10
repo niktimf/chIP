@@ -1,12 +1,13 @@
 //! Vendor connectivity-check endpoints and the rule that tells a genuine
 //! answer from one a captive portal or a middlebox rewrote.
 use http::StatusCode;
-use strum::Display;
+use itertools::{Either, Itertools as _};
+use strum::{Display, IntoStaticStr};
 use url::Url;
 
 use crate::model::PortalOutcome;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, IntoStaticStr)]
 #[strum(serialize_all = "lowercase")]
 pub enum Scheme {
     Http,
@@ -101,7 +102,9 @@ impl PortalEndpoint {
         final_url: &Url,
         body: &str,
     ) -> PortalOutcome {
-        let same_url = final_url.as_str() == self.url();
+        let scheme: &str = self.scheme.into();
+        let same_url = final_url.as_str().split_once("://")
+            == Some((scheme, self.host_path));
         let same_body = body.trim() == self.expected_body.trim();
         if status == self.expected_status && same_url && same_body {
             PortalOutcome::Ok
@@ -122,16 +125,13 @@ impl FromIterator<(Scheme, PortalOutcome)> for PortalChecks {
     fn from_iter<I: IntoIterator<Item = (Scheme, PortalOutcome)>>(
         iter: I,
     ) -> Self {
-        iter.into_iter().fold(
-            Self::default(),
-            |mut checks, (scheme, outcome)| {
-                match scheme {
-                    Scheme::Https => checks.https.push(outcome),
-                    Scheme::Http => checks.http.push(outcome),
-                }
-                checks
-            },
-        )
+        let (https, http) =
+            iter.into_iter()
+                .partition_map(|(scheme, outcome)| match scheme {
+                    Scheme::Https => Either::Left(outcome),
+                    Scheme::Http => Either::Right(outcome),
+                });
+        Self { https, http }
     }
 }
 
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn outcomes_are_grouped_by_the_scheme_of_their_endpoint() {
         let sut = [
-            (Scheme::Http, PortalOutcome::Unreachable),
+            (Scheme::Http, PortalOutcome::Ok),
             (Scheme::Https, PortalOutcome::Ok),
             (Scheme::Http, PortalOutcome::Altered),
         ];
@@ -222,7 +222,7 @@ mod tests {
             checks,
             PortalChecks {
                 https: vec![PortalOutcome::Ok],
-                http: vec![PortalOutcome::Unreachable, PortalOutcome::Altered],
+                http: vec![PortalOutcome::Ok, PortalOutcome::Altered],
             }
         );
     }

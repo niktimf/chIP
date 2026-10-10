@@ -1,6 +1,8 @@
 use crate::Verdict;
 use crate::model::ServiceState;
-use crate::verdict::services::is_cloudflare_challenge;
+use crate::verdict::services::{
+    CLOUDFLARE_CHALLENGED, is_cloudflare_challenge,
+};
 use http::StatusCode;
 
 /// An AI API whose reachability the `ai:*` gates probe. The variant carries
@@ -51,12 +53,10 @@ pub fn classify_ai_endpoint(
     status: StatusCode,
     body: &str,
 ) -> ServiceState {
-    let lower = body.to_lowercase();
-    if is_cloudflare_challenge(status, &lower) {
-        return ServiceState::Inconclusive(
-            "challenged before reaching the API".into(),
-        );
+    if is_cloudflare_challenge(status, body) {
+        return ServiceState::Inconclusive(CLOUDFLARE_CHALLENGED.into());
     }
+    let lower = body.to_lowercase();
     if provider
         .region_markers()
         .iter()
@@ -143,7 +143,7 @@ mod tests {
         AiProvider::Gemini,
         StatusCode::FORBIDDEN,
         "Checking your browser before accessing",
-        ServiceState::Inconclusive("challenged before reaching the API".into())
+        ServiceState::Inconclusive("Cloudflare challenged the request".into())
     )]
     fn an_endpoint_is_classified_by_provider_status_and_body(
         #[case] provider: AiProvider,

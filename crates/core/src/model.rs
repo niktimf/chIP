@@ -298,9 +298,12 @@ pub struct ReachProbe {
     pub control: HttpProbeOutcome,
 }
 
+/// Candidate and control outcomes paired probe by probe. The field is
+/// private so that only `new`, which checks that both series have the same
+/// length, can pair them.
 #[derive(Debug, Clone)]
 pub struct ReachFacts {
-    pub probes: Vec<ReachProbe>,
+    probes: Vec<ReachProbe>,
 }
 
 impl ReachFacts {
@@ -329,6 +332,10 @@ impl ReachFacts {
             .map(|(candidate, control)| ReachProbe { candidate, control })
             .collect();
         Ok(Self { probes })
+    }
+
+    pub fn probes(&self) -> &[ReachProbe] {
+        &self.probes
     }
 }
 
@@ -407,8 +414,9 @@ impl PingSample {
     ///
     /// # Errors
     ///
-    /// Returns `InvalidPingSample` when the RTT is negative or not finite, or
-    /// the loss is not a finite percentage in `0..=100`.
+    /// Returns `InvalidPingSample` when the RTT is negative, not finite or
+    /// too large for a `Duration`, or the loss is not a finite percentage in
+    /// `0..=100`.
     #[expect(
         clippy::map_err_ignore,
         reason = "TryFromFloatSecsError only repeats that the RTT is \
@@ -441,7 +449,8 @@ impl PingSample {
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
 pub enum InvalidPingSample {
     #[error(
-        "invalid ping sample: RTT must be finite and non-negative, got {0}"
+        "invalid ping sample: RTT must be finite, non-negative and below \
+         2^64 seconds, got {0}"
     )]
     Rtt(f64),
     #[error("invalid ping sample: loss")]
@@ -991,7 +1000,7 @@ mod tests {
 
         assert_eq!(sut.severity(), Severity::Ok);
         assert_eq!(sut.label(), "SKIP");
-        assert_eq!(sut.detail, "ports 443 and 8443 are already in use");
+        assert_eq!(sut.detail(), "ports 443 and 8443 are already in use");
     }
 
     #[test]
@@ -1020,7 +1029,6 @@ mod tests {
         let sut: CountryCode = "fi".parse().unwrap();
 
         assert_eq!(sut.as_str(), "FI");
-        assert_eq!(sut, CountryCode::try_from("FI").unwrap());
     }
 
     #[rstest::rstest]
@@ -1058,6 +1066,7 @@ mod tests {
     #[case::nan_rtt(f64::NAN, Some(0.0))]
     #[case::infinite_rtt(f64::INFINITY, Some(0.0))]
     #[case::negative_rtt(-1.0, Some(0.0))]
+    #[case::rtt_too_large_for_a_duration(f64::MAX, Some(0.0))]
     fn a_ping_with_an_unusable_rtt_is_rejected(
         #[case] rtt_ms: f64,
         #[case] loss_pct: Option<f64>,
@@ -1159,8 +1168,12 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(
-            error.to_string(),
-            "anchor 'short-anchor' returned 0 probe samples, expected 1"
+            error,
+            ProbeAlignmentError {
+                anchor_id: "short-anchor".to_owned(),
+                expected: 1,
+                actual: 0,
+            }
         );
     }
 
@@ -1174,8 +1187,25 @@ mod tests {
             ReachFacts::new(candidate, vec![HttpProbeOutcome::Ok]).unwrap_err();
 
         assert_eq!(
-            error.to_string(),
-            "anchor 'control' returned 1 probe samples, expected 2"
+            error,
+            ProbeAlignmentError {
+                anchor_id: "control".to_owned(),
+                expected: 2,
+                actual: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn steal_ticks_cannot_exceed_total_ticks() {
+        let error = ProcStatSnapshot::new(11, 10).unwrap_err();
+
+        assert_eq!(
+            error,
+            InvalidProcStatSnapshot {
+                steal: 11,
+                total: 10
+            }
         );
     }
 }

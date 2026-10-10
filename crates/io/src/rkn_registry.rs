@@ -1,16 +1,10 @@
 use std::collections::BTreeSet;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use chip_core::ip_lists::{AddressList, NetworkList, RknRegistry};
 use thiserror::Error;
 
-use crate::netset;
-
-/// Single addresses from the RKN registry, exported by antifilter.download
-/// several times a day.
-const ADDRESS_LIST_URL: &str = "https://antifilter.download/list/ip.lst";
-/// Networks the registry blocks as a whole.
-const SUBNET_LIST_URL: &str = "https://antifilter.download/list/subnet.lst";
+use crate::netset::{self, Garbage, Line, ParsedList};
 
 #[derive(Debug, Error)]
 pub enum RknRegistryError {
@@ -29,6 +23,13 @@ pub struct RknRegistryClient {
 
 impl RknRegistryClient {
     pub fn new(http: reqwest::Client) -> Self {
+        /// Single addresses from the RKN registry, exported by
+        /// antifilter.download several times a day.
+        const ADDRESS_LIST_URL: &str =
+            "https://antifilter.download/list/ip.lst";
+        /// Networks the registry blocks as a whole.
+        const SUBNET_LIST_URL: &str =
+            "https://antifilter.download/list/subnet.lst";
         Self {
             http,
             address_list_url: ADDRESS_LIST_URL.to_owned(),
@@ -50,24 +51,31 @@ impl RknRegistryClient {
             self.get_text(&self.address_list_url),
             self.get_text(&self.subnet_list_url)
         );
-        let addresses = AddressList::new(Self::parse_addresses(&addresses?))
-            .map_err(|_| RknRegistryError::Empty {
-                url: self.address_list_url.clone(),
-            })?;
+        let addresses = Self::parse_addresses(&addresses?)
+            .into_logged_entries("rkn addresses");
         let subnets =
-            NetworkList::new(netset::parse(&subnets?)).map_err(|_| {
-                RknRegistryError::Empty {
-                    url: self.subnet_list_url.clone(),
-                }
+            netset::parse(&subnets?).into_logged_entries("rkn subnets");
+        let addresses = AddressList::new(addresses).map_err(|_| {
+            RknRegistryError::Empty {
+                url: self.address_list_url.clone(),
+            }
+        })?;
+        let subnets =
+            NetworkList::new(subnets).map_err(|_| RknRegistryError::Empty {
+                url: self.subnet_list_url.clone(),
             })?;
         Ok(RknRegistry::new(addresses, subnets))
     }
 
-    /// Lines that are not a single IPv4 address (IPv6, garbage) are skipped.
-    fn parse_addresses(body: &str) -> BTreeSet<Ipv4Addr> {
-        body.lines()
-            .filter_map(|line| line.trim().parse().ok())
-            .collect()
+    /// The IPv4 addresses of the address list; blank and IPv6 lines hold no
+    /// entry.
+    fn parse_addresses(body: &str) -> ParsedList<BTreeSet<Ipv4Addr>> {
+        ParsedList::parse(body, |line| match line.parse::<IpAddr>() {
+            Ok(IpAddr::V4(address)) => Ok(Line::Entry(address)),
+            Ok(IpAddr::V6(_)) => Ok(Line::Skip),
+            Err(_) if line.is_empty() => Ok(Line::Skip),
+            Err(_) => Err(Garbage),
+        })
     }
 
     async fn get_text(&self, url: &str) -> Result<String, RknRegistryError> {
@@ -131,7 +139,7 @@ mod tests {
         let actual = RknRegistryClient::parse_addresses(ADDRESS_LIST);
 
         assert_eq!(
-            actual,
+            actual.into_logged_entries("rkn addresses"),
             BTreeSet::from([
                 Ipv4Addr::new(203, 0, 113, 7),
                 Ipv4Addr::new(203, 0, 113, 8),

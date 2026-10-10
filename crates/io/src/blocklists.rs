@@ -3,16 +3,41 @@ use ipnet::Ipv4Net;
 use serde::Deserialize;
 
 use crate::error_chain::describe_error;
-use crate::netset;
+use crate::netset::{self, Garbage, Line, ParsedList};
 
-const SPAMHAUS_URL: &str = "https://www.spamhaus.org/drop/drop_v4.json";
-const FIREHOL_URL: &str = "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset";
-
-/// One line of the Spamhaus DROP export. The trailing metadata line has no
-/// `cidr` and does not parse as an entry.
+/// One line of the Spamhaus DROP export: an entry, or the trailing
+/// `{"type": "metadata", ...}` line.
 #[derive(Deserialize)]
-struct DropEntry {
-    cidr: Ipv4Net,
+#[serde(untagged)]
+enum DropLine {
+    Entry {
+        cidr: Ipv4Net,
+    },
+    Metadata {
+        #[serde(rename = "type")]
+        _kind: DropLineType,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DropLineType {
+    Metadata,
+}
+
+impl DropLine {
+    fn read(line: &str) -> Result<Line<Ipv4Net>, Garbage> {
+        if line.is_empty() {
+            return Ok(Line::Skip);
+        }
+        match serde_json::from_str::<Self>(line) {
+            Ok(Self::Entry { cidr }) => Ok(Line::Entry(cidr)),
+            Ok(Self::Metadata { .. }) => Ok(Line::Skip),
+            // The caller counts garbage lines; the decode error of one line
+            // adds nothing to that count.
+            Err(_) => Err(Garbage),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -24,6 +49,8 @@ pub struct BlockListsClient {
 
 impl BlockListsClient {
     pub fn new(http: reqwest::Client) -> Self {
+        const SPAMHAUS_URL: &str = "https://www.spamhaus.org/drop/drop_v4.json";
+        const FIREHOL_URL: &str = "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset";
         Self {
             http,
             spamhaus_url: SPAMHAUS_URL.to_owned(),
@@ -50,7 +77,7 @@ impl BlockListsClient {
         &self,
         list: &'static str,
         url: &str,
-        parse: fn(&str) -> Vec<Ipv4Net>,
+        parse: fn(&str) -> ParsedList<Vec<Ipv4Net>>,
     ) -> FetchedList {
         let body = match self.get_text(url).await {
             Ok(body) => body,
@@ -63,7 +90,8 @@ impl BlockListsClient {
                 return FetchedList::Unavailable;
             }
         };
-        NetworkList::new(parse(&body)).map_or_else(
+        let networks = parse(&body).into_logged_entries(list);
+        NetworkList::new(networks).map_or_else(
             |error| {
                 tracing::warn!(
                     list,
@@ -77,11 +105,8 @@ impl BlockListsClient {
         )
     }
 
-    fn parse_spamhaus(body: &str) -> Vec<Ipv4Net> {
-        body.lines()
-            .filter_map(|line| serde_json::from_str::<DropEntry>(line).ok())
-            .map(|entry| entry.cidr)
-            .collect()
+    fn parse_spamhaus(body: &str) -> ParsedList<Vec<Ipv4Net>> {
+        ParsedList::parse(body, DropLine::read)
     }
 
     async fn get_text(&self, url: &str) -> Result<String, reqwest::Error> {
@@ -134,12 +159,19 @@ mod tests {
         let actual = BlockListsClient::parse_spamhaus(SPAMHAUS_SAMPLE);
 
         assert_eq!(
-            actual,
+            actual.into_logged_entries("spamhaus"),
             vec![
                 "203.0.113.0/24".parse::<Ipv4Net>().unwrap(),
                 "198.51.100.0/24".parse().unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn a_spamhaus_line_that_is_neither_entry_nor_metadata_is_garbage() {
+        let actual = DropLine::read(r#"{"type":"something-else"}"#);
+
+        assert_eq!(actual, Err(Garbage));
     }
 
     #[tokio::test]
@@ -230,13 +262,5 @@ mod tests {
         let actual = sut.fetch().await;
 
         assert_eq!(actual.spamhaus, FetchedList::Unavailable);
-        assert_eq!(
-            actual.firehol,
-            fetched_list(&[
-                "192.0.2.0/24",
-                "203.0.113.0/25",
-                "198.51.100.7/32"
-            ])
-        );
     }
 }

@@ -92,14 +92,4 @@ mod tests {
 
         assert_eq!(verdict.detail, "~3.0% CPU steal over a 5s sample");
     }
-
-    #[test]
-    fn steal_ticks_cannot_exceed_total_ticks() {
-        let error = ProcStatSnapshot::new(11, 10).unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "steal ticks (11) exceeds total CPU ticks (10)"
-        );
-    }
 }

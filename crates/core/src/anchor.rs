@@ -17,14 +17,27 @@ pub struct Anchor {
     as_v4: u32,
 }
 
+/// The fields of an [`Anchor`], named at the call site. The anchor name and
+/// its city are both strings; a struct literal keeps them from being swapped
+/// the way two positional arguments could be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorFields {
+    pub fqdn: String,
+    pub ip_v4: Ipv4Addr,
+    pub city: String,
+    pub country: CountryCode,
+    pub as_v4: u32,
+}
+
 impl Anchor {
-    pub const fn new(
-        fqdn: String,
-        ip_v4: Ipv4Addr,
-        city: String,
-        country: CountryCode,
-        as_v4: u32,
-    ) -> Self {
+    pub fn new(fields: AnchorFields) -> Self {
+        let AnchorFields {
+            fqdn,
+            ip_v4,
+            city,
+            country,
+            as_v4,
+        } = fields;
         Self {
             fqdn,
             ip_v4,
@@ -99,13 +112,13 @@ mod tests {
     const THREE: NonZeroUsize = NonZeroUsize::new(3).expect("3 is non-zero");
 
     fn anchor(fqdn: &str, city: &str, country: &str, as_v4: u32) -> Anchor {
-        Anchor::new(
-            fqdn.into(),
-            Ipv4Addr::new(192, 0, 2, 1),
-            city.into(),
-            country.parse().unwrap(),
+        Anchor::new(AnchorFields {
+            fqdn: fqdn.into(),
+            ip_v4: Ipv4Addr::new(192, 0, 2, 1),
+            city: city.into(),
+            country: country.parse().unwrap(),
             as_v4,
-        )
+        })
     }
 
     fn fqdns(anchors: &[Anchor]) -> Vec<&str> {
@@ -151,14 +164,14 @@ mod tests {
     }
 
     #[test]
-    fn a_country_matches_the_two_letter_code_exactly() {
+    fn only_anchors_of_the_given_country_are_picked() {
         let anchors = [
             anchor("fi-hel-as1", "Helsinki", "FI", 1),
             anchor("de-fra-as2", "Frankfurt", "DE", 2),
         ];
 
         let picked =
-            select_for_country(&anchors, &"fi".parse().unwrap(), THREE);
+            select_for_country(&anchors, &"FI".parse().unwrap(), THREE);
 
         assert_eq!(fqdns(&picked), ["fi-hel-as1"]);
     }

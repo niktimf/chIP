@@ -10,7 +10,11 @@ pub enum NeighborBucket {
     RealityBrand,
     RealityGoogle,
     OwnDomain,
-    SelfSigned,
+    /// A certificate a server presents before anyone configures it: empty
+    /// or placeholder CN, a bare address, a Traefik or Caddy default, or no
+    /// issuer. Self-signed ones are one kind; a CA-issued `example.com`
+    /// certificate falls here too.
+    DefaultCertificate,
     NoHandshake,
     Closed,
 }
@@ -162,7 +166,7 @@ impl NeighborProbe {
             || issuer.to_lowercase().contains("caddy local")
             || issuer.is_empty();
         if looks_default {
-            NeighborBucket::SelfSigned
+            NeighborBucket::DefaultCertificate
         } else {
             NeighborBucket::OwnDomain
         }
@@ -221,13 +225,10 @@ fn largest_identical_default_certificate_group(
 ) -> Option<usize> {
     classified
         .iter()
-        .filter(|(_, bucket)| *bucket == NeighborBucket::SelfSigned)
+        .filter(|(_, bucket)| *bucket == NeighborBucket::DefaultCertificate)
         .filter_map(|(probe, _)| probe.presented_certificate())
         .counts_by(|handshake| {
-            (
-                handshake.cert_cn.clone().unwrap_or_default(),
-                handshake.cert_issuer.clone().unwrap_or_default(),
-            )
+            (handshake.cert_cn.as_deref(), handshake.cert_issuer.as_deref())
         })
         .into_values()
         .max()
@@ -363,15 +364,15 @@ mod tests {
     // example.com is a default-page CN (same as neighbors.sh), not a real site
     #[case::default_page_cn(
         handshake("203.0.113.8", "example.com", "R3", &["example.com"]),
-        NeighborBucket::SelfSigned
+        NeighborBucket::DefaultCertificate
     )]
     #[case::empty_cn(
         handshake("203.0.113.6", "", "", &[]),
-        NeighborBucket::SelfSigned
+        NeighborBucket::DefaultCertificate
     )]
     #[case::cn_is_the_address(
         handshake("203.0.113.7", "203.0.113.7", "", &[]),
-        NeighborBucket::SelfSigned
+        NeighborBucket::DefaultCertificate
     )]
     fn a_neighbor_falls_into_one_bucket(
         #[case] sut: NeighborProbe,
@@ -441,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn twenty_plus_identical_self_signed_certs_warns_as_one_operator() {
+    fn twenty_plus_identical_default_certs_warns_as_one_operator() {
         // One real site keeps the proxy-farm warning out of the detail.
         let real_site =
             handshake("203.0.113.99", "blog.example.org", "R3", &[]);
@@ -454,6 +455,43 @@ mod tests {
 
         assert_eq!(verdict.severity, Severity::Warn, "{}", verdict.detail);
         assert!(verdict.detail.contains("one operator"), "{}", verdict.detail);
+    }
+
+    fn without_cn(ip: &str) -> NeighborProbe {
+        NeighborProbe {
+            ip: ip.parse().unwrap(),
+            ptr: PtrLookup::NotFound,
+            https: NeighborHttps::Open {
+                handshake: TlsHandshake::Presented(TlsHandshakeFacts {
+                    cert_cn: None,
+                    cert_issuer: Some(String::new()),
+                    cert_san: Vec::new(),
+                }),
+            },
+        }
+    }
+
+    /// Eleven certificates without a CN and eleven with an empty one are two
+    /// groups of eleven, below the one-operator threshold, not one of 22.
+    #[test]
+    fn a_missing_cn_and_an_empty_cn_are_different_certificates() {
+        let real_site =
+            handshake("203.0.113.99", "blog.example.org", "R3", &[]);
+        let sut: Vec<NeighborProbe> = (0..11)
+            .map(|i| without_cn(&format!("203.0.113.{i}")))
+            .chain(
+                (11..22)
+                    .map(|i| handshake(&format!("203.0.113.{i}"), "", "", &[])),
+            )
+            .chain([real_site])
+            .collect();
+
+        let verdict = judge_neighbor_extremes(&sut);
+
+        assert_eq!(
+            verdict,
+            Verdict::ok("23 of 23 neighbors responding, no extreme pattern")
+        );
     }
 
     fn named_neighbor(ip: &str, name: &str) -> NeighborProbe {

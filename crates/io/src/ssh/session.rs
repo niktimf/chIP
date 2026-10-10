@@ -1,5 +1,5 @@
 use super::credential_files::SshCredentialFiles;
-use super::known_hosts::HostKeyPolicy;
+use super::known_hosts::{HostKeyPolicy, StrictHostKeyChecking};
 use super::listener::ListenerSlot;
 use crate::credentials::SshPrivateKey;
 use openssh::{KnownHosts, Session, SessionBuilder, Stdio};
@@ -25,6 +25,7 @@ pub enum SshError {
         #[source]
         source: std::io::Error,
     },
+    /// `output` is the stderr of the failed process.
     #[error("ssh process exited with {status}: {output}")]
     Exit {
         status: std::process::ExitStatus,
@@ -116,10 +117,12 @@ impl SshSession {
             .connect_timeout(Duration::from_secs(
                 config.connect_timeout_secs().get(),
             ))
-            .known_hosts_check(match config.host_keys {
-                HostKeyPolicy::Pinned(_) => KnownHosts::Strict,
-                HostKeyPolicy::TrustOnFirstUse { .. } => KnownHosts::Add,
-            })
+            .known_hosts_check(
+                match config.host_keys.strict_host_key_checking() {
+                    StrictHostKeyChecking::Yes => KnownHosts::Strict,
+                    StrictHostKeyChecking::AcceptNew => KnownHosts::Add,
+                },
+            )
             // openssh appends this "path" verbatim after
             // `UserKnownHostsFile=` and has no raw option setter, so the
             // quoted list of files goes through it unchanged.
@@ -156,6 +159,10 @@ impl SshSession {
         Arc::clone(&self.credentials)
     }
 
+    /// Runs `program` with `args` and returns its stdout. Stderr is kept
+    /// only for the error of a failed command, so a shell warning on it
+    /// cannot break the parsing of a reply.
+    ///
     /// # Errors
     ///
     /// Returns `SshError` when the command cannot run, exceeds `timeout`, or
@@ -167,13 +174,13 @@ impl SshSession {
         timeout: Duration,
     ) -> Result<String, SshError> {
         let mut cmd = self.session.command(program);
-        for arg in args {
-            cmd.arg(arg);
-        }
-        cmd.stdin(Stdio::null());
+        cmd.args(args).stdin(Stdio::null());
         Self::collect(cmd.output(), timeout).await
     }
 
+    /// Runs `command` in the remote shell and returns its stdout, as
+    /// `run_command` does.
+    ///
     /// # Errors
     ///
     /// Returns `SshError` when the command cannot run, exceeds `timeout`, or
@@ -195,19 +202,13 @@ impl SshSession {
         match tokio::time::timeout(timeout, fut).await {
             Err(_) => Err(SshError::Timeout),
             Ok(Err(e)) => Err(SshError::Command(e)),
-            Ok(Ok(out)) => {
-                let mut text =
-                    String::from_utf8_lossy(&out.stdout).into_owned();
-                text.push_str(&String::from_utf8_lossy(&out.stderr));
-                if out.status.success() {
-                    Ok(text)
-                } else {
-                    Err(SshError::Exit {
-                        status: out.status,
-                        output: text,
-                    })
-                }
+            Ok(Ok(out)) if out.status.success() => {
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
             }
+            Ok(Ok(out)) => Err(SshError::Exit {
+                status: out.status,
+                output: String::from_utf8_lossy(&out.stderr).into_owned(),
+            }),
         }
     }
 
@@ -224,7 +225,9 @@ impl SshSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error_chain::describe_error;
     use rstest::rstest;
+    use std::os::unix::process::ExitStatusExt as _;
 
     fn config_with_connect_timeout(connect_timeout: Duration) -> SshConfig {
         SshConfig {
@@ -276,40 +279,62 @@ mod tests {
         assert_eq!(message, "spawn ssh");
     }
 
-    #[tokio::test]
-    async fn a_command_error_message_does_not_repeat_its_cause() {
-        let source = openssh::Error::Remote(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "remote execution denied",
-        ));
-
-        let error =
-            SshSession::collect(async { Err(source) }, Duration::from_secs(1))
-                .await
-                .unwrap_err();
-
-        assert_eq!(error.to_string(), "ssh command failed");
+    fn finished(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
     }
 
     #[tokio::test]
-    async fn remote_command_errors_keep_the_complete_source_chain() {
-        use std::error::Error as _;
+    async fn a_shell_warning_on_stderr_does_not_reach_the_reply() {
+        let output = finished(
+            0,
+            "READY\n",
+            "bash: warning: setlocale: LC_ALL: cannot change locale\n",
+        );
+
+        let reply =
+            SshSession::collect(async { Ok(output) }, Duration::from_secs(1))
+                .await
+                .unwrap();
+
+        assert_eq!(reply, "READY\n");
+    }
+
+    #[tokio::test]
+    async fn a_failed_command_reports_its_status_and_stderr() {
+        let output = finished(1, "partial reply\n", "ss: permission denied\n");
+
+        let error =
+            SshSession::collect(async { Ok(output) }, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+
+        let SshError::Exit { status, output } = error else {
+            panic!("expected an exit error, got {error:?}");
+        };
+        assert_eq!(status.code(), Some(1));
+        assert_eq!(output, "ss: permission denied\n");
+    }
+
+    #[tokio::test]
+    async fn a_command_error_names_each_cause_once() {
         let source = openssh::Error::Remote(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "remote execution denied",
         ));
+
         let error =
             SshSession::collect(async { Err(source) }, Duration::from_secs(1))
                 .await
                 .unwrap_err();
-        let io = error
-            .source()
-            .unwrap()
-            .source()
-            .unwrap()
-            .downcast_ref::<std::io::Error>()
-            .unwrap();
-        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
-        assert_eq!(io.to_string(), "remote execution denied");
+
+        assert_eq!(
+            describe_error(&error),
+            "ssh command failed: the remote command could not be executed: \
+             remote execution denied"
+        );
     }
 }

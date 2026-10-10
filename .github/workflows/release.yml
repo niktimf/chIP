@@ -19,9 +19,10 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-        with:
-          targets: x86_64-unknown-linux-musl
+      # The toolchain of rust-toolchain.toml, plus the musl target.
+      - run: |
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked --target x86_64-unknown-linux-musl -p chip

@@ -1,6 +1,4 @@
 use std::fmt;
-use std::num::NonZeroUsize;
-use std::time::Duration;
 
 use anyhow::Context as _;
 use chip_core::anchor::{Anchor, select_for_city};
@@ -9,14 +7,14 @@ use chip_core::verdict::latency::{
     LatencySummary, SuggestedThresholds, summarize_latency,
 };
 use chip_io::atlas::AnchorClient;
-use chip_io::globalping::{GlobalpingClient, Locations, MeasurementId, Ping};
+use chip_io::globalping::{
+    GlobalpingClient, Locations, MeasurementId, Ping, ProbeSelection,
+};
+use futures::{StreamExt as _, TryStreamExt as _, stream};
 
-use crate::config::{CalibrateCommand, CalibrationTarget, ProbeSelection};
-
-const MEASUREMENT_DEADLINE: Duration = Duration::from_secs(90);
-/// How many RIPE Atlas anchors of the target's city to measure against.
-const ANCHORS_PER_CITY: NonZeroUsize =
-    NonZeroUsize::new(3).expect("3 is non-zero");
+use crate::config::{CalibrateCommand, CalibrationTarget};
+use crate::scan::globalping_rate_limit_hint;
+use crate::{CITY_ANCHORS, GLOBALPING_DEADLINE};
 
 #[derive(Debug, Clone)]
 pub struct CalibrationRow {
@@ -33,7 +31,7 @@ impl fmt::Display for CalibrationRow {
             self.summary.median_excess_ms,
             self.summary.p75_excess_ms,
         )?;
-        match self.summary.median_loss_delta_pct {
+        match self.summary.median_loss_delta_pp {
             Some(loss_delta) => write!(f, "{loss_delta:>11.2}"),
             None => write!(f, "{:>11}", "n/a"),
         }
@@ -87,9 +85,8 @@ struct CalibrationSession {
 
 impl CalibrationSession {
     async fn start(command: &CalibrateCommand) -> anyhow::Result<Self> {
-        const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-        let http = crate::http_client(HTTP_TIMEOUT)
-            .context("failed to build the HTTP client")?;
+        let http =
+            crate::http_client().context("failed to build the HTTP client")?;
         let anchors = AnchorClient::new(http.clone())
             .anchors()
             .await
@@ -110,7 +107,7 @@ impl CalibrationSession {
         target: &CalibrationTarget,
     ) -> anyhow::Result<CalibrationRow> {
         let city_anchors =
-            select_for_city(&self.anchors, target.city(), ANCHORS_PER_CITY);
+            select_for_city(&self.anchors, target.city(), CITY_ANCHORS);
         if city_anchors.is_empty() {
             anyhow::bail!(
                 "no RIPE Atlas anchor found for city '{}'",
@@ -120,16 +117,7 @@ impl CalibrationSession {
         let locations = self
             .first_measurement_id
             .as_ref()
-            .map_or_else(
-                || {
-                    Locations::ru(
-                        self.probes.eyeball(),
-                        self.probes.datacenter(),
-                    )
-                },
-                |id| Ok(Locations::reuse(id.clone())),
-            )
-            .context("failed to build the Globalping probe locations")?;
+            .map_or_else(|| Locations::ru(self.probes), Locations::reuse);
         let candidate_id = self
             .globalping
             .create_ping(target.ip(), &locations)
@@ -143,7 +131,7 @@ impl CalibrationSession {
             .clone();
         let candidate = self
             .globalping
-            .poll_ping(&candidate_id, MEASUREMENT_DEADLINE)
+            .poll_ping(&candidate_id, GLOBALPING_DEADLINE)
             .await
             .with_context(|| {
                 format!(
@@ -160,31 +148,38 @@ impl CalibrationSession {
         anchors: Vec<Anchor>,
         sample: &MeasurementId<Ping>,
     ) -> anyhow::Result<Vec<AnchorSeries>> {
-        let mut measurements = Vec::with_capacity(anchors.len());
-        for anchor in anchors {
-            let id = self
-                .globalping
-                .create_ping(anchor.ip_v4(), &Locations::reuse(sample.clone()))
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to start a Globalping ping of anchor {}",
-                        anchor.fqdn()
-                    )
-                })?;
-            let samples = self
-                .globalping
-                .poll_ping(&id, MEASUREMENT_DEADLINE)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to collect the Globalping ping of anchor {}",
-                        anchor.fqdn()
-                    )
-                })?;
-            measurements.push(AnchorSeries::new(anchor.fqdn(), samples));
-        }
-        Ok(measurements)
+        stream::iter(anchors)
+            .then(|anchor| self.measure_anchor(anchor, sample))
+            .try_collect()
+            .await
+    }
+
+    async fn measure_anchor(
+        &self,
+        anchor: Anchor,
+        sample: &MeasurementId<Ping>,
+    ) -> anyhow::Result<AnchorSeries> {
+        let id = self
+            .globalping
+            .create_ping(anchor.ip_v4(), &Locations::reuse(sample))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to start a Globalping ping of anchor {}",
+                    anchor.fqdn()
+                )
+            })?;
+        let samples = self
+            .globalping
+            .poll_ping(&id, GLOBALPING_DEADLINE)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to collect the Globalping ping of anchor {}",
+                    anchor.fqdn()
+                )
+            })?;
+        Ok(AnchorSeries::new(anchor.fqdn(), samples))
     }
 }
 
@@ -195,13 +190,10 @@ fn calibration_row(
 ) -> anyhow::Result<CalibrationRow> {
     let facts = PingSweepFacts::new(candidate, anchors)
         .context("Globalping returned misaligned probe sets")?;
+    let label = format!("{} ({})", target.ip(), target.city());
     let summary = summarize_latency(&facts)
-        .map_err(anyhow::Error::new)
-        .with_context(|| format!("{} ({})", target.ip(), target.city()))?;
-    Ok(CalibrationRow {
-        label: format!("{} ({})", target.ip(), target.city()),
-        summary,
-    })
+        .with_context(|| format!("failed to summarize latency of {label}"))?;
+    Ok(CalibrationRow { label, summary })
 }
 
 #[tracing::instrument(
@@ -213,12 +205,26 @@ fn calibration_row(
 pub async fn run_calibrate(
     command: &CalibrateCommand,
 ) -> anyhow::Result<Vec<CalibrationRow>> {
-    let mut session = CalibrationSession::start(command).await?;
-    let mut rows = Vec::with_capacity(command.targets().len());
-    for target in command.targets() {
-        rows.push(session.calibrate(target).await?);
-    }
-    Ok(rows)
+    let session = CalibrationSession::start(command).await?;
+    // The first target's ping picks the probes that every later ping
+    // reuses, so the targets are measured one after another and the session
+    // passes from each step to the next.
+    stream::try_unfold(
+        (session, command.targets().iter()),
+        |(mut session, mut targets)| async move {
+            let Some(target) = targets.next() else {
+                return Ok(None);
+            };
+            let row = session.calibrate(target).await?;
+            Ok(Some((row, (session, targets))))
+        },
+    )
+    .try_collect()
+    .await
+    .map_err(|error| match globalping_rate_limit_hint(&error) {
+        Some(hint) => error.context(hint),
+        None => error,
+    })
 }
 
 #[cfg(test)]
@@ -231,14 +237,14 @@ mod tests {
         label: &str,
         median_excess_ms: f64,
         p75_excess_ms: f64,
-        median_loss_delta_pct: Option<f64>,
+        median_loss_delta_pp: Option<f64>,
     ) -> CalibrationRow {
         CalibrationRow {
             label: label.into(),
             summary: LatencySummary {
                 median_excess_ms,
                 p75_excess_ms,
-                median_loss_delta_pct,
+                median_loss_delta_pp,
                 valid_probes: 12,
             },
         }

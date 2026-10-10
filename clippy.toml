@@ -1,6 +1,7 @@
-# Copy to the workspace root. Clippy reads the nearest clippy.toml and does
-# not merge it with files in parent directories: a crate with its own file
-# repeats these settings (see core-clippy.toml).
+# Clippy settings of the workspace. Clippy reads the nearest clippy.toml and
+# does not merge it with files in parent directories, so
+# crates/core/clippy.toml repeats every setting here and adds the
+# restrictions of the functional core.
 #
 # The default cognitive-complexity-threshold is intentional. Add an explicit
 # value only after measurements on a real codebase justify changing it.

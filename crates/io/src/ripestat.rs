@@ -126,11 +126,11 @@ impl RipestatClient {
         &self,
         ip: Ipv4Addr,
     ) -> Result<Routing, RipestatError> {
-        let url =
-            format!("{}/routing-status/data.json?resource={ip}", self.base_url);
+        let url = format!("{}/routing-status/data.json", self.base_url);
         let body: RoutingStatusBody = self
             .http
             .get(&url)
+            .query(&[("resource", ip)])
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)

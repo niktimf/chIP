@@ -91,7 +91,7 @@ impl SuggestedThresholds {
         .filter(|excess| !excess.is_zero())?;
         let max_loss_delta = summaries
             .iter()
-            .filter_map(|summary| summary.median_loss_delta_pct)
+            .filter_map(|summary| summary.median_loss_delta_pp)
             .reduce(f64::max)
             .map(|worst| PercentagePoints(worst.max(0.0)));
         Some(Self {
@@ -157,7 +157,7 @@ pub struct LatencySummary {
     /// Candidate loss minus anchor loss, in percentage points, over the
     /// valid probes where both sides reported loss. `None` when no probe
     /// did: Globalping's `stats.loss` is optional.
-    pub median_loss_delta_pct: Option<f64>,
+    pub median_loss_delta_pp: Option<f64>,
     pub valid_probes: usize,
 }
 
@@ -283,7 +283,7 @@ pub fn summarize_latency(
     Ok(LatencySummary {
         median_excess_ms: median(&excess),
         p75_excess_ms: percentile75(&excess),
-        median_loss_delta_pct: (!loss_delta.is_empty())
+        median_loss_delta_pp: (!loss_delta.is_empty())
             .then(|| median(&loss_delta)),
         valid_probes: excess.len(),
     })
@@ -330,7 +330,7 @@ pub fn judge_latency(
     let LatencySummary {
         median_excess_ms: med,
         p75_excess_ms: p75,
-        median_loss_delta_pct: loss_med,
+        median_loss_delta_pp: loss_med,
         valid_probes,
     } = summary;
     let rtt = format!(
@@ -492,11 +492,9 @@ mod tests {
 
         let verdict = judge_latency(&sut, &thresholds());
 
-        assert_eq!(verdict.severity, Severity::Ok, "{}", verdict.detail);
-        assert!(
-            verdict.detail.contains("4.9") || verdict.detail.contains("5.0"),
-            "{}",
-            verdict.detail
+        assert_eq!(
+            verdict,
+            Verdict::ok("median excess 5.0ms, p75 9.0ms across 12 probes")
         );
     }
 
@@ -568,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn too_few_probes_exposes_counts_as_typed_error_data() {
+    fn too_few_probes_valid_on_both_sides_leave_nothing_to_summarize() {
         let sut = facts(
             optional_samples(
                 &[Some(20.0), Some(20.0), None, None, None, None, None, None],
@@ -590,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_anchors_has_a_matchable_error_variant() {
+    fn without_a_surviving_anchor_there_is_nothing_to_summarize() {
         let sut = facts(samples(&[20.0], 0.0), vec![]);
 
         let error = summarize_latency(&sut).unwrap_err();
@@ -600,12 +598,12 @@ mod tests {
 
     fn calibrated(
         p75_excess_ms: f64,
-        median_loss_delta_pct: Option<f64>,
+        median_loss_delta_pp: Option<f64>,
     ) -> LatencySummary {
         LatencySummary {
             median_excess_ms: 0.0,
             p75_excess_ms,
-            median_loss_delta_pct,
+            median_loss_delta_pp,
             valid_probes: 12,
         }
     }
@@ -709,7 +707,7 @@ mod tests {
 
         let summary = summarize_latency(&sut).unwrap();
 
-        assert_eq!(summary.median_loss_delta_pct, Some(10.0));
+        assert_eq!(summary.median_loss_delta_pp, Some(10.0));
     }
 
     #[test]
@@ -734,7 +732,7 @@ mod tests {
 
         let summary = summarize_latency(&sut).unwrap();
 
-        assert_eq!(summary.median_loss_delta_pct, None);
+        assert_eq!(summary.median_loss_delta_pp, None);
     }
 
     #[test]

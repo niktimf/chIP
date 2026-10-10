@@ -8,15 +8,16 @@ on:
 permissions:
   contents: read
 # Each job runs one group of ci/check.sh, which holds the commands; the jobs
-# only install what the group needs and run in parallel.
+# only install what the group needs and run in parallel. The toolchain comes
+# from rust-toolchain.toml: `rustup toolchain install` without a name
+# installs it with its components. The msrv group reads its version from
+# `rust-version` in Cargo.toml and installs that toolchain itself.
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-        with:
-          components: rustfmt, clippy
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: sh ci/check.sh lint-and-test
 
@@ -24,15 +25,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: rustup toolchain install
+      # rust-cache keys on the toolchain of rust-toolchain.toml, not on the
+      # MSRV toolchain the job builds with, so the key also hashes the
+      # manifest that holds `rust-version`.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ hashFiles('Cargo.toml') }}
       - run: sh ci/check.sh msrv
 
   dependencies:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo install --locked cargo-deny --version 0.20.2
       - run: cargo install --locked cargo-machete --version 0.9.2

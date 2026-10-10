@@ -23,10 +23,9 @@ pub enum GateScope {
     Skipped(&'static str),
 }
 
-const RU_BRIDGE_REASON: &str =
-    "--country RU: judged only for a foreign exit, not for a Russian bridge";
-
 impl ScanProfile {
+    const RU_BRIDGE_REASON: &str = "--country RU: judged only for a foreign exit, not for a Russian bridge";
+
     pub fn for_country(country: &CountryCode) -> Self {
         if *country == CountryCode::RU {
             Self::RuBridge
@@ -40,7 +39,7 @@ impl ScanProfile {
             Self::Exit => GateScope::Judged,
             Self::RuBridge => match gate.bridge() {
                 BridgePolicy::ForeignExitOnly => {
-                    GateScope::Skipped(RU_BRIDGE_REASON)
+                    GateScope::Skipped(Self::RU_BRIDGE_REASON)
                 }
                 BridgePolicy::Judged => GateScope::Judged,
             },

@@ -15,6 +15,7 @@ chip-core = { workspace = true }
 chip-io = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+futures = { workspace = true, features = ["alloc"] }
 ipnet = { workspace = true }
 itertools = { workspace = true }
 reqwest = { workspace = true }

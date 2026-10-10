@@ -78,24 +78,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_failure_stays_distinct_from_an_inconclusive_page() {
-        let client = TunnelClient::from_client(
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_millis(100))
-                .build()
-                .unwrap(),
-        );
-        let sut = ServicePage {
-            url: "http://127.0.0.1:1",
-            ..CHATGPT_WEB
-        };
-
-        let state = sut.probe(&client).await;
-
-        assert!(matches!(state, ServiceState::Unavailable(_)), "{state:?}");
-    }
-
-    #[tokio::test]
     async fn a_refused_connection_reports_the_operating_system_cause() {
         let client = TunnelClient::from_client(reqwest::Client::new());
         let sut = ServicePage {
