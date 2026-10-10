@@ -35,4 +35,7 @@ jobs:
       - run: cargo install --locked cargo-deny --version 0.20.2
       - run: cargo install --locked cargo-machete --version 0.9.2
       - run: cargo deny --locked check
+      - run: >-
+          cargo deny --locked --manifest-path crates/core/Cargo.toml
+          --config crates/core/deny.toml check bans
       - run: cargo machete

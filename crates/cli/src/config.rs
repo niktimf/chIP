@@ -70,6 +70,11 @@ pub enum Command {
     Calibrate(CalibrateCommand),
 }
 
+#[expect(
+    clippy::map_err_ignore,
+    reason = "the rejected value is a secret, so the error names only the \
+              variable"
+)]
 fn secret_from_env<T>(
     name: &'static str,
     value: Option<OsString>,
@@ -159,6 +164,10 @@ impl Cli {
 }
 
 #[derive(Args, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "CLI arguments: each flag is an independent switch"
+)]
 struct ScanArgs {
     /// The candidate IPv4 address to vet.
     ip: CandidateIp,
@@ -271,6 +280,10 @@ impl ProbeSelection {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "tracked: CLI-B7 in docs/notes/2026-10-10-playbook-review.md"
+)]
 pub struct ScanCommand {
     ip: Ipv4Addr,
     country: CountryCode,
@@ -493,7 +506,7 @@ mod tests {
     fn scan_command(args: &[&str]) -> anyhow::Result<Box<ScanCommand>> {
         let command = parse(args).into_command_with(SecretInputs::default())?;
         let Command::Scan(command) = command else {
-            panic!("expected scan command")
+            anyhow::bail!("expected scan command")
         };
         Ok(command)
     }

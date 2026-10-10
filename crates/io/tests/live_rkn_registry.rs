@@ -9,6 +9,11 @@
 //! Public DNS is not blocked, and Meta's networks have been blocked as whole
 //! subnets since 2022. If the second test starts failing, check the export
 //! before the parser: the registry may have changed.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helpers fail fast on broken setup"
+)]
 
 use std::net::Ipv4Addr;
 

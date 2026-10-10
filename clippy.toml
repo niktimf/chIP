@@ -1,1 +1,46 @@
-too-many-lines-threshold = 50
+# Copy to the workspace root. Clippy reads the nearest clippy.toml and does
+# not merge it with files in parent directories: a crate with its own file
+# repeats these settings (see core-clippy.toml).
+#
+# The default cognitive-complexity-threshold is intentional. Add an explicit
+# value only after measurements on a real codebase justify changing it.
+
+# Tests may fail fast, but they stay silent: `cargo test` shows output only
+# for a failing test, and assertions carry the result, so print and dbg!
+# stay forbidden in tests as well. These keys cover `#[test]` functions and
+# `#[cfg(test)]` modules only. Helper functions in `tests/*.rs` are ordinary
+# code for clippy, so such a file starts with
+# `#![allow(clippy::unwrap_used, clippy::expect_used, reason = "...")]`.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = false
+allow-print-in-tests = false
+allow-indexing-slicing-in-tests = true
+
+# Roles, modes and states are enums, not bool flags. A boundary DTO with
+# independent flags, such as CLI arguments, states the exception with
+# `#[expect(clippy::struct_excessive_bools, reason = "...")]`.
+max-fn-params-bools = 0
+max-struct-bools = 1
+
+# Queues are bounded. Paths of crates that are not dependencies are ignored,
+# so the list covers the usual channel crates. A queue whose growth is bounded
+# by another proven condition states it with
+# `#[expect(clippy::disallowed_methods, reason = "...")]`.
+disallowed-methods = [
+    { path = "std::sync::mpsc::channel", reason = "unbounded queue: use std::sync::mpsc::sync_channel with a capacity" },
+    { path = "tokio::sync::mpsc::unbounded_channel", reason = "unbounded queue: use tokio::sync::mpsc::channel with a capacity" },
+    { path = "crossbeam_channel::unbounded", reason = "unbounded queue: use crossbeam_channel::bounded" },
+    { path = "crossbeam::channel::unbounded", reason = "unbounded queue: use crossbeam::channel::bounded" },
+    { path = "futures::channel::mpsc::unbounded", reason = "unbounded queue: use futures::channel::mpsc::channel" },
+    { path = "flume::unbounded", reason = "unbounded queue: use flume::bounded" },
+    { path = "async_channel::unbounded", reason = "unbounded queue: use async_channel::bounded" },
+]
+
+# A span guard held across `.await` attaches events of other tasks to the
+# span.
+await-holding-invalid-types = [
+    { path = "tracing::span::Entered", reason = "instrument the future with tracing::Instrument::instrument instead of holding span.enter() across .await" },
+    { path = "tracing::span::EnteredSpan", reason = "instrument the future with tracing::Instrument::instrument instead of holding span.entered() across .await" },
+]

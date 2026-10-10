@@ -29,7 +29,7 @@ impl SweepConfig {
 impl Default for SweepConfig {
     fn default() -> Self {
         Self::new(
-            NonZeroUsize::new(16).expect("16 is non-zero"),
+            const { NonZeroUsize::new(16).expect("16 is non-zero") },
             Duration::from_secs(3),
         )
     }
@@ -142,6 +142,10 @@ fn first_nonempty_line(text: &str) -> Option<&str> {
 
 /// Surveys every host in a subnet with bounded concurrency. A task owns its
 /// permit for its complete TCP/TLS/PTR sequence and every task is joined.
+///
+/// # Errors
+///
+/// Returns `JoinError` when a probe task panics or is cancelled.
 pub async fn sweep(
     network: Ipv4Net,
     config: &SweepConfig,

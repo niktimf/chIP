@@ -14,6 +14,7 @@ struct DropEntry {
     cidr: Ipv4Net,
 }
 
+#[derive(Debug)]
 pub struct BlockListsClient {
     http: reqwest::Client,
     spamhaus_url: String,

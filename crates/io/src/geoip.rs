@@ -8,6 +8,15 @@ pub struct GeoSource {
     pub pointer: &'static str,
 }
 
+impl std::fmt::Debug for GeoSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeoSource")
+            .field("name", &self.name)
+            .field("pointer", &self.pointer)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Delegates the registry check to `CountryCode::try_from` rather than
 /// re-implementing it: a source's free tier answering with a full name
 /// (`"Germany"`) or anything else that isn't a valid code is exactly the
@@ -65,6 +74,7 @@ fn default_sources() -> Vec<GeoSource> {
     ]
 }
 
+#[derive(Debug)]
 pub struct GeoIpClient {
     http: reqwest::Client,
     timeout: Duration,
@@ -93,6 +103,10 @@ impl GeoIpClient {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns `JoinError` when a source query task panics or is cancelled.
+    /// A source that fails to answer is a missing vote, not an error.
     pub async fn consensus(
         &self,
         ip: Ipv4Addr,
@@ -240,7 +254,7 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
                 .await
                 .unwrap();
-            let _ = hold.await;
+            hold.await.unwrap();
         });
         let http = reqwest::Client::new();
         let result = tokio::time::timeout(
@@ -253,7 +267,7 @@ mod tests {
             ),
         )
         .await;
-        let _ = release.send(());
+        release.send(()).unwrap();
         server.await.unwrap();
         assert_eq!(result.unwrap(), None);
     }

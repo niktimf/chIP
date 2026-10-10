@@ -3,7 +3,10 @@ use crate::model::{CountryCode, GeoConsensusFacts};
 
 const MIN_ANSWERS: usize = 5;
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "vote counts are a handful of geo sources, far below 2^52"
+)]
 pub fn judge_geo(facts: &GeoConsensusFacts, expected: &CountryCode) -> Verdict {
     let answered: Vec<CountryCode> =
         facts.votes.iter().flatten().copied().collect();
@@ -14,8 +17,7 @@ pub fn judge_geo(facts: &GeoConsensusFacts, expected: &CountryCode) -> Verdict {
             facts.votes.len()
         ));
     }
-    let russia =
-        CountryCode::try_from("RU").expect("RU is a valid country code");
+    let russia = CountryCode::RU;
     let matching = answered.iter().filter(|c| *c == expected).count();
     let share = matching as f64 / answered.len() as f64;
     let ru_seen = expected != &russia && answered.contains(&russia);

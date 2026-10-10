@@ -54,9 +54,9 @@ impl ScanProfile {
     /// Turns a result of a gate this profile does not judge into a `SKIP` row
     /// carrying the reason; other results pass through unchanged.
     pub fn apply(self, result: CheckResult) -> CheckResult {
-        match self.scope(result.gate) {
+        match self.scope(result.gate()) {
             GateScope::Skipped(reason) => {
-                CheckResult::skipped(result.gate, reason)
+                CheckResult::skipped(result.gate(), reason)
             }
             GateScope::Judged => result,
         }
@@ -145,7 +145,7 @@ mod tests {
 
         assert!(out.is_skipped());
         assert_eq!(out.severity(), Severity::Ok);
-        assert!(out.detail.contains("--country RU"), "{}", out.detail);
+        assert!(out.detail().contains("--country RU"), "{}", out.detail());
     }
 
     #[test]
@@ -153,7 +153,7 @@ mod tests {
         let out = ScanProfile::RuBridge.skipped([TAMPERING, SERVICE_NETFLIX]);
 
         let gates: Vec<_> =
-            out.iter().map(|result| result.gate.as_str()).collect();
+            out.iter().map(|result| result.gate().as_str()).collect();
         assert_eq!(gates, ["service:netflix"]);
     }
 }

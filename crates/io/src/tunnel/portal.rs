@@ -72,6 +72,10 @@ async fn probe_at(
 
 /// Returns `(https, http)` outcomes for the vendor-documented connectivity
 /// endpoints. Requests are concurrent and every task is joined.
+///
+/// # Errors
+///
+/// Returns `JoinError` when a probe task panics or is cancelled.
 pub async fn probe_portal_endpoints(
     client: &TunnelClient,
 ) -> Result<(Vec<PortalOutcome>, Vec<PortalOutcome>), tokio::task::JoinError> {

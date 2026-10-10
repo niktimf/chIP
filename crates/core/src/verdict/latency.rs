@@ -12,12 +12,17 @@ const MIN_VALID_PROBES: usize = 6;
 /// evidence the candidate is not actually in its declared city.
 const SUSPICIOUSLY_NEGATIVE_MS: f64 = -5.0;
 
+#[derive(Debug)]
 pub struct LatencyThresholds {
     max_excess_ms: f64,
     max_loss_delta_pct: f64,
 }
 
 impl LatencyThresholds {
+    /// # Errors
+    ///
+    /// Returns `InvalidLatencyThresholds` when the RTT excess is not finite and
+    /// positive, or the loss delta is not finite and non-negative.
     pub fn new(
         max_excess_ms: f64,
         max_loss_delta_pct: f64,
@@ -46,6 +51,7 @@ pub struct InvalidLatencyThresholds(&'static str);
 /// The raw numbers behind a latency verdict — what `cli::calibrate`
 /// prints to help choose `LatencyThresholds`, and what `judge_latency` itself
 /// is built on, so the two can never disagree.
+#[derive(Debug)]
 pub struct LatencySummary {
     pub median_excess_ms: f64,
     pub p75_excess_ms: f64,
@@ -88,10 +94,13 @@ fn median(xs: &[f64]) -> f64 {
 /// smaller 8-probe fixture below) it can drop the top quartile's spikes
 /// from the result entirely — on the 8-probe case it changes the verdict
 /// from Warn to Ok. Do not "simplify" this back to nearest-rank.
-#[allow(
+#[expect(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    reason = "n is a probe count far below 2^52, and rank.floor() lies in \
+              [0.75, n + 1], so the usize round trip neither truncates nor \
+              wraps"
 )]
 fn percentile75(xs: &[f64]) -> f64 {
     // `n` is a probe count (single/low-double digits in practice) — nowhere
@@ -143,6 +152,10 @@ pub fn select_anchors(anchors: &[AnchorSeries]) -> Vec<&AnchorSeries> {
 /// `Err` names why there is nothing to summarize: no anchor survived outlier
 /// rejection, or too few probes were valid on both the candidate and anchor
 /// side to trust the arithmetic.
+///
+/// # Errors
+///
+/// Returns `LatencySummaryError` in the two cases listed above.
 pub fn summarize_latency(
     facts: &PingSweepFacts,
 ) -> Result<LatencySummary, LatencySummaryError> {
@@ -297,8 +310,7 @@ mod tests {
         #[case] expected_detail: &str,
     ) {
         let error = LatencyThresholds::new(max_excess_ms, max_loss_delta_pct)
-            .err()
-            .expect("invalid thresholds must be rejected");
+            .expect_err("invalid thresholds must be rejected");
 
         assert!(error.to_string().contains(expected_detail), "{error}");
     }
@@ -399,8 +411,7 @@ mod tests {
         );
 
         let error = summarize_latency(&sut)
-            .err()
-            .expect("summary must reject insufficient samples");
+            .expect_err("summary must reject insufficient samples");
 
         assert_eq!(
             error,
@@ -417,8 +428,7 @@ mod tests {
         let sut = facts(samples(&[20.0], 0.0), vec![]);
 
         let error = summarize_latency(&sut)
-            .err()
-            .expect("summary must reject an empty anchor set");
+            .expect_err("summary must reject an empty anchor set");
 
         assert_eq!(error, LatencySummaryError::NoUsableAnchors);
     }

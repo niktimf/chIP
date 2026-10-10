@@ -14,6 +14,11 @@ pub struct InvalidNetsetEntry;
 impl FromStr for NetsetEntry {
     type Err = InvalidNetsetEntry;
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "a line that is neither a network nor an address has no \
+                  single parse error to keep, and the only caller skips it"
+    )]
     fn from_str(line: &str) -> Result<Self, Self::Err> {
         line.parse::<Ipv4Net>()
             .or_else(|_| line.parse::<Ipv4Addr>().map(Ipv4Net::from))

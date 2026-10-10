@@ -133,8 +133,9 @@ mod tests {
 
     #[test]
     fn a_fully_listed_24_and_16_are_valid_facts() {
-        let sut = RknRegistryFacts::new(RknListing::NotListed, 255, 65_535);
+        let actual = RknRegistryFacts::new(RknListing::NotListed, 255, 65_535)
+            .map(|facts| (facts.neighbors_24(), facts.neighbors_16()));
 
-        assert!(sut.is_ok());
+        assert_eq!(actual, Ok((255, 65_535)));
     }
 }

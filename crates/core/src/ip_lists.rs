@@ -23,6 +23,9 @@ pub struct EmptyList;
 pub struct NetworkList(Vec<Ipv4Net>);
 
 impl NetworkList {
+    /// # Errors
+    ///
+    /// Returns `EmptyList` when `networks` is empty.
     pub fn new(networks: Vec<Ipv4Net>) -> Result<Self, EmptyList> {
         if networks.is_empty() {
             Err(EmptyList)
@@ -42,6 +45,9 @@ impl NetworkList {
 pub struct AddressList(BTreeSet<Ipv4Addr>);
 
 impl AddressList {
+    /// # Errors
+    ///
+    /// Returns `EmptyList` when `addresses` is empty.
     pub fn new(addresses: BTreeSet<Ipv4Addr>) -> Result<Self, EmptyList> {
         if addresses.is_empty() {
             Err(EmptyList)
@@ -119,7 +125,11 @@ pub enum RknCheckError {
     /// A `/24` holds 255 addresses besides the candidate and a `/16` 65 535,
     /// so a larger count means the lookup itself is broken.
     #[error("counted {count} listed neighbors in a /{prefix_len}")]
-    NeighborCount { prefix_len: u8, count: usize },
+    NeighborCount {
+        prefix_len: u8,
+        count: usize,
+        source: std::num::TryFromIntError,
+    },
     #[error(transparent)]
     Facts(#[from] InvalidRknRegistryFacts),
 }
@@ -129,6 +139,10 @@ impl RknRegistry {
         Self { addresses, subnets }
     }
 
+    /// # Errors
+    ///
+    /// Returns `RknCheckError` when a neighbor count does not fit its prefix
+    /// or the counts contradict each other; both mean the lookup is broken.
     pub fn check(
         &self,
         ip: Ipv4Addr,
@@ -142,16 +156,20 @@ impl RknRegistry {
         };
         let in_24 = self.addresses.neighbors(ip, NETMASK_24);
         let in_16 = self.addresses.neighbors(ip, NETMASK_16);
-        let neighbors_24 =
-            u8::try_from(in_24).map_err(|_| RknCheckError::NeighborCount {
+        let neighbors_24 = u8::try_from(in_24).map_err(|source| {
+            RknCheckError::NeighborCount {
                 prefix_len: 24,
                 count: in_24,
-            })?;
-        let neighbors_16 =
-            u16::try_from(in_16).map_err(|_| RknCheckError::NeighborCount {
+                source,
+            }
+        })?;
+        let neighbors_16 = u16::try_from(in_16).map_err(|source| {
+            RknCheckError::NeighborCount {
                 prefix_len: 16,
                 count: in_16,
-            })?;
+                source,
+            }
+        })?;
         Ok(RknRegistryFacts::new(listing, neighbors_24, neighbors_16)?)
     }
 }

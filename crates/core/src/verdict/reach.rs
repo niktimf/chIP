@@ -22,7 +22,10 @@ pub fn judge_reach(facts: &ReachFacts) -> Verdict {
         .filter(|probe| probe.control == HttpProbeOutcome::Ok)
         .filter(|probe| probe.candidate == HttpProbeOutcome::Failed)
         .count();
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "probe counts are far below 2^52"
+    )]
     let share = failed as f64 / valid as f64;
     let detail = format!(
         "{failed}/{valid} valid probes could not reach the candidate over HTTPS"

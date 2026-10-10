@@ -166,8 +166,8 @@ impl fmt::Display for CityName {
 /// report, `--gate`, and `--skip-gate` all operate on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckResult {
-    pub gate: GateId,
-    pub detail: String,
+    gate: GateId,
+    detail: String,
     outcome: CheckOutcome,
 }
 

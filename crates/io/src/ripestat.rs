@@ -9,12 +9,22 @@ use thiserror::Error;
 pub enum RipestatError {
     #[error("RIPEstat response did not have the expected shape: {0}")]
     Shape(&'static str),
+    #[error("RIPEstat response field {field} is out of range")]
+    OutOfRange {
+        field: &'static str,
+        source: std::num::TryFromIntError,
+    },
+    #[error("RIPEstat response field resource is not an IPv4 prefix")]
+    Prefix(#[source] ipnet::AddrParseError),
+    #[error("RIPEstat response has inconsistent visibility counts")]
+    Visibility(#[source] chip_core::model::InvalidRoutingFacts),
     #[error("RIPEstat returned no RIS peer data for this address")]
     NoPeerData,
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
 }
 
+#[derive(Debug)]
 pub struct RipestatClient {
     http: reqwest::Client,
     base_url: String,
@@ -32,6 +42,11 @@ impl RipestatClient {
     /// the announced prefix that covers it, which is often a `/18` or a
     /// `/22`. A `/24` that is not announced on its own reads as seen by no
     /// peer at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RipestatError` when the request fails, the answer does not
+    /// have the expected shape, or no RIS peer reports on the address.
     pub async fn routing_status(
         &self,
         ip: Ipv4Addr,
@@ -48,8 +63,12 @@ impl RipestatClient {
         let total = data["visibility"]["v4"]["total_ris_peers"]
             .as_u64()
             .ok_or(RipestatError::Shape("visibility.v4.total_ris_peers"))?;
-        let total = u32::try_from(total)
-            .map_err(|_| RipestatError::Shape("value out of range"))?;
+        let total = u32::try_from(total).map_err(|source| {
+            RipestatError::OutOfRange {
+                field: "visibility.v4.total_ris_peers",
+                source,
+            }
+        })?;
         let total = NonZeroU32::new(total).ok_or(RipestatError::NoPeerData)?;
         // RIPEstat echoes the bare address back as `resource` when no
         // announcement covers it, and the announced prefix otherwise.
@@ -58,9 +77,8 @@ impl RipestatClient {
                 total_ris_peers: total,
             });
         }
-        let prefix: Ipv4Net = resource
-            .parse()
-            .map_err(|_| RipestatError::Shape("resource"))?;
+        let prefix: Ipv4Net =
+            resource.parse().map_err(RipestatError::Prefix)?;
 
         let seeing = data["visibility"]["v4"]["ris_peers_seeing"]
             .as_u64()
@@ -68,12 +86,16 @@ impl RipestatClient {
         let origin_count = data["origins"].as_array().map_or(0, Vec::len);
 
         let facts = RoutingFacts::new(
-            u32::try_from(seeing)
-                .map_err(|_| RipestatError::Shape("value out of range"))?,
+            u32::try_from(seeing).map_err(|source| {
+                RipestatError::OutOfRange {
+                    field: "visibility.v4.ris_peers_seeing",
+                    source,
+                }
+            })?,
             total,
             u32::try_from(origin_count).unwrap_or(u32::MAX),
         )
-        .map_err(|_| RipestatError::Shape("visibility exceeds total peers"))?;
+        .map_err(RipestatError::Visibility)?;
         Ok(Routing::Announced { prefix, facts })
     }
 }

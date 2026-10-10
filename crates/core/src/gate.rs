@@ -31,6 +31,10 @@ impl GateId {
 
     /// The registry row behind this id. Total: every `GateId` is a copy of
     /// an id in [`GATES`], so the lookup always finds its row.
+    #[expect(
+        clippy::expect_used,
+        reason = "GateId has a private field and is only built from GATES"
+    )]
     fn spec(self) -> &'static GateSpec {
         GATES
             .iter()
@@ -224,10 +228,10 @@ pub struct GateOverrides {
 
 impl GateOverrides {
     pub fn apply(&self, result: CheckResult) -> CheckResult {
-        if self.skip.contains(&result.gate) {
-            return CheckResult::skipped(result.gate, result.detail);
+        if self.skip.contains(&result.gate()) {
+            return CheckResult::skipped(result.gate(), result.into_detail());
         }
-        if self.escalate.contains(&result.gate) {
+        if self.escalate.contains(&result.gate()) {
             return result.escalate_warning();
         }
         result
@@ -357,7 +361,7 @@ mod tests {
 
         assert_eq!(out.severity(), Severity::Ok);
         assert_eq!(out.label(), "SKIP");
-        assert_eq!(out.detail, "named Snowd");
+        assert_eq!(out.detail(), "named Snowd");
     }
 
     #[test]

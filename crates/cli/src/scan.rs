@@ -136,6 +136,10 @@ pub fn network_24(ip: Ipv4Addr) -> Ipv4Net {
         .trunc()
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "tracked: CLI-B7 in docs/notes/2026-10-10-playbook-review.md"
+)]
 pub fn should_short_circuit(results: &[CheckResult], fail_fast: bool) -> bool {
     fail_fast
         && results

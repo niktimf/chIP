@@ -1,5 +1,4 @@
 use crate::model::{CheckResult, Severity};
-use std::fmt::Write;
 
 fn is_unsafe_formatting(character: char) -> bool {
     character.is_control()
@@ -20,7 +19,7 @@ fn terminal_cell(value: &str) -> String {
             '\r' => escaped.push_str(r"\r"),
             '\t' => escaped.push_str(r"\t"),
             control if is_unsafe_formatting(control) => {
-                let _ = write!(escaped, r"\u{{{:x}}}", u32::from(control));
+                escaped.extend(control.escape_unicode());
             }
             safe => escaped.push(safe),
         }
@@ -49,7 +48,7 @@ fn markdown_cell(value: &str) -> String {
                 escaped.push(character);
             }
             control if is_unsafe_formatting(control) => {
-                let _ = write!(escaped, r"\u{{{:x}}}", u32::from(control));
+                escaped.extend(control.escape_unicode());
             }
             safe => escaped.push(safe),
         }
@@ -58,6 +57,7 @@ fn markdown_cell(value: &str) -> String {
 }
 
 /// Every gate's result for one scan, ready to render.
+#[derive(Debug)]
 pub struct Report {
     pub results: Vec<CheckResult>,
 }
@@ -88,41 +88,46 @@ impl Report {
         rows.sort_by(|a, b| {
             b.severity()
                 .cmp(&a.severity())
-                .then_with(|| a.gate.cmp(&b.gate))
+                .then_with(|| a.gate().cmp(&b.gate()))
         });
         rows
     }
 
     pub fn table(&self) -> String {
-        let mut out = String::new();
-        for row in self.sorted() {
-            let _ = writeln!(
-                out,
-                "{:<5}  {:<28}  {}",
-                row.label(),
-                terminal_cell(row.gate.as_str()),
-                terminal_cell(&row.detail)
-            );
-        }
-        let _ = write!(out, "OVERALL: {}", self.overall());
-        out
+        let rows = self
+            .sorted()
+            .into_iter()
+            .map(|row| {
+                format!(
+                    "{:<5}  {:<28}  {}\n",
+                    row.label(),
+                    terminal_cell(row.gate().as_str()),
+                    terminal_cell(row.detail())
+                )
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        format!("{rows}OVERALL: {}", self.overall())
     }
 
     pub fn markdown(&self) -> String {
-        let mut out = format!(
-            "## chIP: {}\n\n| severity | gate | detail |\n|---|---|---|\n",
+        let rows = self
+            .sorted()
+            .into_iter()
+            .map(|row| {
+                format!(
+                    "| {} | {} | {} |\n",
+                    row.label(),
+                    markdown_cell(row.gate().as_str()),
+                    markdown_cell(row.detail())
+                )
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        format!(
+            "## chIP: {}\n\n| severity | gate | detail |\n|---|---|---|\n{rows}",
             self.overall()
-        );
-        for row in self.sorted() {
-            let _ = writeln!(
-                out,
-                "| {} | {} | {} |",
-                row.label(),
-                markdown_cell(row.gate.as_str()),
-                markdown_cell(&row.detail)
-            );
-        }
-        out
+        )
     }
 }
 

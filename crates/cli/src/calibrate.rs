@@ -128,28 +128,31 @@ pub fn suggest_thresholds(rows: &[CalibrationRow]) -> Option<(f64, f64)> {
 }
 
 pub fn render_calibration(rows: &[CalibrationRow]) -> String {
-    use std::fmt::Write as _;
-
-    let mut output = String::from(
-        "node                         median     p75  loss-delta\n",
+    let table = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{:<28} {:>7.2} {:>7.2} {:>11.2}\n",
+                row.label,
+                row.median_excess_ms,
+                row.p75_excess_ms,
+                row.median_loss_delta_pct
+            )
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    let suggestion = suggest_thresholds(rows).map_or_else(
+        String::new,
+        |(excess, loss)| {
+            format!(
+                "\nsuggested: --max-excess-ms {excess:.1} --max-loss-pct {loss:.1}"
+            )
+        },
     );
-    for row in rows {
-        let _ = writeln!(
-            output,
-            "{:<28} {:>7.2} {:>7.2} {:>11.2}",
-            row.label,
-            row.median_excess_ms,
-            row.p75_excess_ms,
-            row.median_loss_delta_pct
-        );
-    }
-    if let Some((excess, loss)) = suggest_thresholds(rows) {
-        let _ = write!(
-            output,
-            "\nsuggested: --max-excess-ms {excess:.1} --max-loss-pct {loss:.1}"
-        );
-    }
-    output
+    format!(
+        "node                         median     p75  loss-delta\n\
+         {table}{suggestion}"
+    )
 }
 
 #[tracing::instrument(

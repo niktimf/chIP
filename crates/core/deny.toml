@@ -1,0 +1,33 @@
+# Copy to the directory of the functional core crate (next to its
+# Cargo.toml). CI checks the dependency graph rooted at core only:
+#
+#     cargo deny --manifest-path crates/core/Cargo.toml \
+#         --config crates/core/deny.toml check bans
+#
+# Transitive dependencies count; dev-dependencies do not, so tests of core
+# may still use a runtime.
+
+[graph]
+exclude-dev = true
+
+[bans]
+deny = [
+    # Network.
+    { crate = "reqwest", reason = "core performs no network I/O; the shell does" },
+    { crate = "hyper", reason = "core performs no network I/O; the shell does" },
+    { crate = "axum", reason = "core performs no network I/O; the shell does" },
+    { crate = "tonic", reason = "core performs no network I/O; the shell does" },
+    { crate = "ureq", reason = "core performs no network I/O; the shell does" },
+    # Async runtimes.
+    { crate = "tokio", reason = "core is synchronous and pure; the runtime belongs to the shell" },
+    { crate = "async-std", reason = "core is synchronous and pure; the runtime belongs to the shell" },
+    { crate = "smol", reason = "core is synchronous and pure; the runtime belongs to the shell" },
+    # Databases.
+    { crate = "sqlx", reason = "core does not talk to a database; the shell does" },
+    { crate = "diesel", reason = "core does not talk to a database; the shell does" },
+    { crate = "rusqlite", reason = "core does not talk to a database; the shell does" },
+    { crate = "sea-orm", reason = "core does not talk to a database; the shell does" },
+    { crate = "redis", reason = "core does not talk to a database; the shell does" },
+    # Processes and remote shells.
+    { crate = "openssh", reason = "core runs no processes or remote sessions; the shell does" },
+]

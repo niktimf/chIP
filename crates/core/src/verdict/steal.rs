@@ -5,10 +5,13 @@ const WARN_STEAL_PCT: f64 = 5.0;
 
 /// Share of elapsed CPU ticks the kernel itself attributes to steal time
 /// (`/proc/stat` field 8) over the interval between two snapshots.
-#[allow(clippy::cast_precision_loss)]
 // `steal_delta` and `total_delta` are cumulative tick counts since boot,
 // clamped to u64::MAX; converting to f64 never loses precision within the
 // representable tick range (centuries of uptime).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "tick deltas stay far below 2^52 for any realistic uptime"
+)]
 pub fn steal_pct(before: &ProcStatSnapshot, after: &ProcStatSnapshot) -> f64 {
     let total_delta = after.total_ticks().saturating_sub(before.total_ticks());
     if total_delta == 0 {
@@ -29,7 +32,10 @@ pub fn judge_steal(pct: f64) -> Verdict {
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp)]
+#[expect(
+    clippy::float_cmp,
+    reason = "these tick counts give the expected percentages exactly in f64"
+)]
 mod tests {
     use super::*;
     use crate::model::Severity;
