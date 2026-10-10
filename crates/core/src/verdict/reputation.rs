@@ -7,34 +7,29 @@ use crate::model::ReputationFacts;
 const WARN_RISK: u8 = 50;
 
 pub fn judge_reputation(facts: &ReputationFacts) -> Verdict {
-    let flags = [
-        facts.vpn.then_some("vpn"),
-        facts.proxy.then_some("proxy"),
-        facts.tor.then_some("tor"),
-        facts.compromised.then_some("compromised"),
-        facts.anonymous.then_some("anonymous"),
-        facts.scraper.then_some("scraper"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
+    let names = facts
+        .flags
+        .iter()
+        .map(|flag| flag.as_str())
+        .collect::<Vec<_>>();
     let detail = format!(
         "risk {}, {}",
         facts
             .risk
             .map_or_else(|| "?".to_string(), |r| r.to_string()),
-        if flags.is_empty() {
+        if names.is_empty() {
             "no flags".to_string()
         } else {
-            format!("flags: {}", flags.join(", "))
+            format!("flags: {}", names.join(", "))
         },
     );
 
-    if facts.vpn || facts.proxy || facts.tor || facts.compromised {
+    if facts.flags.iter().any(|flag| flag.is_hard()) {
         return Verdict::fail(detail);
     }
     let risk_over = facts.risk.is_some_and(|r| r.value() >= WARN_RISK);
-    if facts.anonymous || facts.scraper || risk_over {
+    let soft_flag = facts.flags.iter().any(|flag| !flag.is_hard());
+    if soft_flag || risk_over {
         return Verdict::warn(detail);
     }
     Verdict::ok(detail)
@@ -55,7 +50,8 @@ pub fn judge_reputation_operator(facts: &ReputationFacts) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{RiskScore, Severity};
+    use crate::model::{ReputationFlag, RiskScore, Severity};
+    use std::collections::BTreeSet;
 
     fn risk(value: u8) -> RiskScore {
         RiskScore::new(value).unwrap()
@@ -63,14 +59,16 @@ mod tests {
 
     fn clean() -> ReputationFacts {
         ReputationFacts {
-            vpn: false,
-            proxy: false,
-            tor: false,
-            compromised: false,
-            anonymous: false,
-            scraper: false,
+            flags: BTreeSet::new(),
             risk: Some(risk(33)),
             operator: None,
+        }
+    }
+
+    fn clean_with(flags: &[ReputationFlag]) -> ReputationFacts {
+        ReputationFacts {
+            flags: flags.iter().copied().collect(),
+            ..clean()
         }
     }
 
@@ -81,10 +79,10 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::vpn(ReputationFacts { vpn: true, ..clean() })]
-    #[case::proxy(ReputationFacts { proxy: true, ..clean() })]
-    #[case::tor(ReputationFacts { tor: true, ..clean() })]
-    #[case::compromised(ReputationFacts { compromised: true, ..clean() })]
+    #[case::vpn(clean_with(&[ReputationFlag::Vpn]))]
+    #[case::proxy(clean_with(&[ReputationFlag::Proxy]))]
+    #[case::tor(clean_with(&[ReputationFlag::Tor]))]
+    #[case::compromised(clean_with(&[ReputationFlag::Compromised]))]
     fn each_hard_flag_fails_on_its_own(#[case] sut: ReputationFacts) {
         assert_eq!(judge_reputation(&sut).severity, Severity::Fail);
     }
@@ -117,8 +115,8 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::anonymous(ReputationFacts { anonymous: true, ..clean() })]
-    #[case::scraper(ReputationFacts { scraper: true, ..clean() })]
+    #[case::anonymous(clean_with(&[ReputationFlag::Anonymous]))]
+    #[case::scraper(clean_with(&[ReputationFlag::Scraper]))]
     fn each_soft_flag_only_warns(#[case] sut: ReputationFacts) {
         assert_eq!(judge_reputation(&sut).severity, Severity::Warn);
     }
@@ -151,11 +149,7 @@ mod tests {
 
     #[test]
     fn a_flagged_address_lists_its_flags() {
-        let sut = ReputationFacts {
-            vpn: true,
-            anonymous: true,
-            ..clean()
-        };
+        let sut = clean_with(&[ReputationFlag::Anonymous, ReputationFlag::Vpn]);
 
         let verdict = judge_reputation(&sut);
 

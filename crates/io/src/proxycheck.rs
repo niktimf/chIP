@@ -1,6 +1,7 @@
 use crate::credentials::ProxycheckApiKey;
-use chip_core::model::{ReputationFacts, RiskScore};
+use chip_core::model::{ReputationFacts, ReputationFlag, RiskScore};
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use thiserror::Error;
 
@@ -45,6 +46,22 @@ struct RawDetections {
     risk: Option<u64>,
 }
 
+impl RawDetections {
+    fn flags(&self) -> BTreeSet<ReputationFlag> {
+        [
+            (self.vpn, ReputationFlag::Vpn),
+            (self.proxy, ReputationFlag::Proxy),
+            (self.tor, ReputationFlag::Tor),
+            (self.compromised, ReputationFlag::Compromised),
+            (self.anonymous, ReputationFlag::Anonymous),
+            (self.scraper, ReputationFlag::Scraper),
+        ]
+        .into_iter()
+        .filter_map(|(raised, flag)| raised.then_some(flag))
+        .collect()
+    }
+}
+
 /// v3 answers with an object (`{"name": …, "url": …, "anonymity": …}`),
 /// not a bare string: reading it as a string silently dropped every
 /// operator proxycheck ever named.
@@ -60,12 +77,7 @@ impl From<RawEntry> for ReputationFacts {
             operator,
         } = entry;
         Self {
-            vpn: detections.vpn,
-            proxy: detections.proxy,
-            tor: detections.tor,
-            compromised: detections.compromised,
-            anonymous: detections.anonymous,
-            scraper: detections.scraper,
+            flags: detections.flags(),
             risk: detections
                 .risk
                 .and_then(|risk| RiskScore::try_from(risk).ok()),
@@ -206,7 +218,7 @@ mod tests {
 
         let facts = sut.lookup("203.0.113.1".parse().unwrap()).await.unwrap();
 
-        assert!(!facts.vpn && !facts.proxy && !facts.tor && !facts.compromised);
+        assert_eq!(facts.flags, BTreeSet::new());
         assert_eq!(facts.risk.map(RiskScore::value), Some(33));
         assert_eq!(facts.operator, None);
     }
@@ -218,7 +230,7 @@ mod tests {
 
         let facts = sut.lookup("203.0.113.2".parse().unwrap()).await.unwrap();
 
-        assert!(facts.vpn);
+        assert_eq!(facts.flags, BTreeSet::from([ReputationFlag::Vpn]));
         assert_eq!(facts.operator.as_deref(), Some("Snowd"));
     }
 
@@ -234,7 +246,7 @@ mod tests {
 
         let facts = sut.lookup("203.0.113.3".parse().unwrap()).await.unwrap();
 
-        assert!(!facts.vpn && !facts.proxy);
+        assert_eq!(facts.flags, BTreeSet::new());
         assert_eq!(facts.operator.as_deref(), Some("Snowd"));
     }
 

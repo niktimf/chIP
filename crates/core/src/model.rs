@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU32;
@@ -443,18 +444,46 @@ impl PingSweepFacts {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "tracked: CORE-S12 in docs/notes/2026-10-10-playbook-review.md"
-)]
+/// A proxycheck detection raised for an address.
+///
+/// `Ord` follows declaration order, and the reputation verdict lists the
+/// flags of an address in that order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReputationFlag {
+    Vpn,
+    Proxy,
+    Tor,
+    Compromised,
+    Anonymous,
+    Scraper,
+}
+
+impl ReputationFlag {
+    /// Whether the flag alone fails the reputation gate. The other flags
+    /// only warn.
+    pub const fn is_hard(self) -> bool {
+        match self {
+            Self::Vpn | Self::Proxy | Self::Tor | Self::Compromised => true,
+            Self::Anonymous | Self::Scraper => false,
+        }
+    }
+
+    /// The flag's name in the verdict detail.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vpn => "vpn",
+            Self::Proxy => "proxy",
+            Self::Tor => "tor",
+            Self::Compromised => "compromised",
+            Self::Anonymous => "anonymous",
+            Self::Scraper => "scraper",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ReputationFacts {
-    pub vpn: bool,
-    pub proxy: bool,
-    pub tor: bool,
-    pub compromised: bool,
-    pub anonymous: bool,
-    pub scraper: bool,
+    pub flags: BTreeSet<ReputationFlag>,
     pub risk: Option<RiskScore>,
     pub operator: Option<String>,
 }
