@@ -271,20 +271,22 @@ pub enum CdnEdge {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CdnEdgeVote {
     pub edge: CdnEdge,
-    pub observation: EdgeObservation,
+    pub observation: CountryObservation,
 }
 
-/// What one CDN edge probe showed.
+/// The country one probed source (a CDN edge or a service) placed the
+/// candidate in.
 ///
-/// An edge that answered without a country and an edge that could not be
-/// reached are separate states: only the second leaves the gate unable to
-/// tell whether that edge sits in Russia.
+/// A source that answered without a country and a source that gave no answer
+/// are separate states: only the second leaves the gate unable to tell what
+/// that source would have said, for example that it sees Russia.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EdgeObservation {
+pub enum CountryObservation {
     Country(CountryCode),
-    /// The edge answered, but the response named no recognizable location.
+    /// The source answered, but the response named no recognizable location.
     Silent,
-    /// The edge could not be fetched; the string is the transport cause.
+    /// The source gave no answer: a failed request, an HTTP error status or a
+    /// body of the wrong format. The string is the cause.
     Unavailable(String),
 }
 
@@ -654,10 +656,10 @@ impl ServiceGeoSource {
 /// A country vote from a single service. Used by `verdict::service_geo` to
 /// determine whether the IP's location detection is consistent across major
 /// services.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceCountryVote {
     pub source: ServiceGeoSource,
-    pub country: Option<CountryCode>,
+    pub observation: CountryObservation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

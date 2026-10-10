@@ -4,45 +4,111 @@ use regex::regex;
 use crate::Verdict;
 use crate::model::{
     CaptchaObservation, CaptchaRetry, CdnEdge, CdnEdgeVote, CountryCode,
-    EdgeObservation, ServiceCountryVote,
+    CountryObservation, ServiceCountryVote, ServiceGeoSource,
 };
 
+/// Names the votes that `describe` picks out, in input order.
+fn votes_where(
+    votes: &[ServiceCountryVote],
+    describe: impl Fn(ServiceGeoSource, &CountryObservation) -> Option<String>,
+) -> Vec<String> {
+    votes
+        .iter()
+        .filter_map(|vote| describe(vote.source, &vote.observation))
+        .collect()
+}
+
+/// Judges the services' country votes against the `expected` exit country.
+///
+/// A Google or `YouTube` country other than `expected` fails the gate, and
+/// so does one of them seeing Russia. A service that gave no answer may be
+/// the one that would have failed it: an unavailable critical service leaves
+/// the gate with no verdict, and an unavailable other service keeps it from
+/// passing, since that service could at most have warned. A service that
+/// answered without a country is skipped.
 pub fn judge_service_country(
     votes: &[ServiceCountryVote],
     expected: &CountryCode,
 ) -> Verdict {
-    let critical_answered = votes
-        .iter()
-        .any(|vote| vote.source.is_critical() && vote.country.is_some());
+    let russia = CountryCode::RU;
+    // `code == russia` matters only when `expected` is RU itself, and the
+    // CLI never gets here in that case: a RuBridge profile skips this gate.
+    // The clause stays so that a direct caller asking about an RU "exit"
+    // still sees a critical RU sighting fail rather than count as agreement.
+    let gate_hit = votes.iter().any(|vote| {
+        vote.source.is_critical()
+            && matches!(
+                vote.observation,
+                CountryObservation::Country(code)
+                    if code != *expected || code == russia
+            )
+    });
+    let critical_unavailable = votes.iter().any(|vote| {
+        vote.source.is_critical()
+            && matches!(vote.observation, CountryObservation::Unavailable(_))
+    });
+    let critical_answered = votes.iter().any(|vote| {
+        vote.source.is_critical()
+            && matches!(vote.observation, CountryObservation::Country(_))
+    });
+    let disagreements =
+        votes_where(votes, |source, observation| match observation {
+            CountryObservation::Country(code) => {
+                (code != expected).then(|| format!("{source}={code}"))
+            }
+            CountryObservation::Silent | CountryObservation::Unavailable(_) => {
+                None
+            }
+        });
+    let unavailable =
+        votes_where(votes, |source, observation| match observation {
+            CountryObservation::Unavailable(cause) => {
+                Some(format!("{source} ({cause})"))
+            }
+            CountryObservation::Country(_) | CountryObservation::Silent => None,
+        });
+    let unavailable_note = if unavailable.is_empty() {
+        String::new()
+    } else {
+        format!("; service unavailable: {}", unavailable.join(", "))
+    };
+    let disagreement =
+        format!("disagreement: {}{unavailable_note}", disagreements.join(", "));
+    if gate_hit {
+        return Verdict::fail(disagreement);
+    }
+    if critical_unavailable {
+        let named =
+            votes_where(votes, |source, observation| match observation {
+                CountryObservation::Country(code) => {
+                    Some(format!("{source}={code}"))
+                }
+                CountryObservation::Silent
+                | CountryObservation::Unavailable(_) => None,
+            });
+        let seen = if named.is_empty() {
+            String::new()
+        } else {
+            format!("; services: {}", named.join(", "))
+        };
+        return Verdict::error(format!(
+            "service unavailable: {}{seen}",
+            unavailable.join(", ")
+        ));
+    }
     if !critical_answered {
         return Verdict::error("neither Google nor YouTube reported a country");
     }
-    let russia = CountryCode::RU;
-    let disagreements: Vec<String> = votes
-        .iter()
-        .filter_map(|v| v.country.map(|c| (v.source, c)))
-        .filter(|(_, c)| c != expected)
-        .map(|(s, c)| format!("{s}={c}"))
-        .collect();
-    if disagreements.is_empty() {
-        return Verdict::ok(format!(
-            "all responding services agree on {expected}"
+    if !disagreements.is_empty() {
+        return Verdict::warn(disagreement);
+    }
+    if !unavailable.is_empty() {
+        return Verdict::warn(format!(
+            "service unavailable: {}; the others agree on {expected}",
+            unavailable.join(", ")
         ));
     }
-    // `c == russia` matters only when `expected` is RU itself, and the CLI
-    // never gets here in that case: a RuBridge profile skips this gate. The
-    // clause stays so that a direct caller asking about an RU "exit" still
-    // sees a critical RU sighting fail rather than count as agreement.
-    let gate_hit = votes.iter().any(|v| {
-        v.source.is_critical()
-            && v.country.is_some_and(|c| c != *expected || c == russia)
-    });
-    let detail = format!("disagreement: {}", disagreements.join(", "));
-    if gate_hit {
-        Verdict::fail(detail)
-    } else {
-        Verdict::warn(detail)
-    }
+    Verdict::ok(format!("all responding services agree on {expected}"))
 }
 
 /// Reads one fetched Google Search page: a 429 or a block page is a captcha.
@@ -201,7 +267,7 @@ pub fn airport_country(code: &str) -> Option<CountryCode> {
 /// Names the edges that `describe` picks out, in input order.
 fn edges_where(
     edges: &[CdnEdgeVote],
-    describe: impl Fn(CdnEdge, &EdgeObservation) -> Option<String>,
+    describe: impl Fn(CdnEdge, &CountryObservation) -> Option<String>,
 ) -> Vec<String> {
     edges
         .iter()
@@ -210,7 +276,7 @@ fn edges_where(
 }
 
 pub fn judge_cdn_edge(edges: &[CdnEdgeVote]) -> Verdict {
-    let russia = EdgeObservation::Country(CountryCode::RU);
+    let russia = CountryObservation::Country(CountryCode::RU);
     let ru = edges_where(edges, |edge, observation| {
         (*observation == russia).then(|| edge.to_string())
     });
@@ -218,15 +284,15 @@ pub fn judge_cdn_edge(edges: &[CdnEdgeVote]) -> Verdict {
         return Verdict::fail(format!("CDN edge in Russia: {}", ru.join(", ")));
     }
     let named = edges_where(edges, |edge, observation| match observation {
-        EdgeObservation::Country(code) => Some(format!("{edge}={code}")),
-        EdgeObservation::Silent | EdgeObservation::Unavailable(_) => None,
+        CountryObservation::Country(code) => Some(format!("{edge}={code}")),
+        CountryObservation::Silent | CountryObservation::Unavailable(_) => None,
     });
     let unavailable =
         edges_where(edges, |edge, observation| match observation {
-            EdgeObservation::Unavailable(cause) => {
+            CountryObservation::Unavailable(cause) => {
                 Some(format!("{edge} ({cause})"))
             }
-            EdgeObservation::Country(_) | EdgeObservation::Silent => None,
+            CountryObservation::Country(_) | CountryObservation::Silent => None,
         });
     // An unreachable edge may be the one sitting in Russia, so the gate has
     // no verdict, as with an unreachable service in `services`.
@@ -245,7 +311,7 @@ pub fn judge_cdn_edge(edges: &[CdnEdgeVote]) -> Verdict {
         return Verdict::error("no CDN edge reported a country");
     }
     let silent = edges_where(edges, |edge, observation| {
-        (*observation == EdgeObservation::Silent).then(|| edge.to_string())
+        (*observation == CountryObservation::Silent).then(|| edge.to_string())
     });
     let silent = if silent.is_empty() {
         String::new()
@@ -258,40 +324,40 @@ pub fn judge_cdn_edge(edges: &[CdnEdgeVote]) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ServiceGeoSource, Severity};
+    use crate::model::Severity;
 
     fn cc(code: &str) -> CountryCode {
         code.parse().unwrap()
     }
 
-    fn edge(code: &str) -> EdgeObservation {
-        EdgeObservation::Country(cc(code))
+    fn seen(code: &str) -> CountryObservation {
+        CountryObservation::Country(cc(code))
     }
 
-    fn unreachable(cause: &str) -> EdgeObservation {
-        EdgeObservation::Unavailable(cause.to_string())
+    fn unreachable(cause: &str) -> CountryObservation {
+        CountryObservation::Unavailable(cause.to_string())
     }
 
-    const fn at(edge: CdnEdge, observation: EdgeObservation) -> CdnEdgeVote {
+    const fn at(edge: CdnEdge, observation: CountryObservation) -> CdnEdgeVote {
         CdnEdgeVote { edge, observation }
     }
 
-    fn vote(
+    const fn vote(
         source: ServiceGeoSource,
-        country: Option<&str>,
+        observation: CountryObservation,
     ) -> ServiceCountryVote {
         ServiceCountryVote {
             source,
-            country: country.map(cc),
+            observation,
         }
     }
 
     #[test]
     fn edges_without_a_country_are_named_apart_from_the_ones_with_one() {
         let sut = vec![
-            at(CdnEdge::Cloudflare, edge("FI")),
-            at(CdnEdge::YoutubeGgc, EdgeObservation::Silent),
-            at(CdnEdge::NetflixOca, edge("LV")),
+            at(CdnEdge::Cloudflare, seen("FI")),
+            at(CdnEdge::YoutubeGgc, CountryObservation::Silent),
+            at(CdnEdge::NetflixOca, seen("LV")),
         ];
 
         let verdict = judge_cdn_edge(&sut);
@@ -306,8 +372,8 @@ mod tests {
     #[test]
     fn the_detail_stays_short_when_every_edge_named_a_country() {
         let sut = vec![
-            at(CdnEdge::Cloudflare, edge("FI")),
-            at(CdnEdge::NetflixOca, edge("LV")),
+            at(CdnEdge::Cloudflare, seen("FI")),
+            at(CdnEdge::NetflixOca, seen("LV")),
         ];
 
         let verdict = judge_cdn_edge(&sut);
@@ -318,7 +384,7 @@ mod tests {
     #[test]
     fn an_unreachable_edge_is_named_with_its_cause_next_to_the_answers() {
         let sut = vec![
-            at(CdnEdge::Cloudflare, edge("FI")),
+            at(CdnEdge::Cloudflare, seen("FI")),
             at(CdnEdge::YoutubeGgc, unreachable("connection refused")),
         ];
 
@@ -334,9 +400,9 @@ mod tests {
     #[test]
     fn a_disagreement_names_each_service_and_the_country_it_saw() {
         let sut = vec![
-            vote(ServiceGeoSource::Google, Some("FI")),
-            vote(ServiceGeoSource::Spotify, Some("DE")),
-            vote(ServiceGeoSource::Tiktok, Some("NL")),
+            vote(ServiceGeoSource::Google, seen("FI")),
+            vote(ServiceGeoSource::Spotify, seen("DE")),
+            vote(ServiceGeoSource::Tiktok, seen("NL")),
         ];
 
         let verdict = judge_service_country(&sut, &cc("FI"));
@@ -344,49 +410,135 @@ mod tests {
         assert_eq!(verdict.detail, "disagreement: spotify=DE, tiktok=NL");
     }
 
+    #[test]
+    fn an_unavailable_critical_service_is_named_with_its_cause_next_to_the_answers()
+     {
+        let sut = vec![
+            vote(ServiceGeoSource::Google, unreachable("timed out")),
+            vote(ServiceGeoSource::Youtube, seen("FI")),
+            vote(ServiceGeoSource::Apple, seen("FI")),
+        ];
+
+        let verdict = judge_service_country(&sut, &cc("FI"));
+
+        assert_eq!(
+            verdict.detail,
+            "service unavailable: google (timed out); \
+             services: youtube=FI, apple=FI"
+        );
+    }
+
+    #[test]
+    fn a_failing_disagreement_also_names_the_unavailable_services() {
+        let sut = vec![
+            vote(ServiceGeoSource::Google, unreachable("timed out")),
+            vote(ServiceGeoSource::Youtube, seen("RU")),
+        ];
+
+        let verdict = judge_service_country(&sut, &cc("FI"));
+
+        assert_eq!(
+            verdict.detail,
+            "disagreement: youtube=RU; service unavailable: google (timed out)"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_other_service_is_named_beside_the_agreed_country() {
+        let sut = vec![
+            vote(ServiceGeoSource::Google, seen("FI")),
+            vote(ServiceGeoSource::Bing, unreachable("HTTP 503")),
+        ];
+
+        let verdict = judge_service_country(&sut, &cc("FI"));
+
+        assert_eq!(
+            verdict.detail,
+            "service unavailable: bing (HTTP 503); the others agree on FI"
+        );
+    }
+
     #[rstest::rstest]
     #[case::everyone_agreeing(
         vec![
-            vote(ServiceGeoSource::Google, Some("FI")),
-            vote(ServiceGeoSource::Apple, Some("FI")),
+            vote(ServiceGeoSource::Google, seen("FI")),
+            vote(ServiceGeoSource::Apple, seen("FI")),
         ],
         Severity::Ok
     )]
     #[case::google_or_youtube_disagreeing(
         vec![
-            vote(ServiceGeoSource::Google, Some("DE")),
-            vote(ServiceGeoSource::Apple, Some("FI")),
+            vote(ServiceGeoSource::Google, seen("DE")),
+            vote(ServiceGeoSource::Apple, seen("FI")),
         ],
         Severity::Fail
     )]
     #[case::google_or_youtube_seeing_russia_while_everyone_else_agrees(
         vec![
-            vote(ServiceGeoSource::Youtube, Some("RU")),
-            vote(ServiceGeoSource::Apple, Some("FI")),
+            vote(ServiceGeoSource::Youtube, seen("RU")),
+            vote(ServiceGeoSource::Apple, seen("FI")),
         ],
         Severity::Fail
     )]
     #[case::a_non_critical_service_disagreeing_only_warns(
         vec![
-            vote(ServiceGeoSource::Google, Some("FI")),
-            vote(ServiceGeoSource::Spotify, Some("DE")),
+            vote(ServiceGeoSource::Google, seen("FI")),
+            vote(ServiceGeoSource::Spotify, seen("DE")),
         ],
         Severity::Warn
     )]
-    #[case::a_vote_that_did_not_answer_is_silently_skipped(
+    #[case::a_service_that_answered_without_a_country_is_skipped(
         vec![
-            vote(ServiceGeoSource::Google, Some("FI")),
-            vote(ServiceGeoSource::Apple, None),
+            vote(ServiceGeoSource::Google, seen("FI")),
+            vote(ServiceGeoSource::Apple, CountryObservation::Silent),
         ],
         Severity::Ok
     )]
-    #[case::no_critical_service_answer_is_an_error(
+    #[case::a_critical_service_that_answered_without_a_country_is_skipped(
         vec![
-            vote(ServiceGeoSource::Google, None),
-            vote(ServiceGeoSource::Youtube, None),
-            vote(ServiceGeoSource::Apple, Some("FI")),
+            vote(ServiceGeoSource::Google, seen("FI")),
+            vote(ServiceGeoSource::Youtube, CountryObservation::Silent),
+        ],
+        Severity::Ok
+    )]
+    #[case::no_critical_service_naming_a_country_is_an_error(
+        vec![
+            vote(ServiceGeoSource::Google, CountryObservation::Silent),
+            vote(ServiceGeoSource::Youtube, CountryObservation::Silent),
+            vote(ServiceGeoSource::Apple, seen("FI")),
         ],
         Severity::Error
+    )]
+    // Google may be the one that sees Russia, so YouTube agreeing is not
+    // enough to pass.
+    #[case::an_unavailable_google_beside_an_agreeing_youtube(
+        vec![
+            vote(ServiceGeoSource::Google, unreachable("HTTP 403")),
+            vote(ServiceGeoSource::Youtube, seen("FI")),
+        ],
+        Severity::Error
+    )]
+    #[case::youtube_seeing_russia_beside_an_unavailable_google(
+        vec![
+            vote(ServiceGeoSource::Google, unreachable("timed out")),
+            vote(ServiceGeoSource::Youtube, seen("RU")),
+        ],
+        Severity::Fail
+    )]
+    #[case::google_disagreeing_beside_an_unavailable_youtube(
+        vec![
+            vote(ServiceGeoSource::Google, seen("DE")),
+            vote(ServiceGeoSource::Youtube, unreachable("timed out")),
+        ],
+        Severity::Fail
+    )]
+    // The unavailable service could at most have warned.
+    #[case::an_unavailable_non_critical_service_beside_agreeing_ones(
+        vec![
+            vote(ServiceGeoSource::Google, seen("FI")),
+            vote(ServiceGeoSource::Apple, unreachable("timed out")),
+        ],
+        Severity::Warn
     )]
     fn service_votes_against_the_ordered_country_set_the_severity(
         #[case] sut: Vec<ServiceCountryVote>,
@@ -483,34 +635,34 @@ mod tests {
 
     #[rstest::rstest]
     #[case::an_edge_landing_in_russia(
-        vec![at(CdnEdge::Cloudflare, edge("RU")), at(CdnEdge::YoutubeGgc, edge("FI"))],
+        vec![at(CdnEdge::Cloudflare, seen("RU")), at(CdnEdge::YoutubeGgc, seen("FI"))],
         Severity::Fail
     )]
     #[case::edges_outside_russia_whatever_the_country(
         vec![
-            at(CdnEdge::Cloudflare, edge("SE")),
-            at(CdnEdge::YoutubeGgc, EdgeObservation::Silent),
+            at(CdnEdge::Cloudflare, seen("SE")),
+            at(CdnEdge::YoutubeGgc, CountryObservation::Silent),
         ],
         Severity::Ok
     )]
     #[case::no_edge_answered(
         vec![
-            at(CdnEdge::Cloudflare, EdgeObservation::Silent),
-            at(CdnEdge::YoutubeGgc, EdgeObservation::Silent),
+            at(CdnEdge::Cloudflare, CountryObservation::Silent),
+            at(CdnEdge::YoutubeGgc, CountryObservation::Silent),
         ],
         Severity::Error
     )]
     // The unreachable edge may be the Russian one, so the gate cannot pass.
     #[case::an_unreachable_edge_beside_foreign_ones(
         vec![
-            at(CdnEdge::Cloudflare, edge("SE")),
+            at(CdnEdge::Cloudflare, seen("SE")),
             at(CdnEdge::YoutubeGgc, unreachable("timed out")),
         ],
         Severity::Error
     )]
     #[case::a_russian_edge_beside_an_unreachable_one(
         vec![
-            at(CdnEdge::Cloudflare, edge("RU")),
+            at(CdnEdge::Cloudflare, seen("RU")),
             at(CdnEdge::YoutubeGgc, unreachable("timed out")),
         ],
         Severity::Fail

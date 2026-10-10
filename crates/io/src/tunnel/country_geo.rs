@@ -2,13 +2,14 @@ use std::time::Duration;
 
 use chip_core::model::{
     CaptchaObservation, CaptchaRetry, CdnEdge, CdnEdgeVote, CountryCode,
-    EdgeObservation, ServiceCountryVote, ServiceGeoSource,
+    CountryObservation, ServiceCountryVote, ServiceGeoSource,
 };
 use chip_core::verdict::service_geo::{
     airport_country, classify_search_captcha,
 };
 use regex::regex;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use super::client::{TunnelClient, TunnelError, TunnelResponse};
 use super::{BROWSER_EN_HEADERS, BROWSER_HEADERS};
@@ -39,10 +40,6 @@ struct FastLocation {
 }
 
 impl FastResponse {
-    fn parse(body: &str) -> Option<Self> {
-        serde_json::from_str(body).ok()
-    }
-
     fn client_country(&self) -> Option<CountryCode> {
         country(&self.client.as_ref()?.location.country)
     }
@@ -53,21 +50,28 @@ impl FastResponse {
 }
 
 /// The `TikTok` web cookie-privacy config; its region is the country `TikTok`
-/// places the client in.
+/// places the client in. Every level is optional: a JSON answer without the
+/// region is an answer without a country, not a broken one.
 #[derive(Deserialize)]
 struct TiktokConfig {
-    body: TiktokConfigBody,
+    body: Option<TiktokConfigBody>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TiktokConfigBody {
-    app_props: TiktokAppProps,
+    app_props: Option<TiktokAppProps>,
 }
 
 #[derive(Deserialize)]
 struct TiktokAppProps {
-    region: String,
+    region: Option<String>,
+}
+
+impl TiktokConfig {
+    fn country(&self) -> Option<CountryCode> {
+        country(self.body.as_ref()?.app_props.as_ref()?.region.as_ref()?)
+    }
 }
 
 fn google_country(body: &str) -> Option<CountryCode> {
@@ -109,56 +113,74 @@ fn bing_country(body: &str) -> Option<CountryCode> {
     (value != "WW").then(|| country(value)).flatten()
 }
 
-fn netflix_country(body: &str) -> Option<CountryCode> {
-    FastResponse::parse(body)?.client_country()
+type Fetched = Result<TunnelResponse, TunnelError>;
+
+/// The body of a response that arrived with a success status, or the cause
+/// of the missing answer: the transport error or the HTTP error status. A
+/// 403 or 5xx page is not the service's answer, whatever text it holds.
+fn answered_body(response: &Fetched) -> Result<&str, String> {
+    match response {
+        Ok(response) if response.status.is_success() => Ok(&response.body),
+        Ok(response) => Err(format!("HTTP {}", response.status)),
+        Err(error) => Err(describe_error(error)),
+    }
 }
 
-fn tiktok_country(body: &str) -> Option<CountryCode> {
-    let config: TiktokConfig = serde_json::from_str(body).ok()?;
-    country(&config.body.app_props.region)
+/// The country a page or plain-text answer names.
+fn observation(
+    response: &Fetched,
+    locate: fn(&str) -> Option<CountryCode>,
+) -> CountryObservation {
+    match answered_body(response) {
+        Ok(body) => locate(body)
+            .map_or(CountryObservation::Silent, CountryObservation::Country),
+        Err(cause) => CountryObservation::Unavailable(cause),
+    }
 }
 
-/// A service that cannot be reached casts no country vote; the cause goes to
-/// the log, since the vote has no place for it.
-async fn response(client: &TunnelClient, url: &str) -> Option<TunnelResponse> {
-    client
-        .get(url, &BROWSER_HEADERS)
-        .await
-        .inspect_err(|error| {
-            tracing::debug!(
-                url,
-                error = %describe_error(error),
-                "country vote source unreachable"
-            );
-        })
-        .ok()
+/// The country a JSON answer names. A body that is not JSON of the expected
+/// shape, such as an HTML error page served with 200, is no answer: the
+/// source is unavailable with the parse error as the cause.
+fn json_observation<T: DeserializeOwned>(
+    response: &Fetched,
+    locate: fn(&T) -> Option<CountryCode>,
+) -> CountryObservation {
+    let parsed = answered_body(response).and_then(|body| {
+        serde_json::from_str::<T>(body)
+            .map_err(|error| format!("unreadable JSON: {error}"))
+    });
+    match parsed {
+        Ok(answer) => locate(&answer)
+            .map_or(CountryObservation::Silent, CountryObservation::Country),
+        Err(cause) => CountryObservation::Unavailable(cause),
+    }
 }
 
 struct CountryResponses {
-    google: Option<TunnelResponse>,
-    youtube: Option<TunnelResponse>,
-    apple: Option<TunnelResponse>,
-    spotify: Option<TunnelResponse>,
-    /// Kept with its error: the CDN-edge gate reads the same response and
-    /// must tell an unreachable edge from a silent one.
-    netflix: Result<TunnelResponse, TunnelError>,
-    tiktok: Option<TunnelResponse>,
-    bing: Option<TunnelResponse>,
+    google: Fetched,
+    youtube: Fetched,
+    apple: Fetched,
+    spotify: Fetched,
+    /// The CDN-edge gate reads the same response for the Netflix OCA edge.
+    netflix: Fetched,
+    tiktok: Fetched,
+    bing: Fetched,
 }
 
 impl CountryResponses {
     async fn fetch(client: &TunnelClient) -> Self {
         let (google, youtube, apple, spotify, netflix, tiktok, bing) = tokio::join!(
-            response(client, "https://www.google.com"),
-            response(client, "https://www.youtube.com"),
-            response(client, "https://gspe1-ssl.ls.apple.com/pep/gcc"),
-            response(client, "https://accounts.spotify.com/status"),
+            client.get("https://www.google.com", &BROWSER_HEADERS),
+            client.get("https://www.youtube.com", &BROWSER_HEADERS),
+            client
+                .get("https://gspe1-ssl.ls.apple.com/pep/gcc", &BROWSER_HEADERS),
+            client.get("https://accounts.spotify.com/status", &BROWSER_HEADERS),
             client.get(FAST_API_URL, &BROWSER_HEADERS),
-            response(
-                client,
-                "https://www.tiktok.com/api/v1/web-cookie-privacy/config?appId=1988"
+            client.get(
+                "https://www.tiktok.com/api/v1/web-cookie-privacy/config?appId=1988",
+                &BROWSER_HEADERS
             ),
-            response(client, "https://www.bing.com/search?q=cats")
+            client.get("https://www.bing.com/search?q=cats", &BROWSER_HEADERS)
         );
         Self {
             google,
@@ -171,55 +193,44 @@ impl CountryResponses {
         }
     }
 
+    /// One vote per service. `YouTube` votes only with its own page: a page
+    /// without a country is a silent vote, not Google's country again.
     fn votes(&self) -> Vec<ServiceCountryVote> {
-        let google = self
-            .google
-            .as_ref()
-            .and_then(|item| google_country(&item.body));
-        let youtube = self
-            .youtube
-            .as_ref()
-            .and_then(|item| youtube_country(&item.body))
-            .or(google);
         vec![
-            vote(ServiceGeoSource::Google, google),
-            vote(ServiceGeoSource::Youtube, youtube),
             vote(
-                ServiceGeoSource::Apple,
-                self.apple.as_ref().and_then(|item| country(&item.body)),
+                ServiceGeoSource::Google,
+                observation(&self.google, google_country),
             ),
             vote(
+                ServiceGeoSource::Youtube,
+                observation(&self.youtube, youtube_country),
+            ),
+            vote(ServiceGeoSource::Apple, observation(&self.apple, country)),
+            vote(
                 ServiceGeoSource::Spotify,
-                self.spotify
-                    .as_ref()
-                    .and_then(|item| spotify_country(&item.body)),
+                observation(&self.spotify, spotify_country),
             ),
             vote(
                 ServiceGeoSource::Netflix,
-                self.netflix
-                    .as_ref()
-                    .ok()
-                    .and_then(|item| netflix_country(&item.body)),
+                json_observation(&self.netflix, FastResponse::client_country),
             ),
             vote(
                 ServiceGeoSource::Tiktok,
-                self.tiktok
-                    .as_ref()
-                    .and_then(|item| tiktok_country(&item.body)),
+                json_observation(&self.tiktok, TiktokConfig::country),
             ),
-            vote(
-                ServiceGeoSource::Bing,
-                self.bing.as_ref().and_then(|item| bing_country(&item.body)),
-            ),
+            vote(ServiceGeoSource::Bing, observation(&self.bing, bing_country)),
         ]
     }
 }
 
 const fn vote(
     source: ServiceGeoSource,
-    country: Option<CountryCode>,
+    observation: CountryObservation,
 ) -> ServiceCountryVote {
-    ServiceCountryVote { source, country }
+    ServiceCountryVote {
+        source,
+        observation,
+    }
 }
 
 /// Service country votes and CDN edges, read from one set of requests.
@@ -246,17 +257,17 @@ pub async fn probe_service_geo(
     let edges = vec![
         CdnEdgeVote {
             edge: CdnEdge::Cloudflare,
-            observation: edge_observation(&cloudflare, cloudflare_country),
+            observation: observation(&cloudflare, cloudflare_country),
         },
         CdnEdgeVote {
             edge: CdnEdge::YoutubeGgc,
-            observation: edge_observation(&youtube, ggc_country),
+            observation: observation(&youtube, ggc_country),
         },
         CdnEdgeVote {
             edge: CdnEdge::NetflixOca,
-            observation: edge_observation(
+            observation: json_observation(
                 &countries.netflix,
-                netflix_oca_country,
+                FastResponse::first_target_country,
             ),
         },
     ];
@@ -323,27 +334,12 @@ fn ggc_iata(body: &str) -> Option<String> {
     })
 }
 
-fn edge_observation(
-    response: &Result<TunnelResponse, TunnelError>,
-    locate: fn(&str) -> Option<CountryCode>,
-) -> EdgeObservation {
-    match response {
-        Ok(response) => locate(&response.body)
-            .map_or(EdgeObservation::Silent, EdgeObservation::Country),
-        Err(error) => EdgeObservation::Unavailable(describe_error(error)),
-    }
-}
-
 fn cloudflare_country(body: &str) -> Option<CountryCode> {
     value_from_lines(body, "colo").and_then(|code| airport_country(&code))
 }
 
 fn ggc_country(body: &str) -> Option<CountryCode> {
     ggc_iata(body).and_then(|code| airport_country(&code))
-}
-
-fn netflix_oca_country(body: &str) -> Option<CountryCode> {
-    FastResponse::parse(body)?.first_target_country()
 }
 
 #[cfg(test)]
@@ -356,6 +352,18 @@ mod tests {
 
     fn cc(code: &str) -> CountryCode {
         code.parse().unwrap()
+    }
+
+    fn answered(status: StatusCode, body: &str) -> TunnelResponse {
+        TunnelResponse {
+            status,
+            final_url: "https://example.test/".parse().unwrap(),
+            body: body.to_string(),
+        }
+    }
+
+    fn page(body: &str) -> TunnelResponse {
+        answered(StatusCode::OK, body)
     }
 
     #[rstest::rstest]
@@ -391,9 +399,10 @@ mod tests {
             "targets": [{"location": {"city": "Riga", "country": "LV"}}]
         }"#;
 
-        let sut = netflix_country(body);
+        let sut =
+            json_observation(&Ok(page(body)), FastResponse::client_country);
 
-        assert_eq!(sut, Some(cc("FI")));
+        assert_eq!(sut, CountryObservation::Country(cc("FI")));
     }
 
     #[test]
@@ -406,27 +415,114 @@ mod tests {
             ]
         }"#;
 
-        let sut = netflix_oca_country(body);
+        let sut = json_observation(
+            &Ok(page(body)),
+            FastResponse::first_target_country,
+        );
 
-        assert_eq!(sut, Some(cc("LV")));
+        assert_eq!(sut, CountryObservation::Country(cc("LV")));
     }
 
     #[test]
     fn fast_com_without_targets_names_no_oca_edge() {
         let body = r#"{"client": {"location": {"country": "FI"}}}"#;
 
-        let sut = netflix_oca_country(body);
+        let sut = json_observation(
+            &Ok(page(body)),
+            FastResponse::first_target_country,
+        );
 
-        assert_eq!(sut, None);
+        assert_eq!(sut, CountryObservation::Silent);
     }
 
     #[test]
     fn tiktok_votes_for_the_region_of_its_app_props() {
         let body = r#"{"body": {"appProps": {"region": "NL", "lang": "en"}}}"#;
 
-        let sut = tiktok_country(body);
+        let sut = json_observation(&Ok(page(body)), TiktokConfig::country);
 
-        assert_eq!(sut, Some(cc("NL")));
+        assert_eq!(sut, CountryObservation::Country(cc("NL")));
+    }
+
+    #[test]
+    fn tiktok_json_without_a_region_is_an_answer_without_a_country() {
+        let body = r#"{"body": {"appProps": {"lang": "en"}}}"#;
+
+        let sut = json_observation(&Ok(page(body)), TiktokConfig::country);
+
+        assert_eq!(sut, CountryObservation::Silent);
+    }
+
+    // The 403 page still carries a locale; it is not the service's answer.
+    #[rstest::rstest]
+    #[case::forbidden(StatusCode::FORBIDDEN, "HTTP 403 Forbidden")]
+    #[case::server_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "HTTP 503 Service Unavailable"
+    )]
+    fn a_service_answering_with_an_error_status_is_unavailable(
+        #[case] status: StatusCode,
+        #[case] expected: &str,
+    ) {
+        let response = Ok(answered(status, r#"<html lang="en_FI">"#));
+
+        let sut = observation(&response, google_country);
+
+        assert_eq!(sut, CountryObservation::Unavailable(expected.to_string()));
+    }
+
+    #[test]
+    fn a_json_source_answering_with_an_error_status_is_unavailable() {
+        let response = Ok(answered(StatusCode::FORBIDDEN, "{}"));
+
+        let sut = json_observation(&response, FastResponse::client_country);
+
+        assert_eq!(
+            sut,
+            CountryObservation::Unavailable("HTTP 403 Forbidden".to_string())
+        );
+    }
+
+    #[test]
+    fn an_html_page_instead_of_fast_com_json_is_unavailable_with_the_cause() {
+        let response = Ok(page("<html><body>Access denied</body></html>"));
+
+        let sut =
+            json_observation(&response, FastResponse::first_target_country);
+
+        assert_eq!(
+            sut,
+            CountryObservation::Unavailable(
+                "unreadable JSON: expected value at line 1 column 1"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn youtube_without_a_country_votes_silent_instead_of_repeating_google() {
+        let sut = CountryResponses {
+            google: Ok(page(r#"x "en_FI" y"#)),
+            youtube: Ok(page("<html>consent page</html>")),
+            apple: Ok(page("FI")),
+            spotify: Ok(page(r#"{"geoLocationCountryCode":"FI"}"#)),
+            netflix: Ok(page(r#"{"client": {"location": {"country": "FI"}}}"#)),
+            tiktok: Ok(page(r#"{"body": {"appProps": {"region": "FI"}}}"#)),
+            bing: Ok(page(r#"Region: "FI""#)),
+        };
+
+        let votes = sut.votes();
+
+        assert_eq!(
+            votes[..2],
+            [
+                vote(
+                    ServiceGeoSource::Google,
+                    CountryObservation::Country(cc("FI"))
+                ),
+                vote(ServiceGeoSource::Youtube, CountryObservation::Silent),
+            ]
+        );
     }
 
     #[test]
@@ -473,9 +569,9 @@ mod tests {
         let client = TunnelClient::from_client(reqwest::Client::new());
         let response = client.get("http://127.0.0.1:1/", &[]).await;
 
-        let sut = edge_observation(&response, cloudflare_country);
+        let sut = observation(&response, cloudflare_country);
 
-        let EdgeObservation::Unavailable(cause) = sut else {
+        let CountryObservation::Unavailable(cause) = sut else {
             panic!("expected an unavailable edge, got {sut:?}");
         };
         assert!(
@@ -494,8 +590,8 @@ mod tests {
             body: "fl=1\nh=www.cloudflare.com\n".to_string(),
         });
 
-        let sut = edge_observation(&response, cloudflare_country);
+        let sut = observation(&response, cloudflare_country);
 
-        assert_eq!(sut, EdgeObservation::Silent);
+        assert_eq!(sut, CountryObservation::Silent);
     }
 }
