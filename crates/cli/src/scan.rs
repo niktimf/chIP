@@ -152,9 +152,11 @@ pub fn pick_free_port() -> std::io::Result<NonZeroU16> {
 ///
 /// The io error types keep their cause out of their own message, so
 /// `to_string()` would show only the top layer. Context for the operation is
-/// added with `anyhow::Context` before the call.
+/// added with `anyhow::Context` before the call, which is why the argument
+/// is anything that converts into `anyhow::Error`.
 fn error_detail(error: impl Into<anyhow::Error>) -> String {
-    format!("{:#}", error.into())
+    let error: anyhow::Error = error.into();
+    chip_io::describe_error(&*error)
 }
 
 fn error_verdict(error: impl Into<anyhow::Error>) -> Verdict {

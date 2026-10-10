@@ -118,6 +118,9 @@ fn an_unparsable_rust_log_is_reported_instead_of_silently_replaced() {
 
 /// A scan that never leaves the machine: every HTTP request goes to a proxy
 /// on a loopback port with no listener, and SSH and the /24 sweep are off.
+/// Every gate whose source is then unreachable is skipped, so the scan
+/// itself passes and an exit code of 2 can only come from writing the
+/// report.
 fn offline_scan() -> Command {
     let mut command = chip();
     for proxy in ["ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY"] {
@@ -140,8 +143,21 @@ fn offline_scan() -> Command {
         "FI",
         "--no-ssh",
         "--no-neighbors",
+        "--skip-gate",
+        "blocklists,geo,globalping-quota,latency,provenance,reputation,\
+         reputation:operator,rkn-registry",
     ]);
     command
+}
+
+#[test]
+fn an_offline_scan_with_its_unreachable_gates_skipped_passes() {
+    let output = offline_scan().output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("OVERALL: OK"), "{stdout}");
 }
 
 #[test]
@@ -160,4 +176,5 @@ fn a_reader_closing_the_pipe_early_ends_the_scan_with_exit_two_not_a_panic() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!stderr.lines().any(|line| line.starts_with("error:")), "{stderr}");
 }

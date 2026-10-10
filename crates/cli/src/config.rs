@@ -556,14 +556,8 @@ pub enum CalibrationTargetError {
 /// clap prints only the `Display` of a value's parse error, not its source
 /// chain, so the parser hands clap the whole chain joined by ": ".
 fn parse_calibration_target(raw: &str) -> Result<CalibrationTarget, String> {
-    raw.parse::<CalibrationTarget>().map_err(|error| {
-        std::iter::successors(Some(&error as &dyn std::error::Error), |cause| {
-            cause.source()
-        })
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(": ")
-    })
+    raw.parse::<CalibrationTarget>()
+        .map_err(|error| chip_io::describe_error(&error))
 }
 
 impl FromStr for CalibrationTarget {

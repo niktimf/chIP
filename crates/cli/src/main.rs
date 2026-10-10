@@ -2,7 +2,6 @@ mod calibrate;
 mod config;
 mod scan;
 
-use std::error::Error;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -11,7 +10,6 @@ use std::time::Duration;
 use chip_core::{CheckResult, Report, ScanOutcome};
 use clap::Parser as _;
 use config::{Cli, Command};
-use itertools::Itertools as _;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt as _;
 use tracing_subscriber::EnvFilter;
@@ -40,12 +38,10 @@ async fn main() -> ExitCode {
             2
         }
         Err(error) => {
-            let chain = std::iter::successors(
-                Some(&error as &(dyn Error + 'static)),
-                |&error| error.source(),
-            )
-            .join(": ");
-            print_error(format_args!("error: {chain}"));
+            print_error(format_args!(
+                "error: {}",
+                chip_io::describe_error(&error)
+            ));
             2
         }
     };
