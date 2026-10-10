@@ -81,7 +81,9 @@ mod tests {
     fn four_blocked_neighbors_are_ok() {
         let sut = facts(RknListing::NotListed, 4);
 
-        assert_eq!(judge_rkn_registry(&sut).severity, Severity::Ok);
+        let verdict = judge_rkn_registry(&sut);
+
+        assert_eq!(verdict.severity, Severity::Ok, "{}", verdict.detail);
     }
 
     #[test]
@@ -108,7 +110,9 @@ mod tests {
     fn neighbors_never_raise_a_failure_on_their_own() {
         let sut = facts(RknListing::NotListed, 255);
 
-        assert_eq!(judge_rkn_registry(&sut).severity, Severity::Warn);
+        let verdict = judge_rkn_registry(&sut);
+
+        assert_eq!(verdict.severity, Severity::Warn, "{}", verdict.detail);
     }
 
     #[test]

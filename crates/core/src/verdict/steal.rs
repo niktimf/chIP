@@ -1,24 +1,9 @@
-use std::num::NonZeroU64;
 use std::time::Duration;
 
 use crate::Verdict;
-use crate::model::{Percent, ProcStatSnapshot};
+use crate::model::Percent;
 
 const WARN_STEAL_PCT: f64 = 5.0;
-
-/// Share of elapsed CPU ticks the kernel itself attributes to steal time
-/// (`/proc/stat` field 8) over the interval between two snapshots. No
-/// elapsed ticks means no steal.
-pub fn steal_share(
-    before: &ProcStatSnapshot,
-    after: &ProcStatSnapshot,
-) -> Percent {
-    let total_delta = after.total_ticks().saturating_sub(before.total_ticks());
-    let steal_delta = after.steal_ticks().saturating_sub(before.steal_ticks());
-    NonZeroU64::new(total_delta).map_or(Percent::ZERO, |total| {
-        Percent::saturating_ratio(steal_delta, total)
-    })
-}
 
 /// Judges the steal share measured between two snapshots taken `interval`
 /// apart.
@@ -37,7 +22,7 @@ pub fn judge_steal(share: Percent, interval: Duration) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Severity;
+    use crate::model::{ProcStatSnapshot, Severity};
     use pretty_assertions::assert_eq;
 
     fn sample_interval() -> Duration {
@@ -68,7 +53,7 @@ mod tests {
     ) {
         let (before, after) = sut;
 
-        let actual = steal_share(&before, &after);
+        let actual = after.steal_share_since(before);
 
         assert_eq!(actual, Percent::try_from(expected).unwrap());
     }

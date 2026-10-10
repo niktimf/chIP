@@ -1,49 +1,73 @@
 use crate::Verdict;
 use crate::model::ServiceState;
+use crate::verdict::services::is_cloudflare_challenge;
 use http::StatusCode;
 
-/// Reachability probes hit a models-list or similar authenticated endpoint,
-/// so a 401/403 with no region marker means "reachable, just unauthenticated"
+/// An AI API whose reachability the `ai:*` gates probe. The variant carries
+/// what the answer means; the shell keeps the URL and headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiProvider {
+    OpenAi,
+    Anthropic,
+    Gemini,
+    DeepSeek,
+}
+
+impl AiProvider {
+    /// Body markers of this API's region refusal.
+    const fn region_markers(self) -> &'static [&'static str] {
+        match self {
+            Self::OpenAi => &[
+                "unsupported_country_region_territory",
+                "country, region, or territory not supported",
+            ],
+            Self::Anthropic => &["request not allowed", "unsupported_country"],
+            Self::Gemini | Self::DeepSeek => &[],
+        }
+    }
+
+    /// Statuses that mean "reachable, just unauthenticated" for this API.
+    const fn auth_statuses(self) -> &'static [StatusCode] {
+        match self {
+            Self::OpenAi | Self::Anthropic | Self::DeepSeek => {
+                &[StatusCode::UNAUTHORIZED]
+            }
+            // This API refuses an anonymous caller with 403, not only 401.
+            Self::Gemini => &[StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN],
+        }
+    }
+}
+
+/// Classifies the answer of one AI API's models-list endpoint.
 ///
-/// — the opposite of `verdict::services`, where 403 needs a region page to
-/// count as a refusal at all. AI endpoints answer a plain unsupported-region
-/// error even to anonymous requests, so no such page is required here.
+/// Reachability probes hit a models-list or similar authenticated endpoint,
+/// so a 401/403 with no region marker means "reachable, just
+/// unauthenticated" — the opposite of `verdict::services`, where 403 needs a
+/// region page to count as a refusal at all. AI endpoints answer a plain
+/// unsupported-region error even to anonymous requests, so no such page is
+/// required here.
 pub fn classify_ai_endpoint(
+    provider: AiProvider,
     status: StatusCode,
     body: &str,
-    region_markers: &[&str],
-    auth_statuses: &[StatusCode],
 ) -> ServiceState {
     let lower = body.to_lowercase();
-    if [
-        StatusCode::FORBIDDEN,
-        StatusCode::TOO_MANY_REQUESTS,
-        StatusCode::SERVICE_UNAVAILABLE,
-    ]
-    .contains(&status)
-        && [
-            "cf_chl_opt",
-            "_cf_chl",
-            "just a moment",
-            "cf-browser-verification",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
-    {
-        return ServiceState::Error(
+    if is_cloudflare_challenge(status, &lower) {
+        return ServiceState::Inconclusive(
             "challenged before reaching the API".into(),
         );
     }
-    if region_markers
+    if provider
+        .region_markers()
         .iter()
-        .any(|m| lower.contains(&m.to_lowercase()))
+        .any(|marker| lower.contains(marker))
     {
         return ServiceState::Blocked;
     }
-    if auth_statuses.contains(&status) || status.is_success() {
+    if provider.auth_statuses().contains(&status) || status.is_success() {
         ServiceState::Available
     } else {
-        ServiceState::Error(format!("unexpected HTTP {status}"))
+        ServiceState::Inconclusive(format!("unexpected HTTP {status}"))
     }
 }
 
@@ -54,7 +78,7 @@ pub fn judge_ai_endpoint(state: &ServiceState) -> Verdict {
         ServiceState::Available => Verdict::ok("reachable"),
         ServiceState::Restricted => Verdict::warn("restricted"),
         ServiceState::Blocked => Verdict::warn("region-refused"),
-        ServiceState::Error(reason) => {
+        ServiceState::Inconclusive(reason) => {
             Verdict::warn(format!("could not be judged: {reason}"))
         }
         ServiceState::Unavailable(reason) => {
@@ -68,39 +92,66 @@ mod tests {
     use super::*;
     use crate::model::{ServiceState, Severity};
 
-    const MARKERS: &[&str] =
-        &["is not available in your", "unsupported_country"];
-    const AUTH_STATUSES: &[StatusCode] = &[StatusCode::UNAUTHORIZED];
-
     #[test]
     fn an_unrecognized_api_response_cannot_be_classified() {
         let state = classify_ai_endpoint(
+            AiProvider::OpenAi,
             StatusCode::INTERNAL_SERVER_ERROR,
             "server error",
-            MARKERS,
-            AUTH_STATUSES,
         );
 
-        assert!(matches!(state, ServiceState::Error(_)), "{state:?}");
+        assert_eq!(
+            state,
+            ServiceState::Inconclusive(
+                "unexpected HTTP 500 Internal Server Error".into()
+            )
+        );
     }
 
     #[rstest::rstest]
-    #[case::region_marker_blocks(
+    #[case::openai_region_marker_blocks(
+        AiProvider::OpenAi,
         StatusCode::FORBIDDEN,
-        "This API is not available in your region",
+        "{\"code\": \"unsupported_country_region_territory\"}",
+        ServiceState::Blocked
+    )]
+    #[case::anthropic_region_marker_in_any_case_blocks(
+        AiProvider::Anthropic,
+        StatusCode::FORBIDDEN,
+        "Request not allowed",
         ServiceState::Blocked
     )]
     #[case::auth_error_is_a_normal_success(
+        AiProvider::OpenAi,
         StatusCode::UNAUTHORIZED,
         "invalid api key",
         ServiceState::Available
     )]
-    fn an_endpoint_is_classified_by_status_and_body(
+    #[case::gemini_answers_an_anonymous_caller_with_403(
+        AiProvider::Gemini,
+        StatusCode::FORBIDDEN,
+        "method doesn't allow unregistered callers",
+        ServiceState::Available
+    )]
+    #[case::a_403_from_another_api_is_not_an_auth_error(
+        AiProvider::DeepSeek,
+        StatusCode::FORBIDDEN,
+        "forbidden",
+        ServiceState::Inconclusive("unexpected HTTP 403 Forbidden".into())
+    )]
+    #[case::a_cloudflare_challenge_is_inconclusive(
+        AiProvider::Gemini,
+        StatusCode::FORBIDDEN,
+        "Checking your browser before accessing",
+        ServiceState::Inconclusive("challenged before reaching the API".into())
+    )]
+    fn an_endpoint_is_classified_by_provider_status_and_body(
+        #[case] provider: AiProvider,
         #[case] status: StatusCode,
         #[case] sut: &str,
         #[case] expected: ServiceState,
     ) {
-        let actual = classify_ai_endpoint(status, sut, MARKERS, AUTH_STATUSES);
+        let actual = classify_ai_endpoint(provider, status, sut);
 
         assert_eq!(actual, expected);
     }
@@ -112,7 +163,7 @@ mod tests {
         Severity::Warn
     )]
     #[case::an_unclassified_response_only_warns(
-        ServiceState::Error("unexpected HTTP 500".into()),
+        ServiceState::Inconclusive("unexpected HTTP 500".into()),
         Severity::Warn
     )]
     #[case::unreachable_is_an_error(

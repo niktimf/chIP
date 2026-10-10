@@ -8,8 +8,7 @@ use std::net::Ipv4Addr;
 use ipnet::Ipv4Net;
 
 use crate::model::{
-    BlockListFacts, BlockListStatus, InvalidRknRegistryFacts, RknListing,
-    RknRegistryFacts,
+    BlockListFacts, BlockListStatus, RknListing, RknRegistryFacts,
 };
 
 /// A real list always has entries, so an empty one is a corrupted download,
@@ -60,13 +59,10 @@ impl AddressList {
         self.0.contains(&ip)
     }
 
-    /// Listed addresses in the network `netmask` cuts around `ip`, not
-    /// counting `ip` itself.
-    fn neighbors(&self, ip: Ipv4Addr, netmask: u32) -> usize {
-        let first = u32::from(ip) & netmask;
-        let last = first | !netmask;
+    /// Listed addresses in `network`, not counting `ip` itself.
+    fn neighbors(&self, network: Ipv4Net, ip: Ipv4Addr) -> usize {
         self.0
-            .range(Ipv4Addr::from(first)..=Ipv4Addr::from(last))
+            .range(network.network()..=network.broadcast())
             .filter(|&&address| address != ip)
             .count()
     }
@@ -109,9 +105,6 @@ impl BlockLists {
     }
 }
 
-const NETMASK_24: u32 = 0xffff_ff00;
-const NETMASK_16: u32 = 0xffff_0000;
-
 /// The RKN registry export: addresses blocked one by one and networks
 /// blocked as a whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,33 +113,24 @@ pub struct RknRegistry {
     subnets: NetworkList,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum RknCheckError {
-    /// A `/24` holds 255 addresses besides the candidate and a `/16` 65 535,
-    /// so a larger count means the lookup itself is broken.
-    #[error("counted {count} listed neighbors in a /{prefix_len}")]
-    NeighborCount {
-        prefix_len: u8,
-        count: usize,
-        source: std::num::TryFromIntError,
-    },
-    #[error(transparent)]
-    Facts(#[from] InvalidRknRegistryFacts),
-}
-
 impl RknRegistry {
     pub const fn new(addresses: AddressList, subnets: NetworkList) -> Self {
         Self { addresses, subnets }
     }
 
-    /// # Errors
+    /// Looks `ip` up in the registry and counts its listed neighbors.
     ///
-    /// Returns `RknCheckError` when a neighbor count does not fit its prefix
-    /// or the counts contradict each other; both mean the lookup is broken.
-    pub fn check(
-        &self,
-        ip: Ipv4Addr,
-    ) -> Result<RknRegistryFacts, RknCheckError> {
+    /// # Panics
+    ///
+    /// Only on a broken invariant: a `/24` holds 255 addresses besides `ip`,
+    /// a `/16` 65 535, and the `/24` lies inside the `/16`.
+    #[expect(
+        clippy::expect_used,
+        reason = "a /24 holds 255 addresses besides the candidate and a /16 \
+                  65 535, so the counts fit u8 and u16; the /24 lies inside \
+                  the /16, so it never counts more"
+    )]
+    pub fn check(&self, ip: Ipv4Addr) -> RknRegistryFacts {
         let listing = if self.addresses.contains(ip) {
             RknListing::Address
         } else {
@@ -154,23 +138,15 @@ impl RknRegistry {
                 .containing(ip)
                 .map_or(RknListing::NotListed, RknListing::Subnet)
         };
-        let in_24 = self.addresses.neighbors(ip, NETMASK_24);
-        let in_16 = self.addresses.neighbors(ip, NETMASK_16);
-        let neighbors_24 = u8::try_from(in_24).map_err(|source| {
-            RknCheckError::NeighborCount {
-                prefix_len: 24,
-                count: in_24,
-                source,
-            }
-        })?;
-        let neighbors_16 = u16::try_from(in_16).map_err(|source| {
-            RknCheckError::NeighborCount {
-                prefix_len: 16,
-                count: in_16,
-                source,
-            }
-        })?;
-        Ok(RknRegistryFacts::new(listing, neighbors_24, neighbors_16)?)
+        let around = |prefix_len| Ipv4Net::new_assert(ip, prefix_len).trunc();
+        let neighbors_24 =
+            u8::try_from(self.addresses.neighbors(around(24), ip))
+                .expect("a /24 has at most 255 neighbors");
+        let neighbors_16 =
+            u16::try_from(self.addresses.neighbors(around(16), ip))
+                .expect("a /16 has at most 65 535 neighbors");
+        RknRegistryFacts::new(listing, neighbors_24, neighbors_16)
+            .expect("the /24 lies inside its /16")
     }
 }
 
@@ -269,7 +245,7 @@ mod tests {
     fn a_listed_address_is_not_its_own_neighbor() {
         let sut = registry();
 
-        let facts = sut.check(Ipv4Addr::new(203, 0, 113, 7)).unwrap();
+        let facts = sut.check(Ipv4Addr::new(203, 0, 113, 7));
 
         assert_eq!(facts.listing(), RknListing::Address);
         assert_eq!(facts.neighbors_24(), 4);
@@ -279,7 +255,7 @@ mod tests {
     fn an_address_inside_a_blocked_subnet_names_that_subnet() {
         let sut = registry();
 
-        let facts = sut.check(Ipv4Addr::new(198, 51, 100, 42)).unwrap();
+        let facts = sut.check(Ipv4Addr::new(198, 51, 100, 42));
 
         assert_eq!(
             facts.listing(),
@@ -291,7 +267,7 @@ mod tests {
     fn neighbors_are_counted_within_the_24_and_the_16() {
         let sut = registry();
 
-        let facts = sut.check(Ipv4Addr::new(203, 0, 113, 200)).unwrap();
+        let facts = sut.check(Ipv4Addr::new(203, 0, 113, 200));
 
         assert_eq!(facts.listing(), RknListing::NotListed);
         assert_eq!(facts.neighbors_24(), 5);

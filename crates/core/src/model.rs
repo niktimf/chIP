@@ -453,9 +453,10 @@ pub struct ProbeAlignmentError {
 }
 
 /// One anchor's round-trip series against the same probe set as the
-/// candidate. `None` at index `i` means this anchor did not answer probe
+/// candidate.
 ///
-/// `i` (its own measurement failed or timed out) — not that it was slow.
+/// `None` at index `i` means this anchor did not answer probe `i` (its own
+/// measurement failed or timed out), not that it was slow.
 #[derive(Debug, Clone)]
 pub struct AnchorSeries {
     anchor_id: String,
@@ -483,10 +484,10 @@ impl AnchorSeries {
 }
 
 /// Ping (or, when ICMP is closed, TCP-handshake) round-trip data for the
-/// candidate and the anchors of its declared city, all measured by the same
+/// candidate and the anchors of its declared city.
 ///
-/// Globalping probe set so index `i` means the same physical probe
-/// everywhere in this struct.
+/// All series are measured by the same Globalping probe set, so index `i`
+/// means the same physical probe everywhere in this struct.
 #[derive(Debug, Clone)]
 pub struct PingSweepFacts {
     candidate: Vec<Option<PingSample>>,
@@ -740,7 +741,7 @@ pub enum ServiceState {
     Blocked,
     /// The probe reached no conclusion (Cloudflare challenge, unrecognized
     /// body) — never read as evidence of either verdict.
-    Error(String),
+    Inconclusive(String),
     /// The endpoint could not be reached or read. This is an ERROR gate, not
     /// a weak service verdict.
     Unavailable(String),
@@ -890,7 +891,7 @@ pub struct InvalidRoutingFacts {
     total: u32,
 }
 
-/// `/proc/stat`'s first `cpu ` line, reduced to what `steal_pct` needs: the
+/// `/proc/stat`'s first `cpu ` line, reduced to what the steal share needs: the
 /// kernel's own steal-time counter (field 8) and the sum of all ten fields.
 ///
 /// Both are monotonically increasing tick counts since boot.
@@ -927,6 +928,16 @@ impl ProcStatSnapshot {
 
     pub const fn total_ticks(self) -> u64 {
         self.total_ticks
+    }
+
+    /// Share of the CPU ticks elapsed since `earlier` that the kernel itself
+    /// attributes to steal time. No elapsed ticks means no steal.
+    pub fn steal_share_since(self, earlier: Self) -> Percent {
+        let total_delta = self.total_ticks.saturating_sub(earlier.total_ticks);
+        let steal_delta = self.steal_ticks.saturating_sub(earlier.steal_ticks);
+        NonZeroU64::new(total_delta).map_or(Percent::ZERO, |total| {
+            Percent::saturating_ratio(steal_delta, total)
+        })
     }
 }
 

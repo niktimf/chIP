@@ -233,22 +233,16 @@ pub fn summarize_latency(
         return Err(LatencySummaryError::NoUsableAnchors);
     }
 
-    let mut excess = Vec::new();
-    let mut loss_delta = Vec::new();
-    for (i, candidate) in facts.candidate().iter().enumerate() {
-        let Some(candidate) = candidate else {
-            continue;
-        };
-        let winner = kept
-            .iter()
-            .filter_map(|a| a.samples()[i])
-            .min_by_key(|sample| sample.rtt());
-        let Some(best) = winner else {
-            continue;
-        };
-        excess.push(millis(candidate.rtt()) - millis(best.rtt()));
-        loss_delta.push(loss_points(*candidate) - loss_points(best));
-    }
+    let (excess, loss_delta): (Vec<f64>, Vec<f64>) = facts
+        .candidate()
+        .iter()
+        .enumerate()
+        .filter_map(|(probe, candidate)| {
+            let delta =
+                ProbeDelta::against_best_anchor((*candidate)?, &kept, probe)?;
+            Some((delta.excess_ms, delta.loss_delta_pp))
+        })
+        .unzip();
 
     if excess.len() < MIN_VALID_PROBES {
         return Err(LatencySummaryError::TooFewValidProbes {
@@ -264,6 +258,32 @@ pub fn summarize_latency(
         median_loss_delta_pct: median(&loss_delta),
         valid_probes: excess.len(),
     })
+}
+
+/// How much one probe's candidate sample trails the best kept anchor on the
+/// same probe.
+struct ProbeDelta {
+    excess_ms: f64,
+    loss_delta_pp: f64,
+}
+
+impl ProbeDelta {
+    /// `None` when no kept anchor answered on `probe`: the candidate sample
+    /// then has nothing to be compared with.
+    fn against_best_anchor(
+        candidate: PingSample,
+        kept: &[&AnchorSeries],
+        probe: usize,
+    ) -> Option<Self> {
+        let best = kept
+            .iter()
+            .filter_map(|anchor| anchor.samples()[probe])
+            .min_by_key(|sample| sample.rtt())?;
+        Some(Self {
+            excess_ms: millis(candidate.rtt()) - millis(best.rtt()),
+            loss_delta_pp: loss_points(candidate) - loss_points(best),
+        })
+    }
 }
 
 /// A sample without a loss figure counts as lossless.
@@ -352,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn select_anchors_drops_one_whose_median_is_far_from_the_group() {
+    fn an_anchor_whose_median_is_far_from_the_group_is_dropped() {
         // Two normal anchors around 20ms, one clearly on a bad path at 200ms.
         let anchors = vec![
             anchor("a1", &[18.0, 22.0, 19.0]),
@@ -367,11 +387,14 @@ mod tests {
     }
 
     #[test]
-    fn select_anchors_keeps_everyone_when_all_are_close() {
+    fn every_anchor_close_to_the_group_is_kept() {
         let anchors =
             vec![anchor("a1", &[10.0, 11.0]), anchor("a2", &[12.0, 13.0])];
 
-        assert_eq!(select_anchors(&anchors).len(), 2);
+        let kept: Vec<&str> =
+            select_anchors(&anchors).iter().map(|a| a.id()).collect();
+
+        assert_eq!(kept, vec!["a1", "a2"]);
     }
 
     #[rstest::rstest]
@@ -414,8 +437,7 @@ mod tests {
     /// models it as a single already-winning anchor — sufficient to check
     /// the median/p75 arithmetic against the numbers the run reported:
     /// median excess 4.95ms, p75 8.96ms, well inside a 14ms threshold).
-    #[test]
-    fn judges_the_2026_09_15_fi1_helsinki_calibration_run_as_ok() {
+    fn fi1_helsinki_calibration_run() -> PingSweepFacts {
         let candidate = [
             23.378, 70.703, 71.999, 38.032, 6.521, 64.765, 50.927, 50.88,
             15.401, 22.39, 15.354, 21.822,
@@ -424,10 +446,15 @@ mod tests {
             14.12, 65.123, 64.007, 29.98, 7.003, 65.357, 34.615, 24.915,
             22.934, 18.065, 18.86, 19.305,
         ];
-        let sut = facts(
+        facts(
             samples(&candidate, 0.0),
             vec![anchor("helsinki-winner", &best_anchor)],
-        );
+        )
+    }
+
+    #[test]
+    fn judges_the_2026_09_15_fi1_helsinki_calibration_run_as_ok() {
+        let sut = fi1_helsinki_calibration_run();
 
         let verdict = judge_latency(&sut, &thresholds());
 
@@ -594,19 +621,8 @@ mod tests {
     /// `cli::calibrate` reads these raw numbers directly, so they
     /// need their own assertion independent of `judge_latency`'s wording.
     #[test]
-    fn summarize_latency_exposes_the_same_numbers_judge_latency_is_built_on() {
-        let candidate = [
-            23.378, 70.703, 71.999, 38.032, 6.521, 64.765, 50.927, 50.88,
-            15.401, 22.39, 15.354, 21.822,
-        ];
-        let best_anchor = [
-            14.12, 65.123, 64.007, 29.98, 7.003, 65.357, 34.615, 24.915,
-            22.934, 18.065, 18.86, 19.305,
-        ];
-        let sut = facts(
-            samples(&candidate, 0.0),
-            vec![anchor("winner", &best_anchor)],
-        );
+    fn the_calibration_run_summarizes_to_the_numbers_the_run_reported() {
+        let sut = fi1_helsinki_calibration_run();
 
         let summary = summarize_latency(&sut).unwrap();
 

@@ -12,48 +12,37 @@ fn is_unsafe_formatting(character: char) -> bool {
 }
 
 fn terminal_cell(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '\n' => escaped.push_str(r"\n"),
-            '\r' => escaped.push_str(r"\r"),
-            '\t' => escaped.push_str(r"\t"),
+    value
+        .chars()
+        .map(|character| match character {
+            '\n' => r"\n".to_owned(),
+            '\r' => r"\r".to_owned(),
+            '\t' => r"\t".to_owned(),
             control if is_unsafe_formatting(control) => {
-                escaped.extend(control.escape_unicode());
+                control.escape_unicode().to_string()
             }
-            safe => escaped.push(safe),
-        }
-    }
-    escaped
+            safe => safe.to_string(),
+        })
+        .collect()
 }
 
 fn markdown_cell(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    let mut characters = value.chars().peekable();
-    while let Some(character) = characters.next() {
-        match character {
-            '\r' => {
-                if characters.peek() == Some(&'\n') {
-                    characters.next();
-                }
-                escaped.push_str("<br>");
-            }
-            '\n' => escaped.push_str("<br>"),
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
+    value
+        .replace("\r\n", "\n")
+        .chars()
+        .map(|character| match character {
+            '\r' | '\n' => "<br>".to_owned(),
+            '&' => "&amp;".to_owned(),
+            '<' => "&lt;".to_owned(),
+            '>' => "&gt;".to_owned(),
             '\\' | '|' | '`' | '*' | '_' | '[' | ']' | '(' | ')' | '#'
-            | '!' | '~' => {
-                escaped.push('\\');
-                escaped.push(character);
-            }
+            | '!' | '~' => format!("\\{character}"),
             control if is_unsafe_formatting(control) => {
-                escaped.extend(control.escape_unicode());
+                control.escape_unicode().to_string()
             }
-            safe => escaped.push(safe),
-        }
-    }
-    escaped
+            safe => safe.to_string(),
+        })
+        .collect()
 }
 
 /// How a whole scan ended, the verdict a pipeline acts on.
@@ -243,21 +232,26 @@ mod tests {
     }
 
     #[test]
-    fn overall_is_the_most_severe_result_present() {
+    fn the_overall_severity_is_the_most_severe_result_present() {
         let sut = Report {
             results: vec![
                 cr(BLOCKLISTS, Verdict::ok("x")),
                 cr(GEO, Verdict::warn("y")),
             ],
         };
-        assert_eq!(sut.overall(), Severity::Warn);
+
+        let overall = sut.overall();
+
+        assert_eq!(overall, Severity::Warn);
     }
 
     #[test]
-    fn overall_of_an_empty_report_is_ok() {
+    fn an_empty_report_is_ok_overall() {
         let sut = Report { results: vec![] };
 
-        assert_eq!(sut.overall(), Severity::Ok);
+        let overall = sut.overall();
+
+        assert_eq!(overall, Severity::Ok);
     }
 
     #[test]

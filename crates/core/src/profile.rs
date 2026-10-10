@@ -28,14 +28,14 @@ const RU_BRIDGE_REASON: &str =
 
 impl ScanProfile {
     pub fn for_country(country: &CountryCode) -> Self {
-        if country.as_str() == "RU" {
+        if *country == CountryCode::RU {
             Self::RuBridge
         } else {
             Self::Exit
         }
     }
 
-    pub fn scope(self, gate: GateId) -> GateScope {
+    pub const fn scope(self, gate: GateId) -> GateScope {
         match self {
             Self::Exit => GateScope::Judged,
             Self::RuBridge => match gate.bridge() {
@@ -114,7 +114,9 @@ mod tests {
     fn a_bridge_skips_gates_meant_for_a_foreign_exit(#[case] id: &str) {
         let sut = ScanProfile::RuBridge;
 
-        assert!(!sut.judges(gate(id)));
+        let judged = sut.judges(gate(id));
+
+        assert!(!judged);
     }
 
     #[rstest::rstest]
@@ -129,7 +131,9 @@ mod tests {
     fn a_bridge_judges_the_remaining_gates(#[case] id: &str) {
         let sut = ScanProfile::RuBridge;
 
-        assert!(sut.judges(gate(id)));
+        let judged = sut.judges(gate(id));
+
+        assert!(judged);
     }
 
     #[test]
@@ -138,7 +142,7 @@ mod tests {
 
         let skipped: Vec<GateId> = GATES
             .iter()
-            .map(|spec| spec.id)
+            .copied()
             .filter(|&gate| !sut.judges(gate))
             .collect();
 
@@ -146,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_turns_an_excluded_failure_into_a_skip_with_the_reason() {
+    fn an_excluded_failure_becomes_a_skip_with_the_reason() {
         let result = CheckResult::new(LATENCY, Verdict::error("no anchors"));
 
         let out = ScanProfile::RuBridge.apply(result);

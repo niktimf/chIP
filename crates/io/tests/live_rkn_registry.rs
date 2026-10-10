@@ -47,7 +47,7 @@ async fn a_public_address_has_its_long_standing_registry_entry(
 ) {
     let sut = registry().await;
 
-    let facts = sut.check(ip).unwrap();
+    let facts = sut.check(ip);
 
     assert!(expected(facts.listing()), "{facts:?}");
 }

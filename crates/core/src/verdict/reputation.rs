@@ -80,7 +80,9 @@ mod tests {
     #[case::tor(clean_with(&[ReputationFlag::Tor]))]
     #[case::compromised(clean_with(&[ReputationFlag::Compromised]))]
     fn each_hard_flag_fails_on_its_own(#[case] sut: ReputationFacts) {
-        assert_eq!(judge_reputation(&sut).severity, Severity::Fail);
+        let verdict = judge_reputation(&sut);
+
+        assert_eq!(verdict.severity, Severity::Fail, "{}", verdict.detail);
     }
 
     fn named_operator() -> ReputationFacts {
@@ -127,12 +129,14 @@ mod tests {
     #[case::anonymous(clean_with(&[ReputationFlag::Anonymous]))]
     #[case::scraper(clean_with(&[ReputationFlag::Scraper]))]
     fn each_soft_flag_only_warns(#[case] sut: ReputationFacts) {
-        assert_eq!(judge_reputation(&sut).severity, Severity::Warn);
+        let verdict = judge_reputation(&sut);
+
+        assert_eq!(verdict.severity, Severity::Warn, "{}", verdict.detail);
     }
 
     #[rstest::rstest]
-    #[case::at_threshold(WARN_RISK, Severity::Warn)]
-    #[case::below_threshold(WARN_RISK - 1, Severity::Ok)]
+    #[case::at_threshold(50, Severity::Warn)]
+    #[case::below_threshold(49, Severity::Ok)]
     fn risk_threshold_is_inclusive(
         #[case] value: u8,
         #[case] expected: Severity,

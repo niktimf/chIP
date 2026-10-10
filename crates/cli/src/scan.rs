@@ -26,8 +26,8 @@ use chip_core::verdict::rkn_registry::judge_rkn_registry;
 use chip_core::verdict::service_geo::{
     judge_cdn_edge, judge_search_captcha, judge_service_country,
 };
-use chip_core::verdict::services::{judge_service_fail, judge_service_warn};
-use chip_core::verdict::steal::{judge_steal, steal_share};
+use chip_core::verdict::services::ServiceTier;
+use chip_core::verdict::steal::judge_steal;
 use chip_core::verdict::tampering::judge_tampering;
 use chip_core::{
     CheckResult, CountryCode, GateId, GateScope, Report, ScanProfile, Verdict,
@@ -182,9 +182,7 @@ fn rkn_registry_verdict(
     ip: Ipv4Addr,
 ) -> Verdict {
     match registry {
-        Ok(registry) => registry
-            .check(ip)
-            .map_or_else(error_verdict, |facts| judge_rkn_registry(&facts)),
+        Ok(registry) => judge_rkn_registry(&registry.check(ip)),
         Err(error) => error_verdict(error),
     }
 }
@@ -533,10 +531,10 @@ async fn record_service(
     progress: &ScanProgress,
     gate: GateId,
     work: impl std::future::Future<Output = ServiceState>,
-    judge: fn(&ServiceState) -> Verdict,
+    tier: ServiceTier,
 ) {
     let state = work.await;
-    progress.add([CheckResult::new(gate, judge(&state))]);
+    progress.add([CheckResult::new(gate, tier.judge(&state))]);
 }
 
 async fn record_portal(client: &TunnelClient, progress: &ScanProgress) {
@@ -573,25 +571,25 @@ async fn record_primary_services(
             progress,
             gate::SERVICE_CHATGPT_WEB,
             probe_chatgpt_web(client),
-            judge_service_fail
+            ServiceTier::Primary
         ),
         record_service(
             progress,
             gate::SERVICE_CHATGPT_APP,
             probe_chatgpt_app(client),
-            judge_service_fail
+            ServiceTier::Primary
         ),
         record_service(
             progress,
             gate::SERVICE_GEMINI,
             probe_gemini(client),
-            judge_service_fail
+            ServiceTier::Primary
         ),
         record_service(
             progress,
             gate::SERVICE_YOUTUBE_PREMIUM,
             probe_youtube_premium(client),
-            judge_service_fail
+            ServiceTier::Primary
         ),
     );
 }
@@ -605,25 +603,25 @@ async fn record_secondary_services(
             progress,
             gate::SERVICE_NETFLIX,
             probe_netflix(client),
-            judge_service_warn
+            ServiceTier::Secondary
         ),
         record_service(
             progress,
             gate::SERVICE_CLAUDE,
             probe_claude(client),
-            judge_service_warn
+            ServiceTier::Secondary
         ),
         record_service(
             progress,
             gate::SERVICE_TIKTOK,
             probe_tiktok(client),
-            judge_service_warn
+            ServiceTier::Secondary
         ),
         record_service(
             progress,
             gate::SERVICE_NOTEBOOKLM,
             probe_notebooklm(client),
-            judge_service_warn
+            ServiceTier::Secondary
         ),
     );
 }
@@ -1079,7 +1077,10 @@ async fn run_steal_check(session: &SshSession, progress: &ScanProgress) {
                 .steal_snapshot()
                 .await
                 .map_or_else(ssh_failure, |after| {
-                    judge_steal(steal_share(&before, &after), SAMPLE_INTERVAL)
+                    judge_steal(
+                        after.steal_share_since(before),
+                        SAMPLE_INTERVAL,
+                    )
                 })
         }
         Err(error) => ssh_failure(error),
@@ -1257,12 +1258,12 @@ mod tests {
 
     #[test]
     fn an_error_verdict_names_the_cause_below_the_top_message() {
-        let sut = RegistryDownloadFailed(std::io::Error::new(
+        let error = RegistryDownloadFailed(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             "connection refused",
         ));
 
-        let verdict = error_verdict(sut);
+        let verdict = error_verdict(error);
 
         assert_eq!(verdict.severity, Severity::Error);
         assert_eq!(
@@ -1399,14 +1400,14 @@ mod tests {
 
     #[test]
     fn an_exhausted_quota_fails_quota_latency_and_reach_with_one_detail() {
-        let sut = GlobalpingSetupError::QuotaExhausted {
+        let failure = GlobalpingSetupError::QuotaExhausted {
             remaining: 10,
             needed: 84,
         };
 
         let results = globalping_failure_results(
             gate::GLOBALPING_QUOTA,
-            sut,
+            failure,
             verified_listener(),
         );
 
@@ -1427,14 +1428,14 @@ mod tests {
     #[test]
     fn an_unreadable_quota_names_its_cause_and_leaves_reach_without_a_listener()
     {
-        let sut =
+        let failure =
             GlobalpingSetupError::QuotaUnavailable(GlobalpingError::Status {
                 operation: "read limits",
                 status: reqwest::StatusCode::TOO_MANY_REQUESTS,
             });
 
         let results =
-            globalping_failure_results(gate::GLOBALPING_QUOTA, sut, None);
+            globalping_failure_results(gate::GLOBALPING_QUOTA, failure, None);
 
         let detail = "could not read Globalping quota: \
                       globalping request failed: read limits: \
@@ -1453,13 +1454,16 @@ mod tests {
 
     #[test]
     fn a_failed_latency_step_reports_latency_once_beside_reach() {
-        let sut = GlobalpingError::Status {
+        let failure = GlobalpingError::Status {
             operation: "poll measurement",
             status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
         };
 
-        let results =
-            globalping_failure_results(gate::LATENCY, sut, verified_listener());
+        let results = globalping_failure_results(
+            gate::LATENCY,
+            failure,
+            verified_listener(),
+        );
 
         let detail = "globalping request failed: poll measurement: \
                       HTTP 503 Service Unavailable";

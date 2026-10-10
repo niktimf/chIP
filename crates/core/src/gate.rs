@@ -8,8 +8,10 @@
 //! the table, so a new gate is added in exactly one place.
 
 use crate::model::CheckResult;
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
 /// A gate identifier (`"latency"`, `"service:gemini"`, `"ai:openai"`).
@@ -19,53 +21,69 @@ use std::str::FromStr;
 /// [`GATES`] does not name. A typo in `--gate` is therefore a startup error
 /// instead of an override that silently never matches, and a misspelled
 /// gate in code does not compile because the constant does not exist.
-/// `Ord` delegates to the inner `str` so `Report` can sort same-severity
-/// rows by gate id for a stable table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct GateId(&'static str);
+///
+/// The id points at its registry row, so `channel` and `bridge` read fields
+/// instead of searching the table. Equality, hashing and order go by the id
+/// string: two copies of a constant may point at different addresses. `Ord`
+/// lets `Report` sort same-severity rows by gate id for a stable table.
+#[derive(Debug, Clone, Copy)]
+pub struct GateId(&'static GateSpec);
 
 impl GateId {
     pub const fn as_str(self) -> &'static str {
-        self.0
+        self.0.id
     }
 
-    /// The registry row behind this id. Total: every `GateId` is a copy of
-    /// an id in [`GATES`], so the lookup always finds its row.
-    #[expect(
-        clippy::expect_used,
-        reason = "GateId has a private field and is only built from GATES"
-    )]
-    fn spec(self) -> &'static GateSpec {
-        GATES
-            .iter()
-            .find(|spec| spec.id == self)
-            .expect("every GateId is constructed from the GATES table")
+    pub const fn channel(self) -> Channel {
+        self.0.channel
     }
 
-    pub fn channel(self) -> Channel {
-        self.spec().channel
+    pub const fn bridge(self) -> BridgePolicy {
+        self.0.bridge
     }
+}
 
-    pub fn bridge(self) -> BridgePolicy {
-        self.spec().bridge
+impl PartialEq for GateId {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for GateId {}
+
+impl Hash for GateId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl PartialOrd for GateId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GateId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_str().cmp(other.as_str())
     }
 }
 
 impl fmt::Display for GateId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
+        f.write_str(self.as_str())
     }
 }
 
 impl PartialEq<str> for GateId {
     fn eq(&self, other: &str) -> bool {
-        self.0 == other
+        self.as_str() == other
     }
 }
 
 impl PartialEq<&str> for GateId {
     fn eq(&self, other: &&str) -> bool {
-        self.0 == *other
+        self.as_str() == *other
     }
 }
 
@@ -79,8 +97,8 @@ impl FromStr for GateId {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         GATES
             .iter()
-            .map(|spec| spec.id)
             .find(|id| id.as_str() == value)
+            .copied()
             .ok_or_else(|| UnknownGateId(value.to_string()))
     }
 }
@@ -114,24 +132,24 @@ pub enum BridgePolicy {
     ForeignExitOnly,
 }
 
-/// One row of the gate registry.
+/// One row of the gate registry. Reached only through [`GateId`].
 #[derive(Debug)]
-pub struct GateSpec {
-    pub id: GateId,
-    pub channel: Channel,
-    pub bridge: BridgePolicy,
+struct GateSpec {
+    id: &'static str,
+    channel: Channel,
+    bridge: BridgePolicy,
 }
 
 macro_rules! gates {
     ($($konst:ident = $id:literal, $channel:ident, $bridge:ident;)+) => {
-        $(pub const $konst: GateId = GateId($id);)+
-
-        /// Every gate a scan can report, one row per id.
-        pub const GATES: &[GateSpec] = &[$(GateSpec {
-            id: $konst,
+        $(pub const $konst: GateId = GateId(&GateSpec {
+            id: $id,
             channel: Channel::$channel,
             bridge: BridgePolicy::$bridge,
-        },)+];
+        });)+
+
+        /// Every gate a scan can report, one entry per id.
+        pub const GATES: &[GateId] = &[$($konst,)+];
     };
 }
 
@@ -174,8 +192,8 @@ gates! {
 fn by_channel(wanted: &'static [Channel]) -> impl Iterator<Item = GateId> {
     GATES
         .iter()
-        .filter(move |spec| wanted.contains(&spec.channel))
-        .map(|spec| spec.id)
+        .filter(move |id| wanted.contains(&id.channel()))
+        .copied()
 }
 
 /// Gates judged through the SOCKS tunnel.
@@ -211,14 +229,15 @@ pub fn phase_b_gates() -> impl Iterator<Item = GateId> {
 pub fn scan_gates() -> impl Iterator<Item = GateId> {
     GATES
         .iter()
-        .filter(|spec| spec.channel != Channel::Meta)
-        .map(|spec| spec.id)
+        .filter(|id| id.channel() != Channel::Meta)
+        .copied()
 }
 
-/// `--gate`/`--skip-gate` as parsed: which gate ids to force to FAIL when
-/// they land on WARN, and which to neutralize entirely. Skip wins when a
+/// `--gate`/`--skip-gate` as parsed.
 ///
-/// gate id appears in both — an operator who disabled a check did not also
+/// `escalate` holds the gate ids to force to FAIL when they land on WARN,
+/// `skip` the ones to neutralize entirely. Skip wins when a gate id appears
+/// in both — an operator who disabled a check did not also
 /// mean to make it stricter.
 #[derive(Debug, Default, Clone)]
 pub struct GateOverrides {
@@ -256,11 +275,12 @@ mod tests {
 
     #[test]
     fn every_registered_id_parses_back_to_itself() {
-        for spec in GATES {
-            let parsed: GateId = spec.id.as_str().parse().unwrap();
+        let parsed: Vec<GateId> = GATES
+            .iter()
+            .map(|id| id.as_str().parse().unwrap())
+            .collect();
 
-            assert_eq!(parsed, spec.id);
-        }
+        assert_eq!(parsed, GATES);
     }
 
     #[test]
@@ -272,8 +292,7 @@ mod tests {
 
     #[test]
     fn registered_ids_are_unique() {
-        let ids: HashSet<&str> =
-            GATES.iter().map(|spec| spec.id.as_str()).collect();
+        let ids: HashSet<&str> = GATES.iter().map(|id| id.as_str()).collect();
 
         assert_eq!(ids.len(), GATES.len());
     }
@@ -392,7 +411,9 @@ mod tests {
     #[test]
     fn escalation_cannot_turn_a_skipped_check_into_a_failure() {
         let sut = overrides(&["latency"], &[]);
+
         let result = sut.apply(CheckResult::skipped(LATENCY, "disabled"));
+
         assert!(result.is_skipped());
         assert_eq!(result.severity(), Severity::Ok);
     }

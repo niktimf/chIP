@@ -1,7 +1,7 @@
 use chip_core::model::ServiceState;
 use chip_core::verdict::services::{
     NetflixTitleStatuses, classify_claude, classify_netflix,
-    classify_notebooklm, classify_tiktok, claude_unavailable_markers,
+    classify_notebooklm, classify_tiktok,
 };
 use http::header::{
     ACCEPT, ACCEPT_LANGUAGE, UPGRADE_INSECURE_REQUESTS, USER_AGENT,
@@ -46,13 +46,7 @@ static CLAUDE_HEADERS: [(HeaderName, HeaderValue); 8] = [
 static CLAUDE: ServicePage = ServicePage {
     url: "https://claude.ai/",
     headers: &CLAUDE_HEADERS,
-    classify: |response| {
-        classify_claude(
-            response.status,
-            &response.body,
-            claude_unavailable_markers(),
-        )
-    },
+    classify: |response| classify_claude(response.status, &response.body),
 };
 
 static TIKTOK: ServicePage = ServicePage {

@@ -2,6 +2,13 @@ use crate::Verdict;
 use crate::model::{CountryCode, GeoConsensusFacts};
 
 const MIN_ANSWERS: usize = 5;
+// The two shares below were set with the first version of the gate and
+// have not been tuned against measured scans since.
+/// Below this share of answering sources naming the ordered country the
+/// address is placed elsewhere: FAIL.
+const FAIL_BELOW_SHARE: f64 = 0.5;
+/// Below this share the sources disagree too much for OK: WARN.
+const WARN_BELOW_SHARE: f64 = 0.8;
 
 #[expect(
     clippy::cast_precision_loss,
@@ -31,9 +38,9 @@ pub fn judge_geo(facts: &GeoConsensusFacts, expected: &CountryCode) -> Verdict {
             format!(" ({silent} of {} did not answer)", facts.votes.len())
         }
     );
-    if share < 0.5 {
+    if share < FAIL_BELOW_SHARE {
         Verdict::fail(detail)
-    } else if share < 0.8 || ru_seen {
+    } else if share < WARN_BELOW_SHARE || ru_seen {
         Verdict::warn(if ru_seen {
             format!("{detail} (at least one source sees RU)")
         } else {
