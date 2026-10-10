@@ -1,52 +1,73 @@
 use std::time::Duration;
 
 use chip_core::model::{
-    CaptchaObservation, CountryCode, EdgeObservation, ServiceCountryVote,
-    ServiceGeoSource,
+    CaptchaObservation, CaptchaRetry, CdnEdge, CdnEdgeVote, CountryCode,
+    EdgeObservation, ServiceCountryVote, ServiceGeoSource,
 };
-use http::StatusCode;
-use http::header::{ACCEPT_LANGUAGE, USER_AGENT};
+use chip_core::verdict::service_geo::{
+    airport_country, classify_search_captcha,
+};
 use regex::regex;
+use serde::Deserialize;
 
 use super::client::{TunnelClient, TunnelError, TunnelResponse};
-use super::services::{ACCEPT_LANGUAGE_EN, BROWSER_HEADERS, BROWSER_UA};
+use super::{BROWSER_EN_HEADERS, BROWSER_HEADERS};
 use crate::error_chain::describe_error;
 
 const FAST_API_URL: &str = "https://api.fast.com/netflix/speedtest/v2?https=true&token=YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm&urlCount=1";
-
-/// Russian location codes a CDN edge can carry.
-const RU_IATA_CODES: &[&str] = &[
-    "AAQ", "ABA", "ACS", "ADH", "AEM", "AER", "AMV", "ARH", "ASF", "BAX",
-    "BCX", "BGN", "BGS", "BKA", "BQG", "BQJ", "BQS", "BTK", "BVJ", "BVV",
-    "BWO", "BZK", "CEE", "CEK", "CKH", "CKL", "CSH", "CSY", "CYX", "CZR",
-    "DEE", "DHG", "DKS", "DLR", "DME", "DPT", "DYR", "EDN", "EGO", "EIE",
-    "EIK", "EKS", "ERG", "ESL", "ETL", "EYA", "EYK", "EZV", "GDX", "GDZ",
-    "GOJ", "GOY", "GRV", "GSV", "GVN", "GYG", "HMA", "HTA", "HTG", "IAA",
-    "IAR", "IGT", "IJK", "IKS", "IKT", "INA", "IRM", "ITU", "IWA", "JOK",
-    "KCK", "KCY", "KDY", "KEJ", "KGD", "KGP", "KHV", "KJA", "KKQ", "KLD",
-    "KLF", "KMW", "KNY", "KPW", "KRO", "KRR", "KSZ", "KUF", "KVK", "KVM",
-    "KVR", "KVX", "KXD", "KXK", "KYZ", "KZN", "LDG", "LED", "LNX", "LPK",
-    "MCX", "MJY", "MJZ", "MMK", "MOW", "MQF", "MQJ", "MRV", "NAL", "NBC",
-    "NEI", "NER", "NFG", "NGK", "NJC", "NLI", "NNM", "NOI", "NOJ", "NOZ",
-    "NSK", "NUX", "NYA", "NYM", "NYR", "NZG", "ODO", "OGZ", "OHH", "OHO",
-    "OKT", "OLZ", "OMS", "ONK", "OSW", "OVB", "OVS", "PEE", "PES", "PEX",
-    "PEZ", "PKC", "PKV", "PVS", "PWE", "PYJ", "REN", "RGK", "RMZ", "ROV",
-    "RYB", "RZH", "SBT", "SCW", "SEK", "SES", "SGC", "SKX", "SLY", "STW",
-    "SUK", "SUY", "SVO", "SVX", "SWT", "SWV", "SYS", "TBW", "TGK", "TGP",
-    "THX", "TJM", "TKM", "TLK", "TLY", "TOF", "TOX", "TQL", "TYA", "TYD",
-    "UCT", "UEN", "UFA", "UHS", "UIK", "UKG", "UKX", "ULK", "ULV", "ULY",
-    "UMS", "URJ", "URS", "USK", "USR", "UTS", "UUA", "UUD", "UUS", "VAQ",
-    "VEO", "VGD", "VHV", "VKO", "VKT", "VKV", "VLU", "VOG", "VOZ", "VRI",
-    "VUS", "VVO", "VYI", "YAE", "YKS", "YMK", "ZIA", "ZIX", "ZKP", "ZZO",
-];
 
 fn country(raw: &str) -> Option<CountryCode> {
     CountryCode::try_from(raw.trim()).ok()
 }
 
-fn json_string(body: &str, pointer: &str) -> Option<String> {
-    let owned = serde_json::from_str::<serde_json::Value>(body).ok()?;
-    owned.pointer(pointer)?.as_str().map(ToString::to_string)
+/// The part of the fast.com API answer the probes read: the country fast.com
+/// places the client in, and the Netflix OCA edges it hands out.
+#[derive(Deserialize)]
+struct FastResponse {
+    client: Option<FastPeer>,
+    targets: Option<Vec<FastPeer>>,
+}
+
+#[derive(Deserialize)]
+struct FastPeer {
+    location: FastLocation,
+}
+
+#[derive(Deserialize)]
+struct FastLocation {
+    country: String,
+}
+
+impl FastResponse {
+    fn parse(body: &str) -> Option<Self> {
+        serde_json::from_str(body).ok()
+    }
+
+    fn client_country(&self) -> Option<CountryCode> {
+        country(&self.client.as_ref()?.location.country)
+    }
+
+    fn first_target_country(&self) -> Option<CountryCode> {
+        country(&self.targets.as_ref()?.first()?.location.country)
+    }
+}
+
+/// The `TikTok` web cookie-privacy config; its region is the country `TikTok`
+/// places the client in.
+#[derive(Deserialize)]
+struct TiktokConfig {
+    body: TiktokConfigBody,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TiktokConfigBody {
+    app_props: TiktokAppProps,
+}
+
+#[derive(Deserialize)]
+struct TiktokAppProps {
+    region: String,
 }
 
 fn google_country(body: &str) -> Option<CountryCode> {
@@ -86,6 +107,15 @@ fn bing_country(body: &str) -> Option<CountryCode> {
         .get(1)?
         .as_str();
     (value != "WW").then(|| country(value)).flatten()
+}
+
+fn netflix_country(body: &str) -> Option<CountryCode> {
+    FastResponse::parse(body)?.client_country()
+}
+
+fn tiktok_country(body: &str) -> Option<CountryCode> {
+    let config: TiktokConfig = serde_json::from_str(body).ok()?;
+    country(&config.body.app_props.region)
 }
 
 /// A service that cannot be reached casts no country vote; the cause goes to
@@ -166,14 +196,16 @@ impl CountryResponses {
             ),
             vote(
                 ServiceGeoSource::Netflix,
-                json_country(
-                    self.netflix.as_ref().ok(),
-                    "/client/location/country",
-                ),
+                self.netflix
+                    .as_ref()
+                    .ok()
+                    .and_then(|item| netflix_country(&item.body)),
             ),
             vote(
                 ServiceGeoSource::Tiktok,
-                json_country(self.tiktok.as_ref(), "/body/appProps/region"),
+                self.tiktok
+                    .as_ref()
+                    .and_then(|item| tiktok_country(&item.body)),
             ),
             vote(
                 ServiceGeoSource::Bing,
@@ -190,20 +222,11 @@ const fn vote(
     ServiceCountryVote { source, country }
 }
 
-fn json_country(
-    response: Option<&TunnelResponse>,
-    pointer: &str,
-) -> Option<CountryCode> {
-    response
-        .and_then(|item| json_string(&item.body, pointer))
-        .and_then(|value| country(&value))
-}
-
 /// Service country votes and CDN edges, read from one set of requests.
 #[derive(Debug)]
 pub struct ServiceGeoObservations {
     pub votes: Vec<ServiceCountryVote>,
-    pub edges: Vec<(&'static str, EdgeObservation)>,
+    pub edges: Vec<CdnEdgeVote>,
 }
 
 /// Probes the services' country votes and the CDN edges together. The
@@ -221,12 +244,21 @@ pub async fn probe_service_geo(
         ),
     );
     let edges = vec![
-        ("cloudflare", edge_observation(&cloudflare, cloudflare_country)),
-        ("youtube_ggc", edge_observation(&youtube, ggc_country)),
-        (
-            "netflix_oca",
-            edge_observation(&countries.netflix, netflix_oca_country),
-        ),
+        CdnEdgeVote {
+            edge: CdnEdge::Cloudflare,
+            observation: edge_observation(&cloudflare, cloudflare_country),
+        },
+        CdnEdgeVote {
+            edge: CdnEdge::YoutubeGgc,
+            observation: edge_observation(&youtube, ggc_country),
+        },
+        CdnEdgeVote {
+            edge: CdnEdge::NetflixOca,
+            observation: edge_observation(
+                &countries.netflix,
+                netflix_oca_country,
+            ),
+        },
     ];
     ServiceGeoObservations {
         votes: countries.votes(),
@@ -238,38 +270,35 @@ async fn captcha_observation(
     client: &TunnelClient,
     url: &str,
 ) -> CaptchaObservation {
-    match client
-        .get(
-            url,
-            &[
-                (USER_AGENT, BROWSER_UA),
-                (ACCEPT_LANGUAGE, ACCEPT_LANGUAGE_EN),
-            ],
-        )
-        .await
-    {
-        Err(error) => CaptchaObservation::Unavailable(describe_error(&error)),
-        Ok(response)
-            if response.status == StatusCode::TOO_MANY_REQUESTS
-                || regex!(
-                    r"(?i)unusual traffic from|is blocked|unaddressed abuse"
-                )
-                .is_match(&response.body) =>
-        {
-            CaptchaObservation::Triggered
-        }
-        Ok(_) => CaptchaObservation::Clear,
-    }
+    client.get(url, &BROWSER_EN_HEADERS).await.map_or_else(
+        |error| CaptchaObservation::Unavailable(describe_error(&error)),
+        |response| classify_search_captcha(response.status, &response.body),
+    )
 }
 
+/// Fetches Google Search twice, `retry_after` apart. The judge counts a
+/// captcha only when the retry reproduces it.
 pub async fn probe_search_captcha(
     client: &TunnelClient,
-) -> (CaptchaObservation, CaptchaObservation) {
-    let url = "https://www.google.com/search?q=cats";
+    retry_after: Duration,
+) -> CaptchaRetry {
+    search_captcha_at(
+        client,
+        "https://www.google.com/search?q=cats",
+        retry_after,
+    )
+    .await
+}
+
+async fn search_captcha_at(
+    client: &TunnelClient,
+    url: &str,
+    retry_after: Duration,
+) -> CaptchaRetry {
     let first = captcha_observation(client, url).await;
-    tokio::time::sleep(Duration::from_secs(30)).await;
-    let second = captcha_observation(client, url).await;
-    (first, second)
+    tokio::time::sleep(retry_after).await;
+    let retry = captcha_observation(client, url).await;
+    CaptchaRetry { first, retry }
 }
 
 fn value_from_lines(body: &str, key: &str) -> Option<String> {
@@ -290,53 +319,6 @@ fn ggc_iata(body: &str) -> Option<String> {
     })
 }
 
-fn iata_country(code: &str) -> Option<CountryCode> {
-    if RU_IATA_CODES.contains(&code) {
-        return country("RU");
-    }
-    let mapped = match code {
-        "HEL" => "FI",
-        "FRA" | "BER" | "MUC" | "DUS" | "HAM" => "DE",
-        "AMS" => "NL",
-        "ARN" | "STO" | "GOT" => "SE",
-        "LHR" | "LON" | "MAN" => "GB",
-        "CDG" | "PAR" | "MRS" => "FR",
-        "WAW" | "KTW" | "GDN" => "PL",
-        "RIX" => "LV",
-        "TLL" => "EE",
-        "VNO" => "LT",
-        "OSL" => "NO",
-        "CPH" => "DK",
-        "VIE" => "AT",
-        "ZRH" | "GVA" => "CH",
-        "MXP" | "MIL" | "FCO" | "ROM" => "IT",
-        "MAD" | "BCN" => "ES",
-        "LIS" => "PT",
-        "PRG" => "CZ",
-        "BUD" => "HU",
-        "OTP" | "BUH" => "RO",
-        "SOF" => "BG",
-        "BEG" => "RS",
-        "ZAG" => "HR",
-        "ATH" => "GR",
-        "DUB" => "IE",
-        "BRU" => "BE",
-        "IST" | "ISL" => "TR",
-        // Neighbours whose edges show up on Russian-facing routes; the gate
-        // does not fail on them, but naming the country beats "no country".
-        "KBP" | "IEV" | "HRK" | "ODS" | "LWO" | "DNK" => "UA",
-        "MSQ" => "BY",
-        "ALA" | "NQZ" | "TSE" => "KZ",
-        "TBS" => "GE",
-        "EVN" => "AM",
-        "GYD" | "BAK" => "AZ",
-        "TAS" => "UZ",
-        "KIV" => "MD",
-        _ => return None,
-    };
-    country(mapped)
-}
-
 fn edge_observation(
     response: &Result<TunnelResponse, TunnelError>,
     locate: fn(&str) -> Option<CountryCode>,
@@ -349,69 +331,134 @@ fn edge_observation(
 }
 
 fn cloudflare_country(body: &str) -> Option<CountryCode> {
-    value_from_lines(body, "colo").and_then(|code| iata_country(&code))
+    value_from_lines(body, "colo").and_then(|code| airport_country(&code))
 }
 
 fn ggc_country(body: &str) -> Option<CountryCode> {
-    ggc_iata(body).and_then(|code| iata_country(&code))
+    ggc_iata(body).and_then(|code| airport_country(&code))
 }
 
 fn netflix_oca_country(body: &str) -> Option<CountryCode> {
-    json_string(body, "/targets/0/location/country")
-        .and_then(|value| country(&value))
+    FastResponse::parse(body)?.first_target_country()
 }
 
 #[cfg(test)]
 mod tests {
+    use http::StatusCode;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
 
-    #[test]
-    fn parsers_read_the_upstream_wire_shapes() {
-        assert_eq!(google_country(r#"x "en_FI" y"#).unwrap().as_str(), "FI");
-        assert_eq!(
-            youtube_country(r#"{"countryCode":"DE"}"#).unwrap().as_str(),
-            "DE"
-        );
-        assert_eq!(
-            spotify_country(r#"{"geoLocationCountryCode":"NL"}"#)
-                .unwrap()
-                .as_str(),
-            "NL"
-        );
-        assert_eq!(
-            ggc_iata("192.0.2.0/24 => fra16s52").as_deref(),
-            Some("FRA")
-        );
+    fn cc(code: &str) -> CountryCode {
+        code.parse().unwrap()
     }
 
     #[rstest::rstest]
-    #[case::moscow("SVO", "RU")]
-    // A Russian edge outside the handful of capital-city codes still has to
-    // be recognized — the CDN-edge gate fails on RU and nothing else.
-    #[case::ufa("UFA", "RU")]
-    #[case::novosibirsk("OVB", "RU")]
-    // Missed by the original hand-picked list; caught since the list is
-    // derived from the OurAirports dataset.
-    #[case::voronezh("VOZ", "RU")]
-    #[case::surgut("SGC", "RU")]
-    // The airport is shut for civil traffic, but an edge in the city still
-    // carries its code.
-    #[case::rostov("ROV", "RU")]
-    // Seen for real on 2026-09-20: a Finnish address was served by the
-    // Kharkiv GGC edge, and the short table read it as "no country".
-    #[case::kharkiv("HRK", "UA")]
-    #[case::minsk("MSQ", "BY")]
-    #[case::helsinki("HEL", "FI")]
-    fn an_edge_airport_code_names_its_country(
-        #[case] sut: &str,
+    #[case::locale_with_an_underscore(r#"x "en_FI" y"#, "FI")]
+    #[case::the_last_language_tag(r#"["en-US","de-DE"]"#, "DE")]
+    fn google_names_the_country_of_its_page_locale(
+        #[case] body: &str,
         #[case] expected: &str,
     ) {
-        assert_eq!(iata_country(sut).unwrap().as_str(), expected);
+        let sut = google_country(body);
+
+        assert_eq!(sut, Some(cc(expected)));
     }
 
     #[test]
-    fn an_unknown_airport_code_is_no_country_rather_than_a_guess() {
-        assert!(iata_country("ZZZ").is_none());
+    fn youtube_names_the_country_of_its_country_code_field() {
+        let sut = youtube_country(r#"{"countryCode":"DE"}"#);
+
+        assert_eq!(sut, Some(cc("DE")));
+    }
+
+    #[test]
+    fn spotify_names_the_country_of_its_geolocation_field() {
+        let sut = spotify_country(r#"{"geoLocationCountryCode":"NL"}"#);
+
+        assert_eq!(sut, Some(cc("NL")));
+    }
+
+    #[test]
+    fn netflix_votes_for_the_country_fast_com_places_the_client_in() {
+        let body = r#"{
+            "client": {"location": {"city": "Helsinki", "country": "FI"}},
+            "targets": [{"location": {"city": "Riga", "country": "LV"}}]
+        }"#;
+
+        let sut = netflix_country(body);
+
+        assert_eq!(sut, Some(cc("FI")));
+    }
+
+    #[test]
+    fn the_netflix_oca_edge_is_in_the_country_of_the_first_target() {
+        let body = r#"{
+            "client": {"location": {"country": "FI"}},
+            "targets": [
+                {"location": {"country": "LV"}},
+                {"location": {"country": "SE"}}
+            ]
+        }"#;
+
+        let sut = netflix_oca_country(body);
+
+        assert_eq!(sut, Some(cc("LV")));
+    }
+
+    #[test]
+    fn fast_com_without_targets_names_no_oca_edge() {
+        let body = r#"{"client": {"location": {"country": "FI"}}}"#;
+
+        let sut = netflix_oca_country(body);
+
+        assert_eq!(sut, None);
+    }
+
+    #[test]
+    fn tiktok_votes_for_the_region_of_its_app_props() {
+        let body = r#"{"body": {"appProps": {"region": "NL", "lang": "en"}}}"#;
+
+        let sut = tiktok_country(body);
+
+        assert_eq!(sut, Some(cc("NL")));
+    }
+
+    #[test]
+    fn a_google_cache_cluster_name_carries_its_airport_code() {
+        let sut = ggc_iata("192.0.2.0/24 => fra16s52");
+
+        assert_eq!(sut.as_deref(), Some("FRA"));
+    }
+
+    #[tokio::test]
+    async fn a_captcha_gone_on_retry_is_recorded_as_a_triggered_then_clear_pair()
+     {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("cats - Search"),
+            )
+            .mount(&server)
+            .await;
+        let client = TunnelClient::from_client(reqwest::Client::new());
+
+        let sut =
+            search_captcha_at(&client, &server.uri(), Duration::ZERO).await;
+
+        assert_eq!(
+            sut,
+            CaptchaRetry {
+                first: CaptchaObservation::Triggered,
+                retry: CaptchaObservation::Clear,
+            }
+        );
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ use http::header::USER_AGENT;
 use http::{HeaderName, HeaderValue, StatusCode};
 
 use super::client::TunnelClient;
-use super::unavailable;
+use super::fetch_state;
 
 const API_UA: HeaderValue = HeaderValue::from_static("curl/8.5.0");
 
@@ -33,15 +33,15 @@ struct AiEndpoint {
 
 impl AiEndpoint {
     async fn probe(&self, client: &TunnelClient) -> ServiceState {
-        match client.get(self.url, self.headers).await {
-            Ok(response) => classify_ai_endpoint(
+        fetch_state(client, self.url, self.headers, |response| {
+            classify_ai_endpoint(
                 response.status,
                 &response.body,
                 self.region_markers,
                 self.auth_statuses,
-            ),
-            Err(error) => unavailable(&error),
-        }
+            )
+        })
+        .await
     }
 }
 

@@ -625,6 +625,9 @@ async fn record_service_geo(
     country: &CountryCode,
     progress: &ScanProgress,
 ) {
+    /// The pause before the captcha retry; the verdict text says "~30s".
+    const CAPTCHA_RETRY_AFTER: Duration = Duration::from_secs(30);
+
     tokio::join!(
         async {
             let observations = probe_service_geo(client).await;
@@ -640,10 +643,11 @@ async fn record_service_geo(
             ]);
         },
         async {
-            let (first, retry) = probe_search_captcha(client).await;
+            let captcha =
+                probe_search_captcha(client, CAPTCHA_RETRY_AFTER).await;
             progress.add([CheckResult::new(
                 gate::SERVICE_GEO_CAPTCHA,
-                judge_search_captcha(&first, &retry),
+                judge_search_captcha(&captcha),
             )]);
         },
         async {

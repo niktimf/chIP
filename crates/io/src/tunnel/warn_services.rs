@@ -9,11 +9,69 @@ use http::header::{
 use http::{HeaderName, HeaderValue};
 
 use super::client::TunnelClient;
-use super::services::{ACCEPT_LANGUAGE_EN, BROWSER_HEADERS, BROWSER_UA};
-use super::unavailable;
+use super::{
+    ACCEPT_LANGUAGE_EN, BROWSER_HEADERS, BROWSER_HTML_HEADERS, BROWSER_UA,
+    ServicePage, unavailable,
+};
 
 const NETFLIX_LICENSED_TITLE: &str = "70143836";
 const NETFLIX_ORIGINAL_TITLE: &str = "80197526";
+
+/// The headers a browser sends when it opens the page from the address bar.
+static CLAUDE_HEADERS: [(HeaderName, HeaderValue); 8] = [
+    (USER_AGENT, BROWSER_UA),
+    (
+        ACCEPT,
+        HeaderValue::from_static(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        ),
+    ),
+    (ACCEPT_LANGUAGE, ACCEPT_LANGUAGE_EN),
+    (
+        HeaderName::from_static("sec-fetch-dest"),
+        HeaderValue::from_static("document"),
+    ),
+    (
+        HeaderName::from_static("sec-fetch-mode"),
+        HeaderValue::from_static("navigate"),
+    ),
+    (
+        HeaderName::from_static("sec-fetch-site"),
+        HeaderValue::from_static("none"),
+    ),
+    (HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1")),
+    (UPGRADE_INSECURE_REQUESTS, HeaderValue::from_static("1")),
+];
+
+static CLAUDE: ServicePage = ServicePage {
+    url: "https://claude.ai/",
+    headers: &CLAUDE_HEADERS,
+    classify: |response| {
+        classify_claude(
+            response.status,
+            &response.body,
+            claude_unavailable_markers(),
+        )
+    },
+};
+
+static TIKTOK: ServicePage = ServicePage {
+    url: "https://www.tiktok.com/",
+    headers: &BROWSER_HTML_HEADERS,
+    classify: |response| classify_tiktok(response.status, &response.body),
+};
+
+static NOTEBOOKLM: ServicePage = ServicePage {
+    url: "https://notebooklm.google.com/",
+    headers: &BROWSER_HTML_HEADERS,
+    classify: |response| {
+        classify_notebooklm(
+            response.status,
+            &response.final_url,
+            &response.body,
+        )
+    },
+};
 
 async fn probe_netflix_at(
     client: &TunnelClient,
@@ -40,107 +98,16 @@ pub async fn probe_netflix(client: &TunnelClient) -> ServiceState {
     probe_netflix_at(client, "https://www.netflix.com").await
 }
 
-async fn probe_claude_at(client: &TunnelClient, url: &str) -> ServiceState {
-    match client
-        .get(
-            url,
-            &[
-                (USER_AGENT, BROWSER_UA),
-                (
-                    ACCEPT,
-                    HeaderValue::from_static(
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    ),
-                ),
-                (ACCEPT_LANGUAGE, ACCEPT_LANGUAGE_EN),
-                (
-                    HeaderName::from_static("sec-fetch-dest"),
-                    HeaderValue::from_static("document"),
-                ),
-                (
-                    HeaderName::from_static("sec-fetch-mode"),
-                    HeaderValue::from_static("navigate"),
-                ),
-                (
-                    HeaderName::from_static("sec-fetch-site"),
-                    HeaderValue::from_static("none"),
-                ),
-                (
-                    HeaderName::from_static("sec-fetch-user"),
-                    HeaderValue::from_static("?1"),
-                ),
-                (UPGRADE_INSECURE_REQUESTS, HeaderValue::from_static("1")),
-            ],
-        )
-        .await
-    {
-        Ok(response) => classify_claude(
-            response.status,
-            &response.body,
-            claude_unavailable_markers(),
-        ),
-        Err(error) => unavailable(&error),
-    }
-}
-
 pub async fn probe_claude(client: &TunnelClient) -> ServiceState {
-    probe_claude_at(client, "https://claude.ai/").await
-}
-
-async fn probe_tiktok_at(client: &TunnelClient, url: &str) -> ServiceState {
-    match client
-        .get(
-            url,
-            &[
-                (USER_AGENT, BROWSER_UA),
-                (
-                    ACCEPT,
-                    HeaderValue::from_static(
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    ),
-                ),
-                (ACCEPT_LANGUAGE, ACCEPT_LANGUAGE_EN),
-            ],
-        )
-        .await
-    {
-        Ok(response) => classify_tiktok(response.status, &response.body),
-        Err(error) => unavailable(&error),
-    }
+    CLAUDE.probe(client).await
 }
 
 pub async fn probe_tiktok(client: &TunnelClient) -> ServiceState {
-    probe_tiktok_at(client, "https://www.tiktok.com/").await
-}
-
-async fn probe_notebooklm_at(client: &TunnelClient, url: &str) -> ServiceState {
-    match client
-        .get(
-            url,
-            &[
-                (USER_AGENT, BROWSER_UA),
-                (
-                    ACCEPT,
-                    HeaderValue::from_static(
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    ),
-                ),
-                (ACCEPT_LANGUAGE, ACCEPT_LANGUAGE_EN),
-            ],
-        )
-        .await
-    {
-        Ok(response) => classify_notebooklm(
-            response.status,
-            &response.final_url,
-            &response.body,
-        ),
-        Err(error) => unavailable(&error),
-    }
+    TIKTOK.probe(client).await
 }
 
 pub async fn probe_notebooklm(client: &TunnelClient) -> ServiceState {
-    probe_notebooklm_at(client, "https://notebooklm.google.com/").await
+    NOTEBOOKLM.probe(client).await
 }
 
 #[cfg(test)]

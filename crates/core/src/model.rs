@@ -245,6 +245,31 @@ pub enum CaptchaObservation {
     Unavailable(String),
 }
 
+/// The Google Search captcha probe: one request and one more after a pause.
+/// A captcha counts only when the retry reproduces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptchaRetry {
+    pub first: CaptchaObservation,
+    pub retry: CaptchaObservation,
+}
+
+/// A CDN whose edge location the CDN-edge gate reads. `Display` gives the
+/// name shown in the verdict detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+#[strum(serialize_all = "snake_case")]
+pub enum CdnEdge {
+    Cloudflare,
+    YoutubeGgc,
+    NetflixOca,
+}
+
+/// What the probe of one CDN edge showed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdnEdgeVote {
+    pub edge: CdnEdge,
+    pub observation: EdgeObservation,
+}
+
 /// What one CDN edge probe showed.
 ///
 /// An edge that answered without a country and an edge that could not be
