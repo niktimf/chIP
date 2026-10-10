@@ -1,8 +1,11 @@
 use std::time::Duration;
 
 use crate::Verdict;
-use crate::model::{AnchorSeries, PingSample, PingSweepFacts};
-use crate::units::{duration_from_millis, millis};
+use crate::values::units::{duration_from_millis, millis};
+
+pub mod anchor;
+mod facts;
+pub use facts::{AnchorSeries, InvalidPingSample, PingSample, PingSweepFacts};
 
 /// An anchor whose median RTT differs from its city group's median by more
 /// than this is treated as being on a bad path of its own and dropped
@@ -115,7 +118,7 @@ impl SuggestedThresholds {
 /// The largest tolerated loss delta: a finite, non-negative number of
 /// percentage points.
 ///
-/// It is not a [`Percent`](crate::model::Percent): a threshold above 100
+/// It is not a [`Percent`](crate::values::Percent): a threshold above 100
 /// points is accepted and never trips, since a delta of two percentages stays
 /// within 100.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -148,7 +151,7 @@ pub enum InvalidLatencyThresholds {
 ///
 /// The fields are differences between the candidate and its best anchor and
 /// can be negative, so they stay `f64` in the unit their names carry instead
-/// of `Duration` and `Percent`. `crate::units` converts RTTs into these
+/// of `Duration` and `Percent`. `crate::values::units` converts RTTs into these
 /// milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LatencySummary {
@@ -366,7 +369,7 @@ pub fn judge_latency(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AnchorSeries, Severity};
+    use crate::report::Severity;
     use pretty_assertions::assert_eq;
 
     fn samples(rtt: &[f64], loss_pct: f64) -> Vec<Option<PingSample>> {

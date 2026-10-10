@@ -1,6 +1,7 @@
 use super::types::{MeasurementStatus, RawMeasurement, RawProbeResult};
 use crate::error_chain::describe_error;
-use chip_core::model::{HttpProbeOutcome, PingSample};
+use chip_core::checks::globalping::latency::PingSample;
+use chip_core::checks::globalping::reach::HttpProbeOutcome;
 
 impl RawMeasurement {
     /// One entry per probe, in the order Globalping lists the probes. A probe
@@ -57,7 +58,8 @@ impl RawProbeResult {
 mod tests {
     use std::time::Duration;
 
-    use chip_core::model::{HttpProbeOutcome, Percent};
+    use chip_core::checks::globalping::reach::HttpProbeOutcome;
+    use chip_core::values::Percent;
     use pretty_assertions::assert_eq;
 
     use crate::globalping::types::RawMeasurement;

@@ -1,10 +1,10 @@
 use std::fmt;
 
 use anyhow::Context as _;
-use chip_core::anchor::{Anchor, select_for_city};
-use chip_core::model::{AnchorSeries, PingSample, PingSweepFacts};
-use chip_core::verdict::latency::{
-    LatencySummary, SuggestedThresholds, summarize_latency,
+use chip_core::checks::globalping::latency::anchor::{Anchor, select_for_city};
+use chip_core::checks::globalping::latency::{
+    AnchorSeries, LatencySummary, PingSample, PingSweepFacts,
+    SuggestedThresholds, summarize_latency,
 };
 use chip_io::atlas::AnchorClient;
 use chip_io::globalping::{

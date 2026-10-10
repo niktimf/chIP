@@ -280,7 +280,7 @@ async fn run_calibrate_command(
 #[cfg(test)]
 mod tests {
     use chip_core::Verdict;
-    use chip_core::gate::{GEO, LATENCY, REACH, REPUTATION};
+    use chip_core::report::gate::{GEO, LATENCY, REACH, REPUTATION};
 
     use super::*;
 

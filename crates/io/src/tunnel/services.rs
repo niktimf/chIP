@@ -1,5 +1,5 @@
-use chip_core::model::ServiceState;
-use chip_core::verdict::services::{
+use chip_core::checks::tunnel::ServiceState;
+use chip_core::checks::tunnel::services::{
     classify_chatgpt_app, classify_chatgpt_web, classify_gemini,
     classify_youtube_premium,
 };

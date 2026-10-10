@@ -19,7 +19,7 @@ use std::process::Command;
 /// failure this test exists to catch — a missing row reads as "checked and
 /// fine" to whoever runs the rotation.
 fn expected_gates() -> Vec<&'static str> {
-    chip_core::gate::scan_gates()
+    chip_core::report::gate::scan_gates()
         .map(chip_core::GateId::as_str)
         .collect()
 }

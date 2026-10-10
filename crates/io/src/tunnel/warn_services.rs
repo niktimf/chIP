@@ -1,5 +1,5 @@
-use chip_core::model::ServiceState;
-use chip_core::verdict::services::{
+use chip_core::checks::tunnel::ServiceState;
+use chip_core::checks::tunnel::services::{
     NetflixTitleStatuses, classify_claude, classify_netflix,
     classify_notebooklm, classify_tiktok,
 };

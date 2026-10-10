@@ -1,4 +1,6 @@
-use chip_core::ip_lists::{BlockLists, FetchedList, NetworkList};
+use chip_core::checks::direct::ip_lists::{
+    BlockLists, FetchedList, NetworkList,
+};
 use ipnet::Ipv4Net;
 use serde::Deserialize;
 

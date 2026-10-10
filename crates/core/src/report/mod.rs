@@ -1,4 +1,14 @@
-use crate::model::{CheckResult, Severity};
+//! The scan's result: per-gate rows, their severities and the report built
+//! from them, plus the gate registry and the scan profile that decide which
+//! rows a scan owes.
+
+mod check;
+pub mod gate;
+pub mod profile;
+mod verdict;
+
+pub use check::CheckResult;
+pub use verdict::{Severity, Verdict};
 
 fn is_unsafe_formatting(character: char) -> bool {
     character.is_control()
@@ -133,11 +143,11 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gate::{
+    use crate::report::gate::{
         BLOCKLISTS, GEO, GateId, LATENCY, NEIGHBORS, REACH, REPUTATION,
         TAMPERING,
     };
-    use crate::model::{CheckResult, Severity, Verdict};
+    use crate::report::{CheckResult, Severity, Verdict};
 
     fn cr(gate: GateId, v: Verdict) -> CheckResult {
         CheckResult::new(gate, v)

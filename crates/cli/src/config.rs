@@ -4,10 +4,10 @@ use std::num::{NonZeroU16, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use chip_core::model::InvalidCityName;
-use chip_core::verdict::latency::{
+use chip_core::checks::globalping::latency::{
     InvalidLatencyThresholds, LatencyThresholds,
 };
+use chip_core::values::InvalidCityName;
 use chip_core::{
     CheckResult, CityName, CountryCode, GateId, GateOverrides, ScanProfile,
     Severity,
@@ -578,7 +578,8 @@ impl CalibrateCommand {
 mod tests {
     use std::collections::HashSet;
 
-    use chip_core::{Verdict, gate};
+    use chip_core::Verdict;
+    use chip_core::report::gate;
 
     use super::*;
 

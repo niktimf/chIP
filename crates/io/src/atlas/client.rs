@@ -1,4 +1,4 @@
-use chip_core::anchor::{Anchor, AnchorFields};
+use chip_core::checks::globalping::latency::anchor::{Anchor, AnchorFields};
 use futures::{TryStreamExt as _, stream};
 use serde::Deserialize;
 use thiserror::Error;

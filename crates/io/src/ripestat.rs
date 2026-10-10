@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 use std::num::NonZeroU32;
 
-use chip_core::model::{Routing, RoutingFacts};
+use chip_core::checks::direct::provenance::{Routing, RoutingFacts};
 use ipnet::Ipv4Net;
 use serde::Deserialize;
 use thiserror::Error;
@@ -20,7 +20,9 @@ pub enum RipestatError {
     #[error("RIPEstat response field resource is not an IPv4 prefix")]
     Prefix(#[source] ipnet::AddrParseError),
     #[error("RIPEstat response has inconsistent visibility counts")]
-    Visibility(#[source] chip_core::model::InvalidRoutingFacts),
+    Visibility(
+        #[source] chip_core::checks::direct::provenance::InvalidRoutingFacts,
+    ),
     #[error("RIPEstat returned no RIS peer data for this address")]
     NoPeerData,
     #[error(

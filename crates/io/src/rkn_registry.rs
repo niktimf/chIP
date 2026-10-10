@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
 
-use chip_core::ip_lists::{AddressList, NetworkList, RknRegistry};
+use chip_core::checks::direct::ip_lists::{
+    AddressList, NetworkList, RknRegistry,
+};
 use thiserror::Error;
 
 use crate::netset::{self, Garbage, Line, ParsedList};

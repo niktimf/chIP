@@ -1,5 +1,6 @@
-use crate::gate::{BridgePolicy, GateId};
-use crate::model::{CheckResult, CountryCode};
+use crate::report::CheckResult;
+use crate::report::gate::{BridgePolicy, GateId};
+use crate::values::CountryCode;
 
 /// Which gates a scan judges, chosen by the country the candidate was
 /// ordered in.
@@ -82,14 +83,14 @@ impl ScanProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gate::{
+    use crate::report::gate::{
         AI_ANTHROPIC, AI_DEEPSEEK, AI_GEMINI, AI_OPENAI, GATES, GEO, LATENCY,
         SERVICE_CHATGPT_APP, SERVICE_CHATGPT_WEB, SERVICE_CLAUDE,
         SERVICE_GEMINI, SERVICE_GEO, SERVICE_GEO_CAPTCHA, SERVICE_GEO_CDN,
         SERVICE_NETFLIX, SERVICE_NOTEBOOKLM, SERVICE_TIKTOK,
         SERVICE_YOUTUBE_PREMIUM, TAMPERING,
     };
-    use crate::model::{Severity, Verdict};
+    use crate::report::{Severity, Verdict};
     use std::collections::HashSet;
 
     #[rstest::rstest]

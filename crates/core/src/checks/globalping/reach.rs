@@ -1,5 +1,60 @@
 use crate::Verdict;
-use crate::model::{HttpProbeOutcome, ReachFacts};
+use crate::checks::globalping::ProbeAlignmentError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpProbeOutcome {
+    Ok,
+    Failed,
+}
+
+/// HTTPS reachability of the candidate's temporary listener, and of a known-
+/// good control anchor, measured by the same Globalping probe set.
+#[derive(Debug, Clone)]
+pub struct ReachProbe {
+    pub candidate: HttpProbeOutcome,
+    pub control: HttpProbeOutcome,
+}
+
+/// Candidate and control outcomes paired probe by probe. The field is
+/// private so that only `new`, which checks that both series have the same
+/// length, can pair them.
+#[derive(Debug, Clone)]
+pub struct ReachFacts {
+    probes: Vec<ReachProbe>,
+}
+
+impl ReachFacts {
+    /// Pairs the candidate and control outcomes probe by probe. Both series
+    /// come from the same Globalping probe set, so index `i` must mean the
+    /// same probe in each; a series of a different length cannot be paired.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProbeAlignmentError` when the two series differ in length.
+    pub fn new(
+        candidate: Vec<HttpProbeOutcome>,
+        control: Vec<HttpProbeOutcome>,
+    ) -> Result<Self, ProbeAlignmentError> {
+        const CONTROL_ID: &str = "control";
+        if control.len() != candidate.len() {
+            return Err(ProbeAlignmentError {
+                anchor_id: CONTROL_ID.to_owned(),
+                expected: candidate.len(),
+                actual: control.len(),
+            });
+        }
+        let probes = candidate
+            .into_iter()
+            .zip(control)
+            .map(|(candidate, control)| ReachProbe { candidate, control })
+            .collect();
+        Ok(Self { probes })
+    }
+
+    pub fn probes(&self) -> &[ReachProbe] {
+        &self.probes
+    }
+}
 
 const FAIL_SHARE: f64 = 0.25;
 const MIN_VALID_PROBES: usize = 6;
@@ -42,8 +97,27 @@ pub fn judge_reach(facts: &ReachFacts) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::HttpProbeOutcome::{Failed, Ok as HttpOk};
-    use crate::model::Severity;
+    use crate::report::Severity;
+    use HttpProbeOutcome::{Failed, Ok as HttpOk};
+
+    /// A control probe missing from the reply used to read as `Failed`,
+    /// which the reach gate takes for "the control was unreachable too".
+    #[test]
+    fn reach_rejects_a_control_with_fewer_probes_than_the_candidate() {
+        let candidate = vec![HttpProbeOutcome::Ok, HttpProbeOutcome::Failed];
+
+        let error =
+            ReachFacts::new(candidate, vec![HttpProbeOutcome::Ok]).unwrap_err();
+
+        assert_eq!(
+            error,
+            ProbeAlignmentError {
+                anchor_id: "control".to_owned(),
+                expected: 2,
+                actual: 1,
+            }
+        );
+    }
 
     fn facts(
         candidate: &[HttpProbeOutcome],

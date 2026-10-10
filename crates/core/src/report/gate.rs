@@ -7,7 +7,7 @@
 //! bridge judges it. Derived sets such as [`tunnel_gates`] are filters over
 //! the table, so a new gate is added in exactly one place.
 
-use crate::model::CheckResult;
+use crate::report::CheckResult;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt;
@@ -248,7 +248,7 @@ impl GateOverrides {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CheckResult, Severity, Verdict};
+    use crate::report::{CheckResult, Severity, Verdict};
 
     fn gate(id: &str) -> GateId {
         id.parse().unwrap()

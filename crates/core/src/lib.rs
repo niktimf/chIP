@@ -1,24 +1,12 @@
 //! Pure domain model and judges. No network, no filesystem, no clock reads
 //! beyond what callers pass in — everything here is a function of its inputs.
 
-pub mod anchor;
-
-pub mod model;
-pub use model::{
-    CheckResult, CityName, CountryCode, InvalidCountryCode, Severity, Verdict,
-};
+pub mod values;
+pub use values::{CityName, CountryCode, InvalidCountryCode};
 
 pub mod report;
-pub use report::{Report, ScanOutcome};
+pub use report::gate::{GateId, GateOverrides};
+pub use report::profile::{GateScope, ScanProfile};
+pub use report::{CheckResult, Report, ScanOutcome, Severity, Verdict};
 
-pub mod gate;
-pub use gate::{GateId, GateOverrides};
-
-pub mod ip_lists;
-
-pub mod profile;
-pub use profile::{GateScope, ScanProfile};
-
-pub mod verdict;
-
-mod units;
+pub mod checks;

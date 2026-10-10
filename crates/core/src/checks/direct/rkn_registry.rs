@@ -1,5 +1,71 @@
 use crate::Verdict;
-use crate::model::{RknListing, RknRegistryFacts};
+use ipnet::Ipv4Net;
+
+/// Where the candidate itself stands in the RKN registry export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RknListing {
+    NotListed,
+    /// The address is in the list of single blocked addresses.
+    Address,
+    /// The address falls inside a network the registry blocks as a whole.
+    Subnet(Ipv4Net),
+}
+
+/// The candidate's entry in the RKN registry plus how many other addresses
+/// of its `/24` and `/16` are blocked one by one.
+///
+/// The candidate itself is never counted as its own neighbor, so a `/24` has
+/// at most 255 of them and a `/16` at most 65 535: exactly what `u8` and
+/// `u16` hold. The `/24` lies inside its `/16`, so it never has more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RknRegistryFacts {
+    listing: RknListing,
+    neighbors_24: u8,
+    neighbors_16: u16,
+}
+
+impl RknRegistryFacts {
+    /// # Errors
+    ///
+    /// Returns `InvalidRknRegistryFacts` when the `/24` holds more listed
+    /// neighbors than the `/16` around it.
+    pub fn new(
+        listing: RknListing,
+        neighbors_24: u8,
+        neighbors_16: u16,
+    ) -> Result<Self, InvalidRknRegistryFacts> {
+        if u16::from(neighbors_24) > neighbors_16 {
+            return Err(InvalidRknRegistryFacts {
+                in_24: neighbors_24,
+                in_16: neighbors_16,
+            });
+        }
+        Ok(Self {
+            listing,
+            neighbors_24,
+            neighbors_16,
+        })
+    }
+
+    pub const fn listing(&self) -> RknListing {
+        self.listing
+    }
+
+    pub const fn neighbors_24(&self) -> u8 {
+        self.neighbors_24
+    }
+
+    pub const fn neighbors_16(&self) -> u16 {
+        self.neighbors_16
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the /24 has {in_24} listed neighbors, but its /16 only {in_16}")]
+pub struct InvalidRknRegistryFacts {
+    in_24: u8,
+    in_16: u16,
+}
 
 /// Blocked neighbors in the `/24` from which the subnet is worth a warning.
 /// Taken from the 2026-09-26 slice of the registry, where the 90th percentile
@@ -45,7 +111,7 @@ pub fn judge_rkn_registry(facts: &RknRegistryFacts) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Severity;
+    use crate::report::Severity;
 
     fn facts(listing: RknListing, neighbors_24: u8) -> RknRegistryFacts {
         RknRegistryFacts::new(listing, neighbors_24, u16::from(neighbors_24))

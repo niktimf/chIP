@@ -2,9 +2,12 @@ use http::StatusCode;
 use regex::regex;
 
 use crate::Verdict;
-use crate::model::{
-    CaptchaObservation, CaptchaRetry, CdnEdge, CdnEdgeVote, CountryCode,
-    CountryObservation, ServiceCountryVote, ServiceGeoSource,
+use crate::values::CountryCode;
+
+mod facts;
+pub use facts::{
+    CaptchaObservation, CaptchaRetry, CdnEdge, CdnEdgeVote, CountryObservation,
+    ServiceCountryVote, ServiceGeoSource,
 };
 
 /// Names the votes that `describe` picks out, in input order.
@@ -324,7 +327,7 @@ pub fn judge_cdn_edge(edges: &[CdnEdgeVote]) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Severity;
+    use crate::report::Severity;
 
     fn cc(code: &str) -> CountryCode {
         code.parse().unwrap()

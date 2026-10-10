@@ -7,9 +7,8 @@ use std::net::Ipv4Addr;
 
 use ipnet::Ipv4Net;
 
-use crate::model::{
-    BlockListFacts, BlockListStatus, RknListing, RknRegistryFacts,
-};
+use crate::checks::direct::blocklists::{BlockListFacts, BlockListStatus};
+use crate::checks::direct::rkn_registry::{RknListing, RknRegistryFacts};
 
 /// A real list always has entries, so an empty one is a corrupted download,
 /// not a clean list.

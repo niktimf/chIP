@@ -1,7 +1,12 @@
+//! Gates of [`Channel::Neighbors`](crate::report::gate::Channel::Neighbors):
+//! the `/24` sweep from the runner.
+
 use crate::Verdict;
-use crate::model::{
-    NeighborHttps, NeighborProbe, PtrLookup, PtrName, TlsHandshake,
-    TlsHandshakeFacts,
+
+mod facts;
+pub use facts::{
+    InvalidPtrName, NeighborHttps, NeighborProbe, PtrLookup, PtrName,
+    TlsHandshake, TlsHandshakeFacts,
 };
 use itertools::Itertools as _;
 
@@ -281,7 +286,7 @@ pub fn judge_neighbor_extremes(probes: &[NeighborProbe]) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Severity;
+    use crate::report::Severity;
 
     fn ptr(name: &str) -> PtrLookup {
         PtrLookup::Resolved(PtrName::try_from(name).unwrap())

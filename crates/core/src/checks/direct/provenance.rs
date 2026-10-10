@@ -1,6 +1,74 @@
+use std::num::NonZeroU32;
+
 use crate::Verdict;
-use crate::model::{Routing, RoutingFacts};
 use ipnet::Ipv4Net;
+
+/// How the candidate's address is routed, as the RIS peers see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Routing {
+    /// An announcement covers the address. The prefix is usually shorter
+    /// than a `/24`: cloud providers announce whole blocks.
+    Announced {
+        prefix: Ipv4Net,
+        facts: RoutingFacts,
+    },
+    /// No announcement covers the address, so no peer can see it.
+    NotAnnounced { total_ris_peers: NonZeroU32 },
+}
+
+/// Visibility of an announced prefix.
+///
+/// The total is never zero: a routing answer without RIS peers carries no
+/// data and is rejected where the response is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingFacts {
+    ris_peers_seeing: u32,
+    total_ris_peers: NonZeroU32,
+    origin_count: u32,
+}
+
+impl RoutingFacts {
+    /// # Errors
+    ///
+    /// Returns `InvalidRoutingFacts` when more peers see the prefix than
+    /// exist in total.
+    pub const fn new(
+        ris_peers_seeing: u32,
+        total_ris_peers: NonZeroU32,
+        origin_count: u32,
+    ) -> Result<Self, InvalidRoutingFacts> {
+        if ris_peers_seeing > total_ris_peers.get() {
+            return Err(InvalidRoutingFacts {
+                seeing: ris_peers_seeing,
+                total: total_ris_peers.get(),
+            });
+        }
+        Ok(Self {
+            ris_peers_seeing,
+            total_ris_peers,
+            origin_count,
+        })
+    }
+
+    pub const fn ris_peers_seeing(&self) -> u32 {
+        self.ris_peers_seeing
+    }
+
+    pub const fn total_ris_peers(&self) -> NonZeroU32 {
+        self.total_ris_peers
+    }
+
+    pub const fn origin_count(&self) -> u32 {
+        self.origin_count
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("RIS peers seeing the prefix ({seeing}) exceeds total peers ({total})")]
+pub struct InvalidRoutingFacts {
+    seeing: u32,
+    total: u32,
+}
 
 const MIN_VISIBILITY_RATIO: f64 = 0.9;
 
@@ -37,7 +105,7 @@ fn judge_visibility(prefix: Ipv4Net, facts: &RoutingFacts) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Severity;
+    use crate::report::Severity;
     use std::num::NonZeroU32;
 
     fn peers(total: u32) -> NonZeroU32 {

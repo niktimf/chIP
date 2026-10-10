@@ -1,12 +1,11 @@
 use std::time::Duration;
 
-use chip_core::model::{
-    CaptchaObservation, CaptchaRetry, CdnEdge, CdnEdgeVote, CountryCode,
-    CountryObservation, ServiceCountryVote, ServiceGeoSource,
+use chip_core::checks::tunnel::service_geo::{
+    CaptchaObservation, CaptchaRetry, CdnEdge, CdnEdgeVote, CountryObservation,
+    ServiceCountryVote, ServiceGeoSource, airport_country,
+    classify_search_captcha,
 };
-use chip_core::verdict::service_geo::{
-    airport_country, classify_search_captcha,
-};
+use chip_core::values::CountryCode;
 use regex::regex;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;

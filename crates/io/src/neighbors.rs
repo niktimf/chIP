@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
-use chip_core::model::{
+use chip_core::checks::neighbors::{
     NeighborHttps, NeighborProbe, PtrLookup, PtrName, TlsHandshake,
     TlsHandshakeFacts,
 };

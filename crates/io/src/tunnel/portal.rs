@@ -1,5 +1,6 @@
-use chip_core::model::PortalOutcome;
-use chip_core::verdict::portal::{PortalChecks, PortalEndpoint};
+use chip_core::checks::tunnel::portal::{
+    PortalChecks, PortalEndpoint, PortalOutcome,
+};
 use futures::future::join_all;
 
 use super::client::TunnelClient;

@@ -1,5 +1,5 @@
 use crate::credentials::ProxycheckApiKey;
-use chip_core::model::{
+use chip_core::checks::direct::reputation::{
     InvalidRiskScore, ReputationFacts, ReputationFlag, RiskScore,
 };
 use serde::Deserialize;

@@ -5,7 +5,12 @@ use itertools::{Either, Itertools as _};
 use strum::{Display, IntoStaticStr};
 use url::Url;
 
-use crate::model::PortalOutcome;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortalOutcome {
+    Ok,
+    Altered,
+    Unreachable,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, IntoStaticStr)]
 #[strum(serialize_all = "lowercase")]

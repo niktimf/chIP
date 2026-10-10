@@ -1,5 +1,17 @@
 use crate::Verdict;
-use crate::model::{BlockListFacts, BlockListStatus};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockListStatus {
+    Unavailable,
+    Clear,
+    Listed,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockListFacts {
+    pub spamhaus: BlockListStatus,
+    pub firehol: BlockListStatus,
+}
 
 pub fn judge_blocklists(facts: &BlockListFacts) -> Verdict {
     use BlockListStatus::{Clear, Listed, Unavailable};
@@ -24,7 +36,7 @@ pub fn judge_blocklists(facts: &BlockListFacts) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{BlockListFacts, Severity};
+    use crate::report::Severity;
     use BlockListStatus::{Clear, Listed, Unavailable};
 
     const fn facts(

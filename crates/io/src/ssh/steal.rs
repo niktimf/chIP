@@ -1,5 +1,5 @@
 use super::session::{SshError, SshSession};
-use chip_core::model::ProcStatSnapshot;
+use chip_core::checks::ssh::steal::ProcStatSnapshot;
 use thiserror::Error;
 
 /// Why the CPU steal counters could not be read from the candidate.

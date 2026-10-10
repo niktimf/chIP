@@ -1,5 +1,26 @@
 use crate::Verdict;
-use crate::model::{CountryCode, GeoConsensusFacts, GeoVote};
+use crate::values::CountryCode;
+
+/// One vote per keyless `GeoIP` source, in the order the sources are
+/// queried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeoConsensusFacts {
+    pub votes: Vec<GeoVote>,
+}
+
+/// What one `GeoIP` source says about the candidate's country.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeoVote {
+    /// The source named this country.
+    Country(CountryCode),
+    /// The source answered, but its answer holds no ISO 3166-1 alpha-2 code:
+    /// the field is missing or holds something else, such as a full country
+    /// name.
+    NoCountryCode,
+    /// The source did not answer: timeout, failed request, HTTP error status
+    /// or a body that is not JSON.
+    NoAnswer,
+}
 
 const MIN_ANSWERS: usize = 5;
 // The two shares below were set with the first version of the gate and
@@ -79,7 +100,7 @@ fn count(facts: &GeoConsensusFacts, kind: GeoVote) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Severity;
+    use crate::report::Severity;
 
     fn cc(code: &str) -> CountryCode {
         code.parse().unwrap()

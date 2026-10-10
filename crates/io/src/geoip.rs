@@ -1,6 +1,5 @@
-use chip_core::model::{
-    CountryCode, GeoConsensusFacts, GeoVote, InvalidCountryCode,
-};
+use chip_core::checks::direct::geo::{GeoConsensusFacts, GeoVote};
+use chip_core::values::{CountryCode, InvalidCountryCode};
 
 use crate::error_chain::describe_error;
 use std::net::Ipv4Addr;
@@ -198,7 +197,7 @@ impl GeoIpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chip_core::model::CountryCode;
+    use chip_core::values::CountryCode;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

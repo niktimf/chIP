@@ -7,7 +7,7 @@
 //! `classify_*` function.
 
 use crate::Verdict;
-use crate::model::ServiceState;
+use crate::checks::tunnel::ServiceState;
 use http::StatusCode;
 use regex::regex;
 use url::Url;
@@ -30,7 +30,7 @@ pub(crate) const CLOUDFLARE_CHALLENGED: &str =
     "Cloudflare challenged the request";
 
 /// Whether the response is a Cloudflare challenge page instead of the
-/// service's own answer. Shared with `verdict::ai`: the API endpoints sit
+/// service's own answer. Shared with `ai`: the API endpoints sit
 /// behind the same Cloudflare front, so one marker list serves both. The
 /// markers are matched in any case; the body is lowercased only for a
 /// status Cloudflare challenges with.
@@ -259,7 +259,7 @@ impl ServiceTier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Severity;
+    use crate::report::Severity;
     use rstest::rstest;
 
     const CLOUDFLARE_CHALLENGE: &str =

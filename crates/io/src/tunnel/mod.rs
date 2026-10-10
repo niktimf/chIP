@@ -18,7 +18,7 @@ pub use warn_services::{
     probe_claude, probe_netflix, probe_notebooklm, probe_tiktok,
 };
 
-use chip_core::model::ServiceState;
+use chip_core::checks::tunnel::ServiceState;
 use http::header::{ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
 use http::{HeaderName, HeaderValue};
 

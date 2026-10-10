@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 
 use itertools::Itertools as _;
 
-use crate::model::{CityName, CountryCode};
+use crate::values::{CityName, CountryCode};
 
 /// An active RIPE Atlas anchor that has an IPv4 address.
 #[derive(Debug, Clone, PartialEq, Eq)]

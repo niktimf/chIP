@@ -1,6 +1,5 @@
 use crate::Verdict;
-use crate::model::PortalOutcome;
-use crate::verdict::portal::PortalChecks;
+use crate::checks::tunnel::portal::{PortalChecks, PortalOutcome};
 
 pub fn judge_tampering(checks: &PortalChecks) -> Verdict {
     let PortalChecks { https, http } = checks;
@@ -45,7 +44,7 @@ pub fn judge_tampering(checks: &PortalChecks) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Severity;
+    use crate::report::Severity;
 
     #[test]
     fn plain_http_dead_while_https_is_clean_fails_as_a_hoster_block() {

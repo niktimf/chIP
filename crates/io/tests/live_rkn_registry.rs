@@ -17,8 +17,8 @@
 
 use std::net::Ipv4Addr;
 
-use chip_core::ip_lists::RknRegistry;
-use chip_core::model::RknListing;
+use chip_core::checks::direct::ip_lists::RknRegistry;
+use chip_core::checks::direct::rkn_registry::RknListing;
 use chip_io::rkn_registry::RknRegistryClient;
 
 async fn registry() -> RknRegistry {

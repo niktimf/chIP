@@ -1,7 +1,8 @@
 use super::locations::{Locations, LocationsBody};
 use super::types::{MeasurementStatus, RawMeasurement};
 use crate::credentials::GlobalpingToken;
-use chip_core::model::{HttpProbeOutcome, PingSample};
+use chip_core::checks::globalping::latency::PingSample;
+use chip_core::checks::globalping::reach::HttpProbeOutcome;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;

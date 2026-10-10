@@ -1,6 +1,84 @@
+use std::collections::BTreeSet;
+use std::fmt;
+
+use strum::Display;
+
 use crate::Verdict;
-use crate::model::ReputationFacts;
 use itertools::Itertools as _;
+
+/// A proxycheck detection raised for an address.
+///
+/// `Ord` follows declaration order, and the reputation verdict lists the
+/// flags of an address in that order. `Display` gives the flag's name in
+/// the verdict detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display)]
+#[strum(serialize_all = "lowercase")]
+pub enum ReputationFlag {
+    Vpn,
+    Proxy,
+    Tor,
+    Compromised,
+    Anonymous,
+    Scraper,
+}
+
+impl ReputationFlag {
+    /// Whether the flag alone fails the reputation gate. The other flags
+    /// only warn.
+    pub const fn is_hard(self) -> bool {
+        match self {
+            Self::Vpn | Self::Proxy | Self::Tor | Self::Compromised => true,
+            Self::Anonymous | Self::Scraper => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReputationFacts {
+    pub flags: BTreeSet<ReputationFlag>,
+    pub risk: Option<RiskScore>,
+    pub operator: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RiskScore(u8);
+
+impl RiskScore {
+    /// # Errors
+    ///
+    /// Returns `InvalidRiskScore` when `value` exceeds 100.
+    pub fn new(value: u8) -> Result<Self, InvalidRiskScore> {
+        if value <= 100 {
+            Ok(Self(value))
+        } else {
+            Err(InvalidRiskScore(u64::from(value)))
+        }
+    }
+
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("risk score must be between 0 and 100, got {0}")]
+pub struct InvalidRiskScore(u64);
+
+impl TryFrom<u64> for RiskScore {
+    type Error = InvalidRiskScore;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        // `TryFromIntError` carries no data; `InvalidRiskScore` keeps the
+        // rejected value, and `new` rejects 101..=255 with the same value.
+        u8::try_from(value).map_or(Err(InvalidRiskScore(value)), Self::new)
+    }
+}
+
+impl fmt::Display for RiskScore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// proxycheck risk score from which the gate warns. The free tier scores
 /// plain datacenter hosting around 33, so 50 keeps a clean hosting address
@@ -46,8 +124,15 @@ pub fn judge_reputation_operator(facts: &ReputationFacts) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ReputationFlag, RiskScore, Severity};
+    use crate::report::Severity;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn a_risk_score_above_one_hundred_is_rejected() {
+        let error = RiskScore::new(101).unwrap_err();
+
+        assert_eq!(error, InvalidRiskScore(101));
+    }
 
     fn risk(value: u8) -> RiskScore {
         RiskScore::new(value).unwrap()

@@ -1,6 +1,6 @@
 use crate::Verdict;
-use crate::model::ServiceState;
-use crate::verdict::services::{
+use crate::checks::tunnel::ServiceState;
+use crate::checks::tunnel::services::{
     CLOUDFLARE_CHALLENGED, is_cloudflare_challenge,
 };
 use http::StatusCode;
@@ -44,7 +44,7 @@ impl AiProvider {
 ///
 /// Reachability probes hit a models-list or similar authenticated endpoint,
 /// so a 401/403 with no region marker means "reachable, just
-/// unauthenticated" — the opposite of `verdict::services`, where 403 needs a
+/// unauthenticated" — the opposite of `services`, where 403 needs a
 /// region page to count as a refusal at all. AI endpoints answer a plain
 /// unsupported-region error even to anonymous requests, so no such page is
 /// required here.
@@ -90,7 +90,7 @@ pub fn judge_ai_endpoint(state: &ServiceState) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ServiceState, Severity};
+    use crate::report::Severity;
 
     #[test]
     fn an_unrecognized_api_response_cannot_be_classified() {

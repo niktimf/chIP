@@ -1,5 +1,5 @@
-use chip_core::model::ServiceState;
-use chip_core::verdict::ai::{AiProvider, classify_ai_endpoint};
+use chip_core::checks::tunnel::ServiceState;
+use chip_core::checks::tunnel::ai::{AiProvider, classify_ai_endpoint};
 use http::header::USER_AGENT;
 use http::{HeaderName, HeaderValue};
 

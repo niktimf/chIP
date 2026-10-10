@@ -3,32 +3,33 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use chip_core::anchor::{Anchor, select_for_city, select_for_country};
-use chip_core::gate;
-use chip_core::ip_lists::RknRegistry;
-use chip_core::model::{
-    AnchorSeries, PingSample, PingSweepFacts, ReachFacts, ReputationFacts,
-    ServiceState,
+use chip_core::checks::direct::blocklists::judge_blocklists;
+use chip_core::checks::direct::geo::judge_geo;
+use chip_core::checks::direct::ip_lists::RknRegistry;
+use chip_core::checks::direct::provenance::judge_routing;
+use chip_core::checks::direct::reputation::{
+    ReputationFacts, judge_reputation, judge_reputation_operator,
 };
-use chip_core::verdict::ai::judge_ai_endpoint;
-use chip_core::verdict::blocklists::judge_blocklists;
-use chip_core::verdict::geo::judge_geo;
-use chip_core::verdict::latency::judge_latency;
-use chip_core::verdict::neighbors::{
+use chip_core::checks::direct::rkn_registry::judge_rkn_registry;
+use chip_core::checks::globalping::latency::anchor::{
+    Anchor, select_for_city, select_for_country,
+};
+use chip_core::checks::globalping::latency::{
+    AnchorSeries, PingSample, PingSweepFacts, judge_latency,
+};
+use chip_core::checks::globalping::reach::{ReachFacts, judge_reach};
+use chip_core::checks::neighbors::{
     judge_candidate_ptr, judge_neighbor_extremes,
 };
-use chip_core::verdict::provenance::judge_routing;
-use chip_core::verdict::reach::judge_reach;
-use chip_core::verdict::reputation::{
-    judge_reputation, judge_reputation_operator,
-};
-use chip_core::verdict::rkn_registry::judge_rkn_registry;
-use chip_core::verdict::service_geo::{
+use chip_core::checks::ssh::steal::judge_steal;
+use chip_core::checks::tunnel::ServiceState;
+use chip_core::checks::tunnel::ai::judge_ai_endpoint;
+use chip_core::checks::tunnel::service_geo::{
     judge_cdn_edge, judge_search_captcha, judge_service_country,
 };
-use chip_core::verdict::services::ServiceTier;
-use chip_core::verdict::steal::judge_steal;
-use chip_core::verdict::tampering::judge_tampering;
+use chip_core::checks::tunnel::services::ServiceTier;
+use chip_core::checks::tunnel::tampering::judge_tampering;
+use chip_core::report::gate;
 use chip_core::{
     CheckResult, CountryCode, GateId, GateScope, Report, ScanProfile, Verdict,
 };
@@ -1112,7 +1113,7 @@ async fn run_neighbor_checks(command: &ScanCommand, progress: &ScanProgress) {
     let probes = sweep(network_24(ip), &SweepConfig::default()).await;
     let candidate_ptr = probes.iter().find(|probe| probe.ip == ip).map_or_else(
         || {
-            chip_core::model::PtrLookup::Unavailable(
+            chip_core::checks::neighbors::PtrLookup::Unavailable(
                 "candidate was not surveyed".to_string(),
             )
         },
