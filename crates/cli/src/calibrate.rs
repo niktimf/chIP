@@ -1,11 +1,11 @@
 use std::time::Duration;
 
 use anyhow::Context as _;
+use chip_core::model::{AnchorSeries, PingSample, PingSweepFacts};
 use chip_core::verdict::latency::{LatencySummary, summarize_latency};
 use chip_io::atlas::{Anchor, AnchorClient, select_for_city};
 use chip_io::globalping::{
     GlobalpingClient, Locations, MeasurementId, MeasurementKind,
-    RawMeasurement, ping_sweep_facts,
 };
 
 use crate::config::{CalibrateCommand, CalibrationTarget, ProbeSelection};
@@ -76,17 +76,17 @@ impl CalibrationSession {
             .clone();
         let candidate = self
             .globalping
-            .poll_until_finished(&candidate_id, MEASUREMENT_DEADLINE)
+            .poll_ping(&candidate_id, MEASUREMENT_DEADLINE)
             .await?;
         let anchors = self.measure_anchors(city_anchors, &sample).await?;
-        calibration_row(target, &candidate, &anchors)
+        calibration_row(target, candidate, anchors)
     }
 
     async fn measure_anchors(
         &self,
         anchors: Vec<Anchor>,
         sample: &MeasurementId,
-    ) -> anyhow::Result<Vec<(String, RawMeasurement)>> {
+    ) -> anyhow::Result<Vec<AnchorSeries>> {
         let mut measurements = Vec::with_capacity(anchors.len());
         for anchor in anchors {
             let id = self
@@ -96,11 +96,9 @@ impl CalibrationSession {
                     &Locations::reuse(sample.clone()),
                 )
                 .await?;
-            let measurement = self
-                .globalping
-                .poll_until_finished(&id, MEASUREMENT_DEADLINE)
-                .await?;
-            measurements.push((anchor.fqdn, measurement));
+            let samples =
+                self.globalping.poll_ping(&id, MEASUREMENT_DEADLINE).await?;
+            measurements.push(AnchorSeries::new(anchor.fqdn, samples));
         }
         Ok(measurements)
     }
@@ -108,10 +106,10 @@ impl CalibrationSession {
 
 fn calibration_row(
     target: &CalibrationTarget,
-    candidate: &RawMeasurement,
-    anchors: &[(String, RawMeasurement)],
+    candidate: Vec<Option<PingSample>>,
+    anchors: Vec<AnchorSeries>,
 ) -> anyhow::Result<CalibrationRow> {
-    let facts = ping_sweep_facts(candidate, anchors)
+    let facts = PingSweepFacts::new(candidate, anchors)
         .context("Globalping returned misaligned probe sets")?;
     let summary = summarize_latency(&facts)
         .map_err(anyhow::Error::new)

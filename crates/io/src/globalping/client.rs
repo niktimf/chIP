@@ -1,5 +1,6 @@
-use super::types::RawMeasurement;
+use super::types::{MeasurementStatus, RawMeasurement};
 use crate::credentials::GlobalpingToken;
+use chip_core::model::{HttpProbeOutcome, PingSample};
 use serde::Deserialize;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU16;
@@ -211,11 +212,40 @@ impl GlobalpingClient {
         }
     }
 
+    /// Waits for a ping measurement and returns one sample per probe, in
+    /// probe order: `None` where the probe got no usable reply. Measurements
+    /// that reuse the same probe set line up index by index.
+    ///
     /// # Errors
     ///
     /// Returns `GlobalpingError::Timeout` when the measurement does not finish
     /// before `deadline`, and the request errors of `create` otherwise.
-    pub async fn poll_until_finished(
+    pub async fn poll_ping(
+        &self,
+        id: &MeasurementId,
+        deadline: Duration,
+    ) -> Result<Vec<Option<PingSample>>, GlobalpingError> {
+        let measurement = self.poll_until_finished(id, deadline).await?;
+        Ok(measurement.ping_samples())
+    }
+
+    /// Waits for an HTTPS measurement and returns one outcome per probe, in
+    /// probe order.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GlobalpingError::Timeout` when the measurement does not finish
+    /// before `deadline`, and the request errors of `create` otherwise.
+    pub async fn poll_https(
+        &self,
+        id: &MeasurementId,
+        deadline: Duration,
+    ) -> Result<Vec<HttpProbeOutcome>, GlobalpingError> {
+        let measurement = self.poll_until_finished(id, deadline).await?;
+        Ok(measurement.https_outcomes())
+    }
+
+    async fn poll_until_finished(
         &self,
         id: &MeasurementId,
         deadline: Duration,
@@ -239,10 +269,14 @@ impl GlobalpingClient {
                 .await?;
             let measurement: RawMeasurement =
                 Self::checked(resp, "poll measurement")?.json().await?;
-            if measurement.status != "in-progress" {
-                return Ok(measurement);
+            match measurement.status {
+                MeasurementStatus::InProgress => {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                MeasurementStatus::Finished
+                | MeasurementStatus::Failed
+                | MeasurementStatus::Unknown => return Ok(measurement),
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
@@ -466,32 +500,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_until_finished_returns_as_soon_as_status_is_not_in_progress()
-    {
+    async fn a_finished_ping_measurement_yields_one_sample_per_probe() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/measurements/meas-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"id": "meas-1", "status": "finished", "results": []}),
+                serde_json::json!({"id": "meas-1", "status": "finished", "results": [
+                    {"probe": {"city": "Moscow", "network": "Timeweb"},
+                     "result": {"status": "finished", "stats": {"min": 20.0, "loss": 0.0}}},
+                    {"probe": {"city": "Kursk", "network": "Kurier"},
+                     "result": {"status": "failed"}}
+                ]}),
             ))
             .mount(&server)
             .await;
         let sut = client_against(&server);
 
-        let measurement = sut
-            .poll_until_finished(
-                &measurement_id("meas-1"),
-                Duration::from_secs(5),
-            )
+        let samples = sut
+            .poll_ping(&measurement_id("meas-1"), Duration::from_secs(5))
             .await
             .unwrap();
 
-        assert_eq!(measurement.status, "finished");
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].unwrap().rtt(), Duration::from_millis(20));
+        assert_eq!(samples[1], None);
     }
 
     #[tokio::test]
-    async fn poll_until_finished_times_out_on_a_measurement_stuck_in_progress()
-    {
+    async fn a_finished_https_measurement_yields_one_outcome_per_probe() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/measurements/meas-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"id": "meas-1", "status": "finished", "results": [
+                    {"probe": {"city": "Moscow"},
+                     "result": {"status": "finished", "statusCode": 200}},
+                    {"probe": {"city": "Kursk"},
+                     "result": {"status": "failed"}}
+                ]}),
+            ))
+            .mount(&server)
+            .await;
+        let sut = client_against(&server);
+
+        let outcomes = sut
+            .poll_https(&measurement_id("meas-1"), Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(outcomes, [HttpProbeOutcome::Ok, HttpProbeOutcome::Failed]);
+    }
+
+    #[tokio::test]
+    async fn polling_stops_on_a_measurement_status_the_client_does_not_model() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/measurements/meas-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"id": "meas-1", "status": "cancelled", "results": []}),
+            ))
+            .mount(&server)
+            .await;
+        let sut = client_against(&server);
+
+        let samples = sut
+            .poll_ping(&measurement_id("meas-1"), Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(samples, []);
+    }
+
+    #[tokio::test]
+    async fn a_measurement_stuck_in_progress_times_out() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/measurements/meas-1"))
@@ -503,10 +584,7 @@ mod tests {
         let sut = client_against(&server);
 
         let err = sut
-            .poll_until_finished(
-                &measurement_id("meas-1"),
-                Duration::from_millis(50),
-            )
+            .poll_ping(&measurement_id("meas-1"), Duration::from_millis(50))
             .await
             .unwrap_err();
 
@@ -524,10 +602,7 @@ mod tests {
         let sut = client_against(&server);
 
         let err = sut
-            .poll_until_finished(
-                &measurement_id("meas-1"),
-                Duration::from_secs(5),
-            )
+            .poll_ping(&measurement_id("meas-1"), Duration::from_secs(5))
             .await
             .unwrap_err();
 
@@ -622,10 +697,7 @@ mod tests {
                 .set_delay(Duration::from_millis(300)))
             .mount(&server).await;
         let result = client_against(&server)
-            .poll_until_finished(
-                &measurement_id("slow"),
-                Duration::from_millis(50),
-            )
+            .poll_ping(&measurement_id("slow"), Duration::from_millis(50))
             .await;
         assert!(matches!(result, Err(GlobalpingError::Timeout(_))));
     }

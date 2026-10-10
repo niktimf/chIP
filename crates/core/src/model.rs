@@ -1064,4 +1064,51 @@ mod tests {
 
         assert_eq!(error, InvalidPtrName);
     }
+
+    fn reply(rtt_ms: f64) -> PingSample {
+        PingSample::from_millis(rtt_ms, Some(0.0)).unwrap()
+    }
+
+    #[test]
+    fn a_ping_sweep_keeps_every_anchor_aligned_to_the_candidate_probes() {
+        let anchor = AnchorSeries::new("as1", vec![Some(reply(14.0)), None]);
+
+        let sut = PingSweepFacts::new(
+            vec![Some(reply(20.0)), Some(reply(50.0))],
+            vec![anchor],
+        )
+        .unwrap();
+
+        assert_eq!(sut.city_anchors().len(), 1);
+        assert_eq!(sut.city_anchors()[0].id(), "as1");
+        assert_eq!(sut.city_anchors()[0].samples(), [Some(reply(14.0)), None]);
+    }
+
+    #[test]
+    fn a_ping_sweep_rejects_an_anchor_with_a_different_probe_count() {
+        let anchor = AnchorSeries::new("short-anchor", Vec::new());
+
+        let error = PingSweepFacts::new(vec![Some(reply(20.0))], vec![anchor])
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "anchor 'short-anchor' returned 0 probe samples, expected 1"
+        );
+    }
+
+    /// A control probe missing from the reply used to read as `Failed`,
+    /// which the reach gate takes for "the control was unreachable too".
+    #[test]
+    fn reach_rejects_a_control_with_fewer_probes_than_the_candidate() {
+        let candidate = vec![HttpProbeOutcome::Ok, HttpProbeOutcome::Failed];
+
+        let error =
+            ReachFacts::new(candidate, vec![HttpProbeOutcome::Ok]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "anchor 'control' returned 1 probe samples, expected 2"
+        );
+    }
 }

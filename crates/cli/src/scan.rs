@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use chip_core::gate;
 use chip_core::ip_lists::RknRegistry;
-use chip_core::model::{PingSweepFacts, ReputationFacts, ServiceState};
+use chip_core::model::{
+    AnchorSeries, PingSample, PingSweepFacts, ReachFacts, ReputationFacts,
+    ServiceState,
+};
 use chip_core::verdict::ai::judge_ai_endpoint;
 use chip_core::verdict::blocklists::judge_blocklists;
 use chip_core::verdict::geo::judge_geo;
@@ -35,7 +38,6 @@ use chip_io::blocklists::BlockListsClient;
 use chip_io::geoip::GeoIpClient;
 use chip_io::globalping::{
     GlobalpingClient, Locations, MeasurementId, MeasurementKind,
-    RawMeasurement, ping_sweep_facts, reach_facts,
 };
 use chip_io::neighbors::{SweepConfig, sweep};
 use chip_io::proxycheck::ProxycheckClient;
@@ -283,20 +285,23 @@ struct SkippedAnchor {
 /// The anchor pings of the latency gate, split into measured and skipped
 /// anchors and ordered by label.
 struct AnchorRuns {
-    measured: Vec<(String, RawMeasurement)>,
+    measured: Vec<AnchorSeries>,
     skipped: Vec<SkippedAnchor>,
 }
 
-impl FromIterator<(String, anyhow::Result<RawMeasurement>)> for AnchorRuns {
+/// The per-probe ping samples of one anchor, or why it has none.
+type AnchorRun = (String, anyhow::Result<Vec<Option<PingSample>>>);
+
+impl FromIterator<AnchorRun> for AnchorRuns {
     fn from_iter<I>(runs: I) -> Self
     where
-        I: IntoIterator<Item = (String, anyhow::Result<RawMeasurement>)>,
+        I: IntoIterator<Item = AnchorRun>,
     {
         let (measured, skipped): (Vec<_>, Vec<_>) = runs
             .into_iter()
             .sorted_by(|left, right| left.0.cmp(&right.0))
             .partition_map(|(label, run)| match run {
-                Ok(measurement) => Either::Left((label, measurement)),
+                Ok(samples) => Either::Left(AnchorSeries::new(label, samples)),
                 Err(cause) => Either::Right(SkippedAnchor { label, cause }),
             });
         Self { measured, skipped }
@@ -308,8 +313,8 @@ impl AnchorRuns {
     /// With nothing measured there is no latency to judge, so the verdict is
     /// an error carrying every cause.
     fn verdict(
-        &self,
-        judge: impl FnOnce(&[(String, RawMeasurement)]) -> Verdict,
+        self,
+        judge: impl FnOnce(Vec<AnchorSeries>) -> Verdict,
     ) -> Verdict {
         let skipped = self
             .skipped
@@ -321,7 +326,7 @@ impl AnchorRuns {
                 "every anchor measurement failed: {skipped}"
             ));
         }
-        let verdict = judge(&self.measured);
+        let verdict = judge(self.measured);
         if self.skipped.is_empty() {
             return verdict;
         }
@@ -343,17 +348,17 @@ async fn anchor_measurements(
         let label = target.label.clone();
         let target = target.ip;
         tasks.spawn(async move {
-            let measurement: anyhow::Result<RawMeasurement> = async {
+            let samples: anyhow::Result<Vec<Option<PingSample>>> = async {
                 let id = client
                     .create(
                         &MeasurementKind::ping(target),
                         &Locations::reuse(sample),
                     )
                     .await?;
-                Ok(client.poll_until_finished(&id, GLOBALPING_DEADLINE).await?)
+                Ok(client.poll_ping(&id, GLOBALPING_DEADLINE).await?)
             }
             .await;
-            (label, measurement)
+            (label, samples)
         });
     }
     let mut runs = Vec::new();
@@ -398,11 +403,11 @@ async fn reach_verdict(
         }
     };
     let (candidate, control) = tokio::join!(
-        client.poll_until_finished(&candidate_id, GLOBALPING_DEADLINE),
-        client.poll_until_finished(&control_id, GLOBALPING_DEADLINE)
+        client.poll_https(&candidate_id, GLOBALPING_DEADLINE),
+        client.poll_https(&control_id, GLOBALPING_DEADLINE)
     );
     match (candidate, control) {
-        (Ok(candidate), Ok(control)) => reach_facts(&candidate, &control)
+        (Ok(candidate), Ok(control)) => ReachFacts::new(candidate, control)
             .map_or_else(error_verdict, |facts| judge_reach(&facts)),
         (Err(error), _) | (_, Err(error)) => error_verdict(error),
     }
@@ -412,7 +417,7 @@ async fn record_latency(
     client: &GlobalpingClient,
     command: &ScanCommand,
     candidate_id: &MeasurementId,
-    candidate: &RawMeasurement,
+    candidate: Vec<Option<PingSample>>,
     city_targets: &[PingTarget],
     progress: &ScanProgress,
 ) {
@@ -434,7 +439,7 @@ async fn record_latency(
             }
         };
     let latency = runs.verdict(|anchors| {
-        ping_sweep_facts(candidate, anchors).map_or_else(
+        PingSweepFacts::new(candidate, anchors).map_or_else(
             error_verdict,
             |facts: PingSweepFacts| {
                 judge_latency(&facts, command.latency_thresholds())
@@ -475,21 +480,19 @@ async fn run_globalping_measurements(
             return;
         }
     };
-    let candidate = match client
-        .poll_until_finished(&candidate_id, GLOBALPING_DEADLINE)
-        .await
-    {
-        Ok(measurement) => measurement,
-        Err(error) => {
-            progress.add(unavailable_globalping_results(error, listener));
-            return;
-        }
-    };
+    let candidate =
+        match client.poll_ping(&candidate_id, GLOBALPING_DEADLINE).await {
+            Ok(samples) => samples,
+            Err(error) => {
+                progress.add(unavailable_globalping_results(error, listener));
+                return;
+            }
+        };
     record_latency(
         client,
         command,
         &candidate_id,
-        &candidate,
+        candidate,
         city_targets,
         progress,
     )
@@ -1242,25 +1245,17 @@ mod tests {
         );
     }
 
-    fn measured(label: &str) -> (String, anyhow::Result<RawMeasurement>) {
-        let measurement = RawMeasurement {
-            id: format!("ping-{label}"),
-            status: "finished".to_string(),
-            results: Vec::new(),
-        };
-        (label.to_string(), Ok(measurement))
+    fn measured(label: &str) -> AnchorRun {
+        (label.to_string(), Ok(Vec::new()))
     }
 
-    fn failed(
-        label: &str,
-        cause: &str,
-    ) -> (String, anyhow::Result<RawMeasurement>) {
+    fn failed(label: &str, cause: &str) -> AnchorRun {
         let error = anyhow::anyhow!(cause.to_string())
             .context("globalping request failed");
         (label.to_string(), Err(error))
     }
 
-    fn latency_ok(_: &[(String, RawMeasurement)]) -> Verdict {
+    fn latency_ok(_: Vec<AnchorSeries>) -> Verdict {
         Verdict::ok("excess 3 ms")
     }
 
