@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 use std::num::NonZeroU16;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use chip_core::gate;
@@ -32,11 +32,13 @@ use chip_core::{
     CheckResult, CountryCode, GateId, GateScope, Report, ScanProfile, Verdict,
 };
 use chip_io::atlas::{
-    Anchor, AnchorClient, select_for_city, select_for_country,
+    Anchor, AnchorClient, AtlasError, select_for_city, select_for_country,
 };
 use chip_io::blocklists::BlockListsClient;
 use chip_io::geoip::GeoIpClient;
-use chip_io::globalping::{GlobalpingClient, Locations, MeasurementId, Ping};
+use chip_io::globalping::{
+    GlobalpingClient, GlobalpingError, Locations, MeasurementId, Ping,
+};
 use chip_io::neighbors::{SweepConfig, sweep};
 use chip_io::proxycheck::ProxycheckClient;
 use chip_io::ripestat::RipestatClient;
@@ -338,10 +340,9 @@ async fn anchor_measurements(
     first_measurement_id: &MeasurementId<Ping>,
     targets: &[PingTarget],
 ) -> Result<AnchorRuns, tokio::task::JoinError> {
-    let client = Arc::new(client.clone());
     let mut tasks = tokio::task::JoinSet::new();
     for target in targets {
-        let client = Arc::clone(&client);
+        let client = client.clone();
         let sample = first_measurement_id.clone();
         let label = target.label.clone();
         let target = target.ip;
@@ -457,7 +458,11 @@ async fn run_globalping_measurements(
     let locations = match Locations::ru(probes.eyeball(), probes.datacenter()) {
         Ok(locations) => locations,
         Err(error) => {
-            progress.add(unavailable_globalping_results(error, listener));
+            progress.add(globalping_failure_results(
+                gate::LATENCY,
+                error,
+                listener,
+            ));
             return;
         }
     };
@@ -465,7 +470,11 @@ async fn run_globalping_measurements(
     {
         Ok(id) => id,
         Err(error) => {
-            progress.add(unavailable_globalping_results(error, listener));
+            progress.add(globalping_failure_results(
+                gate::LATENCY,
+                error,
+                listener,
+            ));
             return;
         }
     };
@@ -473,7 +482,11 @@ async fn run_globalping_measurements(
         match client.poll_ping(&candidate_id, GLOBALPING_DEADLINE).await {
             Ok(samples) => samples,
             Err(error) => {
-                progress.add(unavailable_globalping_results(error, listener));
+                progress.add(globalping_failure_results(
+                    gate::LATENCY,
+                    error,
+                    listener,
+                ));
                 return;
             }
         };
@@ -494,19 +507,21 @@ async fn run_globalping_measurements(
     }
 }
 
-fn unavailable_globalping_results(
+/// The rows of a Globalping branch that stopped before its measurements:
+/// the gate whose step failed, the latency gate, which needs every step, and
+/// the reach gate when a verified listener was waiting to be measured.
+fn globalping_failure_results(
+    failed: GateId,
     error: impl Into<anyhow::Error>,
     listener: Option<NonZeroU16>,
 ) -> Vec<CheckResult> {
     let detail = error_detail(error);
-    let mut results = vec![CheckResult::new(
-        gate::LATENCY,
-        Verdict::error(detail.clone()),
-    )];
-    if listener.is_some() {
-        results.push(CheckResult::new(gate::REACH, Verdict::error(detail)));
-    }
-    results
+    [failed, gate::LATENCY]
+        .into_iter()
+        .chain(listener.map(|_| gate::REACH))
+        .unique()
+        .map(|gate| CheckResult::new(gate, Verdict::error(detail.clone())))
+        .collect()
 }
 
 fn tunnel_results(verdict: &Verdict) -> Vec<CheckResult> {
@@ -536,8 +551,9 @@ async fn run_tunnel_checks(
     profile: ScanProfile,
     progress: &ScanProgress,
 ) {
-    if profile == ScanProfile::RuBridge {
-        progress.add(profile.skipped(gate::tunnel_gates()));
+    let skipped = profile.skipped(gate::tunnel_gates());
+    if !skipped.is_empty() {
+        progress.add(skipped);
         record_portal(client, progress).await;
         return;
     }
@@ -755,9 +771,30 @@ struct GlobalpingSources {
     control: Option<Ipv4Addr>,
 }
 
-struct GlobalpingSetupError {
-    gate: GateId,
-    detail: String,
+/// Why the Globalping measurements could not start.
+#[derive(Debug, thiserror::Error)]
+enum GlobalpingSetupError {
+    #[error(
+        "only {remaining} Globalping tests remain; need approximately {needed}"
+    )]
+    QuotaExhausted { remaining: u32, needed: u32 },
+    #[error("could not read Globalping quota")]
+    QuotaUnavailable(#[source] GlobalpingError),
+    #[error("could not load RIPE Atlas anchors")]
+    AnchorsUnavailable(#[source] AtlasError),
+}
+
+impl GlobalpingSetupError {
+    /// The gate whose own step failed: the quota check has a gate of its
+    /// own, the anchors are needed only by the latency gate.
+    const fn gate(&self) -> GateId {
+        match self {
+            Self::QuotaExhausted { .. } | Self::QuotaUnavailable(_) => {
+                gate::GLOBALPING_QUOTA
+            }
+            Self::AnchorsUnavailable(_) => gate::LATENCY,
+        }
+    }
 }
 
 /// An open SSH session and the config it was opened with; the SOCKS tunnel
@@ -767,21 +804,52 @@ struct SshConnection {
     config: SshConfig,
 }
 
-struct SshSetup {
-    connection: Option<SshConnection>,
-    listener_port: Option<NonZeroU16>,
+/// What phase B has of the SSH access to the candidate.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a scan holds one value in its phase B future, so the unused \
+              space of the small variants costs nothing worth a box"
+)]
+enum SshState {
+    /// `--no-ssh`: the SSH gates are reported as skipped.
+    Disabled,
+    /// SSH is enabled but no session is open: connecting failed, and its
+    /// error rows are recorded, or the phase deadline cancelled it.
+    Unavailable,
+    Connected {
+        connection: SshConnection,
+        /// The temporary listener port verified from the runner, the port
+        /// the reach gate measures; `None` when no listener became
+        /// reachable. The session keeps its own record of the port to clean
+        /// up, which a listener that failed verification also leaves.
+        listener: Option<NonZeroU16>,
+    },
 }
 
-impl SshSetup {
-    const fn disconnected() -> Self {
-        Self {
-            connection: None,
-            listener_port: None,
+impl SshState {
+    const fn for_access(access: &SshAccess) -> Self {
+        match access {
+            SshAccess::Disabled => Self::Disabled,
+            SshAccess::Enabled(_) => Self::Unavailable,
+        }
+    }
+
+    const fn connection(&self) -> Option<&SshConnection> {
+        match self {
+            Self::Connected { connection, .. } => Some(connection),
+            Self::Disabled | Self::Unavailable => None,
+        }
+    }
+
+    const fn listener(&self) -> Option<NonZeroU16> {
+        match self {
+            Self::Connected { listener, .. } => *listener,
+            Self::Disabled | Self::Unavailable => None,
         }
     }
 
     async fn stop_listener(&self) -> Option<CheckResult> {
-        stop_listener(&self.connection.as_ref()?.session).await
+        stop_listener(&self.connection()?.session).await
     }
 }
 
@@ -848,43 +916,22 @@ async fn prepare_globalping(
         command.globalping_token().cloned(),
     );
     let probes = command.probes();
-    match globalping.limits().await {
-        Ok(limits)
-            if limits.remaining
-                < globalping_budget(probes.eyeball(), probes.datacenter()) =>
-        {
-            return Err(GlobalpingSetupError {
-                gate: gate::GLOBALPING_QUOTA,
-                detail: format!(
-                    "only {} Globalping tests remain; need approximately {}",
-                    limits.remaining,
-                    globalping_budget(probes.eyeball(), probes.datacenter())
-                ),
-            });
-        }
-        Err(error) => {
-            return Err(GlobalpingSetupError {
-                gate: gate::GLOBALPING_QUOTA,
-                detail: error_detail(
-                    anyhow::Error::new(error)
-                        .context("could not read Globalping quota"),
-                ),
-            });
-        }
-        Ok(_) => {}
+    let needed = globalping_budget(probes.eyeball(), probes.datacenter());
+    let limits = globalping
+        .limits()
+        .await
+        .map_err(GlobalpingSetupError::QuotaUnavailable)?;
+    if limits.remaining < needed {
+        return Err(GlobalpingSetupError::QuotaExhausted {
+            remaining: limits.remaining,
+            needed,
+        });
     }
 
-    let anchors =
-        AnchorClient::new(http.clone())
-            .anchors()
-            .await
-            .map_err(|error| GlobalpingSetupError {
-                gate: gate::LATENCY,
-                detail: error_detail(
-                    anyhow::Error::new(error)
-                        .context("could not load RIPE Atlas anchors"),
-                ),
-            })?;
+    let anchors = AnchorClient::new(http.clone())
+        .anchors()
+        .await
+        .map_err(GlobalpingSetupError::AnchorsUnavailable)?;
     let (city_targets, control) = select_targets(command, &anchors);
     Ok(GlobalpingSources {
         client: globalping,
@@ -912,7 +959,7 @@ fn ssh_config(settings: &SshSettings) -> SshConfig {
 )]
 async fn prepare_ssh(
     command: &ScanCommand,
-    setup: &mut SshSetup,
+    ssh: &mut SshState,
     progress: &ScanProgress,
 ) {
     let SshAccess::Enabled(settings) = command.ssh_access() else {
@@ -928,8 +975,20 @@ async fn prepare_ssh(
     };
     // Store the owner before any remote listener can be created. The session
     // records a pending port before starting the mutating remote command.
-    let connection = setup.connection.insert(SshConnection { session, config });
-    setup.listener_port =
+    *ssh = SshState::Connected {
+        connection: SshConnection { session, config },
+        listener: None,
+    };
+    // Borrows the state just stored, so the `else` never runs; it stands in
+    // for an `expect` the lints forbid.
+    let SshState::Connected {
+        connection,
+        listener,
+    } = ssh
+    else {
+        return;
+    };
+    *listener =
         start_listener(&connection.session, command.ip(), progress).await;
 }
 
@@ -952,35 +1011,21 @@ async fn run_globalping_branch(
             .await;
         }
         Err(error) => {
-            let mut results = vec![CheckResult::new(
-                error.gate,
-                Verdict::error(error.detail.clone()),
-            )];
-            if error.gate != gate::LATENCY {
-                results.push(CheckResult::new(
-                    gate::LATENCY,
-                    Verdict::error(error.detail.clone()),
-                ));
-            }
-            if listener_port.is_some() {
-                results.push(CheckResult::new(
-                    gate::REACH,
-                    Verdict::error(error.detail),
-                ));
-            }
-            progress.add(results);
+            let failed = error.gate();
+            progress.add(globalping_failure_results(
+                failed,
+                error,
+                listener_port,
+            ));
         }
     }
 }
 
 async fn run_socks_checks(
     command: &ScanCommand,
-    setup: &SshSetup,
+    connection: &SshConnection,
     progress: &ScanProgress,
 ) {
-    let Some(connection) = &setup.connection else {
-        return;
-    };
     let port = match pick_free_port() {
         Ok(port) => port,
         Err(error) => {
@@ -1040,14 +1085,14 @@ async fn run_steal_check(session: &SshSession, progress: &ScanProgress) {
 
 async fn run_ssh_checks(
     command: &ScanCommand,
-    setup: &SshSetup,
+    ssh: &SshState,
     progress: &ScanProgress,
 ) {
-    let Some(connection) = &setup.connection else {
+    let Some(connection) = ssh.connection() else {
         return;
     };
     tokio::join!(
-        run_socks_checks(command, setup, progress),
+        run_socks_checks(command, connection, progress),
         run_steal_check(&connection.session, progress),
     );
 }
@@ -1108,7 +1153,8 @@ pub async fn run_phase_b(
 ) -> Vec<CheckResult> {
     let deadline = tokio::time::Instant::now() + command.deadline();
     let progress = ScanProgress::default();
-    if matches!(command.ssh_access(), SshAccess::Disabled) {
+    let mut ssh = SshState::for_access(command.ssh_access());
+    if matches!(ssh, SshState::Disabled) {
         progress.add(skipped_ssh_results());
     }
     if command.neighbor_sweep() == NeighborSweep::Disabled {
@@ -1116,19 +1162,13 @@ pub async fn run_phase_b(
             CheckResult::skipped(gate, "--no-neighbors: the /24 was not swept")
         }));
     }
-    let mut ssh = SshSetup::disconnected();
     let work = async {
         let (sources, ()) = tokio::join!(
             prepare_globalping(command, http),
             prepare_ssh(command, &mut ssh, &progress),
         );
         tokio::join!(
-            run_globalping_branch(
-                sources,
-                command,
-                ssh.listener_port,
-                &progress
-            ),
+            run_globalping_branch(sources, command, ssh.listener(), &progress),
             run_ssh_checks(command, &ssh, &progress),
             run_neighbor_checks(command, &progress),
         );
@@ -1155,11 +1195,7 @@ pub async fn run_phase_b(
     fields(candidate_ip = %command.ip(), country = %command.country())
 )]
 pub async fn run_scan(command: &ScanCommand) -> Report {
-    let http = match reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .user_agent(concat!("chip/", env!("CARGO_PKG_VERSION")))
-        .build()
-    {
+    let http = match crate::http_client(REQUEST_TIMEOUT) {
         Ok(client) => client,
         Err(error) => {
             return Report {
@@ -1351,6 +1387,101 @@ mod tests {
         let budget = globalping_budget(8, 4);
 
         assert_eq!(budget, 84);
+    }
+
+    fn verified_listener() -> Option<NonZeroU16> {
+        NonZeroU16::new(8443)
+    }
+
+    #[test]
+    fn an_exhausted_quota_fails_quota_latency_and_reach_with_one_detail() {
+        let sut = GlobalpingSetupError::QuotaExhausted {
+            remaining: 10,
+            needed: 84,
+        };
+
+        let results = globalping_failure_results(
+            gate::GLOBALPING_QUOTA,
+            sut,
+            verified_listener(),
+        );
+
+        let detail = "only 10 Globalping tests remain; need approximately 84";
+        assert_eq!(
+            results,
+            [
+                CheckResult::new(
+                    gate::GLOBALPING_QUOTA,
+                    Verdict::error(detail)
+                ),
+                CheckResult::new(gate::LATENCY, Verdict::error(detail)),
+                CheckResult::new(gate::REACH, Verdict::error(detail)),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_quota_names_its_cause_and_leaves_reach_without_a_listener()
+    {
+        let sut = GlobalpingSetupError::QuotaUnavailable(
+            GlobalpingError::Http("HTTP 429".to_string()),
+        );
+
+        let results =
+            globalping_failure_results(gate::GLOBALPING_QUOTA, sut, None);
+
+        let detail = "could not read Globalping quota: \
+                      globalping request failed: HTTP 429";
+        assert_eq!(
+            results,
+            [
+                CheckResult::new(
+                    gate::GLOBALPING_QUOTA,
+                    Verdict::error(detail)
+                ),
+                CheckResult::new(gate::LATENCY, Verdict::error(detail)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_latency_step_reports_latency_once_beside_reach() {
+        let sut = GlobalpingError::Http("HTTP 503".to_string());
+
+        let results =
+            globalping_failure_results(gate::LATENCY, sut, verified_listener());
+
+        let detail = "globalping request failed: HTTP 503";
+        assert_eq!(
+            results,
+            [
+                CheckResult::new(gate::LATENCY, Verdict::error(detail)),
+                CheckResult::new(gate::REACH, Verdict::error(detail)),
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_anchors_are_reported_under_the_latency_gate() {
+        let sut = GlobalpingSetupError::AnchorsUnavailable(
+            AtlasError::TooManyPages { limit: 20 },
+        );
+
+        let reported = sut.gate();
+
+        assert_eq!(reported, gate::LATENCY);
+    }
+
+    #[test]
+    fn quota_problems_are_reported_under_the_quota_gate() {
+        let sut = GlobalpingSetupError::QuotaExhausted {
+            remaining: 10,
+            needed: 84,
+        };
+
+        let reported = sut.gate();
+
+        assert_eq!(reported, gate::GLOBALPING_QUOTA);
     }
 
     #[test]

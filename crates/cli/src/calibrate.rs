@@ -78,10 +78,7 @@ struct CalibrationSession {
 impl CalibrationSession {
     async fn start(command: &CalibrateCommand) -> anyhow::Result<Self> {
         const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-        let http = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .user_agent(concat!("chip/", env!("CARGO_PKG_VERSION")))
-            .build()
+        let http = crate::http_client(HTTP_TIMEOUT)
             .context("failed to build the HTTP client")?;
         let anchors = AnchorClient::new(http.clone())
             .anchors()

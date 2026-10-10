@@ -6,6 +6,7 @@ use std::error::Error;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use chip_core::{CheckResult, Report, ScanOutcome};
 use clap::Parser as _;
@@ -48,6 +49,15 @@ async fn main() -> ExitCode {
         }
     };
     ExitCode::from(code)
+}
+
+/// The HTTP client of a command's direct requests: every command sends the
+/// same user agent, and each picks its own per-request timeout.
+fn http_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(concat!("chip/", env!("CARGO_PKG_VERSION")))
+        .build()
 }
 
 /// How a command finished when nothing stopped it.
