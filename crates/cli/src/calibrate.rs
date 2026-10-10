@@ -1,14 +1,19 @@
+use std::fmt;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use chip_core::model::{AnchorSeries, PingSample, PingSweepFacts};
-use chip_core::verdict::latency::{LatencySummary, summarize_latency};
+use chip_core::verdict::latency::{
+    LatencySummary, LatencyThresholds, summarize_latency,
+};
 use chip_io::atlas::{Anchor, AnchorClient, select_for_city};
 use chip_io::globalping::{GlobalpingClient, Locations, MeasurementId, Ping};
 
 use crate::config::{CalibrateCommand, CalibrationTarget, ProbeSelection};
 
 const MEASUREMENT_DEADLINE: Duration = Duration::from_secs(90);
+/// How many RIPE Atlas anchors of the target's city to measure against.
+const ANCHORS_PER_CITY: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct CalibrationRow {
@@ -16,12 +21,51 @@ pub struct CalibrationRow {
     pub summary: LatencySummary,
 }
 
-/// Threshold values to pass back as `--max-excess-ms` and `--max-loss-pct`,
-/// in the units of those flags.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SuggestedThresholds {
-    pub max_excess_ms: f64,
-    pub max_loss_pct: f64,
+impl fmt::Display for CalibrationRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:<28} {:>7.2} {:>7.2} {:>11.2}",
+            self.label,
+            self.summary.median_excess_ms,
+            self.summary.p75_excess_ms,
+            self.summary.median_loss_delta_pct
+        )
+    }
+}
+
+/// The calibration rows as a table, followed by the suggested thresholds as
+/// the `--max-excess-ms` and `--max-loss-pct` flags to scan with.
+pub struct CalibrationReport<'a> {
+    rows: &'a [CalibrationRow],
+}
+
+impl<'a> CalibrationReport<'a> {
+    pub const fn new(rows: &'a [CalibrationRow]) -> Self {
+        Self { rows }
+    }
+}
+
+impl fmt::Display for CalibrationReport<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "node                         median     p75  loss-delta")?;
+        for row in self.rows {
+            writeln!(f, "{row}")?;
+        }
+        let summaries: Vec<LatencySummary> =
+            self.rows.iter().map(|row| row.summary).collect();
+        LatencyThresholds::suggested_from(&summaries).map_or(
+            Ok(()),
+            |suggested| {
+                write!(
+                    f,
+                    "\nsuggested: --max-excess-ms {:.1} --max-loss-pct {:.1}",
+                    suggested.max_excess_ms(),
+                    suggested.max_loss_delta_pp()
+                )
+            },
+        )
+    }
 }
 
 struct CalibrationSession {
@@ -33,11 +77,16 @@ struct CalibrationSession {
 
 impl CalibrationSession {
     async fn start(command: &CalibrateCommand) -> anyhow::Result<Self> {
+        const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(HTTP_TIMEOUT)
             .user_agent(concat!("chip/", env!("CARGO_PKG_VERSION")))
-            .build()?;
-        let anchors = AnchorClient::new(http.clone()).anchors().await?;
+            .build()
+            .context("failed to build the HTTP client")?;
+        let anchors = AnchorClient::new(http.clone())
+            .anchors()
+            .await
+            .context("failed to fetch the RIPE Atlas anchor list")?;
         Ok(Self {
             globalping: GlobalpingClient::new(
                 http,
@@ -53,19 +102,34 @@ impl CalibrationSession {
         &mut self,
         target: &CalibrationTarget,
     ) -> anyhow::Result<CalibrationRow> {
-        let city_anchors = select_for_city(&self.anchors, target.city(), 3);
+        let city_anchors =
+            select_for_city(&self.anchors, target.city(), ANCHORS_PER_CITY);
         if city_anchors.is_empty() {
             anyhow::bail!(
                 "no RIPE Atlas anchor found for city '{}'",
                 target.city()
             );
         }
-        let locations = self.first_measurement_id.as_ref().map_or_else(
-            || Locations::ru(self.probes.eyeball(), self.probes.datacenter()),
-            |id| Ok(Locations::reuse(id.clone())),
-        )?;
-        let candidate_id =
-            self.globalping.create_ping(target.ip(), &locations).await?;
+        let locations = self
+            .first_measurement_id
+            .as_ref()
+            .map_or_else(
+                || {
+                    Locations::ru(
+                        self.probes.eyeball(),
+                        self.probes.datacenter(),
+                    )
+                },
+                |id| Ok(Locations::reuse(id.clone())),
+            )
+            .context("failed to build the Globalping probe locations")?;
+        let candidate_id = self
+            .globalping
+            .create_ping(target.ip(), &locations)
+            .await
+            .with_context(|| {
+                format!("failed to start a Globalping ping of {}", target.ip())
+            })?;
         let sample = self
             .first_measurement_id
             .get_or_insert_with(|| candidate_id.clone())
@@ -73,7 +137,13 @@ impl CalibrationSession {
         let candidate = self
             .globalping
             .poll_ping(&candidate_id, MEASUREMENT_DEADLINE)
-            .await?;
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to collect the Globalping ping of {}",
+                    target.ip()
+                )
+            })?;
         let anchors = self.measure_anchors(city_anchors, &sample).await?;
         calibration_row(target, candidate, anchors)
     }
@@ -88,9 +158,23 @@ impl CalibrationSession {
             let id = self
                 .globalping
                 .create_ping(anchor.ip_v4, &Locations::reuse(sample.clone()))
-                .await?;
-            let samples =
-                self.globalping.poll_ping(&id, MEASUREMENT_DEADLINE).await?;
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to start a Globalping ping of anchor {}",
+                        anchor.fqdn
+                    )
+                })?;
+            let samples = self
+                .globalping
+                .poll_ping(&id, MEASUREMENT_DEADLINE)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to collect the Globalping ping of anchor {}",
+                        anchor.fqdn
+                    )
+                })?;
             measurements.push(AnchorSeries::new(anchor.fqdn, samples));
         }
         Ok(measurements)
@@ -113,51 +197,6 @@ fn calibration_row(
     })
 }
 
-pub fn suggest_thresholds(
-    rows: &[CalibrationRow],
-) -> Option<SuggestedThresholds> {
-    const EXCESS_MARGIN_MS: f64 = 5.0;
-    let max_p75 = rows
-        .iter()
-        .map(|row| row.summary.p75_excess_ms)
-        .reduce(f64::max)?;
-    let max_loss = rows
-        .iter()
-        .map(|row| row.summary.median_loss_delta_pct)
-        .reduce(f64::max)?;
-    Some(SuggestedThresholds {
-        max_excess_ms: max_p75 + EXCESS_MARGIN_MS,
-        max_loss_pct: max_loss.max(0.0),
-    })
-}
-
-pub fn render_calibration(rows: &[CalibrationRow]) -> String {
-    let table = rows
-        .iter()
-        .map(|row| {
-            format!(
-                "{:<28} {:>7.2} {:>7.2} {:>11.2}\n",
-                row.label,
-                row.summary.median_excess_ms,
-                row.summary.p75_excess_ms,
-                row.summary.median_loss_delta_pct
-            )
-        })
-        .collect::<Vec<_>>()
-        .concat();
-    let suggestion =
-        suggest_thresholds(rows).map_or_else(String::new, |suggested| {
-            format!(
-                "\nsuggested: --max-excess-ms {:.1} --max-loss-pct {:.1}",
-                suggested.max_excess_ms, suggested.max_loss_pct
-            )
-        });
-    format!(
-        "node                         median     p75  loss-delta\n\
-         {table}{suggestion}"
-    )
-}
-
 #[tracing::instrument(
     name = "calibrate",
     level = "info",
@@ -177,6 +216,8 @@ pub async fn run_calibrate(
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use super::*;
 
     fn row(
@@ -197,19 +238,34 @@ mod tests {
     }
 
     #[test]
-    fn thresholds_add_five_ms_to_the_worst_p75() {
-        let sut = vec![row("a", 4.95, 8.96, 0.0), row("b", 5.40, 9.12, 0.5)];
+    fn the_report_lists_each_node_and_suggests_the_scan_flags() {
+        let rows = [
+            row("185.1.2.3 (Helsinki)", 4.95, 8.96, -0.25),
+            row("10.0.0.1 (Frankfurt am Main)", 5.404, 9.123, -1.5),
+        ];
+        let sut = CalibrationReport::new(&rows);
 
-        let suggested = suggest_thresholds(&sut).unwrap();
+        let rendered = sut.to_string();
 
-        assert!((suggested.max_excess_ms - 14.12).abs() < 0.01);
-        assert!((suggested.max_loss_pct - 0.5).abs() < 0.01);
+        assert_eq!(
+            rendered,
+            "node                         median     p75  loss-delta\n\
+             185.1.2.3 (Helsinki)            4.95    8.96       -0.25\n\
+             10.0.0.1 (Frankfurt am Main)    5.40    9.12       -1.50\n\
+             \n\
+             suggested: --max-excess-ms 14.1 --max-loss-pct 0.0"
+        );
     }
 
     #[test]
-    fn no_threshold_is_suggested_without_calibration_rows() {
-        let result = suggest_thresholds(&[]);
+    fn a_report_without_nodes_is_only_the_header() {
+        let sut = CalibrationReport::new(&[]);
 
-        assert_eq!(result, None);
+        let rendered = sut.to_string();
+
+        assert_eq!(
+            rendered,
+            "node                         median     p75  loss-delta\n"
+        );
     }
 }

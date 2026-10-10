@@ -44,6 +44,44 @@ impl LatencyThresholds {
             max_loss_delta,
         })
     }
+
+    /// Added on top of the worst p75 RTT excess of a calibration run, so the
+    /// suggested threshold leaves room above the known-good nodes it was
+    /// measured on.
+    pub const SUGGESTED_EXCESS_MARGIN: Duration = Duration::from_millis(5);
+
+    /// Suggests thresholds from the summaries of a calibration run against
+    /// known-good nodes: the worst p75 RTT excess plus
+    /// [`Self::SUGGESTED_EXCESS_MARGIN`], and the worst median loss delta,
+    /// raised to zero when it is negative.
+    ///
+    /// Returns `None` for an empty run, and when the worst p75 excess is so
+    /// negative that adding the margin still leaves no positive threshold.
+    pub fn suggested_from(summaries: &[LatencySummary]) -> Option<Self> {
+        let worst_p75_excess_ms = summaries
+            .iter()
+            .map(|summary| summary.p75_excess_ms)
+            .reduce(f64::max)?;
+        let worst_loss_delta_pp = summaries
+            .iter()
+            .map(|summary| summary.median_loss_delta_pct)
+            .reduce(f64::max)?;
+        let max_excess_ms =
+            worst_p75_excess_ms + millis(Self::SUGGESTED_EXCESS_MARGIN);
+        let max_loss_delta_pp = worst_loss_delta_pp.max(0.0);
+        Self::from_millis_and_points(max_excess_ms, max_loss_delta_pp).ok()
+    }
+
+    /// The RTT excess threshold in milliseconds, the unit of the CLI flag.
+    pub fn max_excess_ms(&self) -> f64 {
+        millis(self.max_excess)
+    }
+
+    /// The loss delta threshold in percentage points, the unit of the CLI
+    /// flag.
+    pub const fn max_loss_delta_pp(&self) -> f64 {
+        self.max_loss_delta.0
+    }
 }
 
 /// The largest tolerated loss delta: a finite, non-negative number of
@@ -251,8 +289,8 @@ pub fn judge_latency(
         "median excess {med:.1}ms, p75 {p75:.1}ms across {valid_probes} probes"
     );
 
-    let max_excess_ms = millis(thresholds.max_excess);
-    let PercentagePoints(max_loss_delta_pp) = thresholds.max_loss_delta;
+    let max_excess_ms = thresholds.max_excess_ms();
+    let max_loss_delta_pp = thresholds.max_loss_delta_pp();
 
     if med > max_excess_ms || loss_med > max_loss_delta_pp {
         Verdict::fail(format!(
@@ -497,6 +535,60 @@ mod tests {
         let error = summarize_latency(&sut).unwrap_err();
 
         assert_eq!(error, LatencySummaryError::NoUsableAnchors);
+    }
+
+    fn calibrated(
+        p75_excess_ms: f64,
+        median_loss_delta_pct: f64,
+    ) -> LatencySummary {
+        LatencySummary {
+            median_excess_ms: 0.0,
+            p75_excess_ms,
+            median_loss_delta_pct,
+            valid_probes: 12,
+        }
+    }
+
+    #[test]
+    fn an_empty_calibration_run_suggests_no_thresholds() {
+        let suggested = LatencyThresholds::suggested_from(&[]);
+
+        assert_eq!(suggested, None);
+    }
+
+    #[test]
+    fn the_suggestion_adds_five_ms_to_the_worst_p75_and_keeps_the_worst_loss() {
+        let summaries = [calibrated(8.96, 0.0), calibrated(9.12, 0.5)];
+
+        let suggested = LatencyThresholds::suggested_from(&summaries);
+
+        assert_eq!(
+            suggested,
+            Some(
+                LatencyThresholds::from_millis_and_points(14.12, 0.5).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn a_negative_worst_loss_delta_is_suggested_as_zero() {
+        let summaries = [calibrated(1.0, -0.25), calibrated(2.0, -1.5)];
+
+        let suggested = LatencyThresholds::suggested_from(&summaries);
+
+        assert_eq!(
+            suggested,
+            Some(LatencyThresholds::from_millis_and_points(7.0, 0.0).unwrap())
+        );
+    }
+
+    #[test]
+    fn a_p75_too_negative_for_the_margin_suggests_no_thresholds() {
+        let summaries = [calibrated(-6.0, 0.0)];
+
+        let suggested = LatencyThresholds::suggested_from(&summaries);
+
+        assert_eq!(suggested, None);
     }
 
     /// `cli::calibrate` reads these raw numbers directly, so they

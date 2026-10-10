@@ -221,7 +221,7 @@ async fn run_calibrate_command(
     let rows = calibrate::run_calibrate(command)
         .await
         .map_err(CliError::Calibrate)?;
-    print_output(&calibrate::render_calibration(&rows))
+    print_output(&calibrate::CalibrationReport::new(&rows).to_string())
 }
 
 #[cfg(test)]
