@@ -14,6 +14,9 @@ pub fn judge_tampering(checks: &PortalChecks) -> Verdict {
             "{altered} connectivity checks were altered"
         ));
     }
+    if https.is_empty() {
+        return Verdict::error("no HTTPS connectivity check ran");
+    }
     let https_ok = https.iter().filter(|o| **o == PortalOutcome::Ok).count();
     // With no plain HTTP probe at all there is no evidence of a block.
     let http_dead = !http.is_empty()
@@ -65,6 +68,38 @@ mod tests {
         let verdict = judge_tampering(&checks);
 
         assert_eq!(verdict.severity, Severity::Ok, "{}", verdict.detail);
+    }
+
+    #[rstest::rstest]
+    #[case::no_probes_at_all(Vec::new())]
+    #[case::only_clean_plain_http_probes(vec![PortalOutcome::Ok; 3])]
+    #[case::only_unreachable_plain_http_probes(
+        vec![PortalOutcome::Unreachable; 3]
+    )]
+    fn without_https_probes_there_is_no_verdict(
+        #[case] http: Vec<PortalOutcome>,
+    ) {
+        let sut = PortalChecks {
+            https: Vec::new(),
+            http,
+        };
+
+        let verdict = judge_tampering(&sut);
+
+        assert_eq!(verdict.severity, Severity::Error, "{}", verdict.detail);
+        assert_eq!(verdict.detail, "no HTTPS connectivity check ran");
+    }
+
+    #[test]
+    fn an_altered_plain_http_probe_fails_even_without_https_probes() {
+        let sut = PortalChecks {
+            https: Vec::new(),
+            http: vec![PortalOutcome::Altered],
+        };
+
+        let verdict = judge_tampering(&sut);
+
+        assert_eq!(verdict.severity, Severity::Fail, "{}", verdict.detail);
     }
 
     #[rstest::rstest]

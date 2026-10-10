@@ -6,7 +6,7 @@ use anyhow::Context as _;
 use chip_core::anchor::{Anchor, select_for_city};
 use chip_core::model::{AnchorSeries, PingSample, PingSweepFacts};
 use chip_core::verdict::latency::{
-    LatencySummary, LatencyThresholds, summarize_latency,
+    LatencySummary, SuggestedThresholds, summarize_latency,
 };
 use chip_io::atlas::AnchorClient;
 use chip_io::globalping::{GlobalpingClient, Locations, MeasurementId, Ping};
@@ -28,17 +28,22 @@ impl fmt::Display for CalibrationRow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{:<28} {:>7.2} {:>7.2} {:>11.2}",
+            "{:<28} {:>7.2} {:>7.2} ",
             self.label,
             self.summary.median_excess_ms,
             self.summary.p75_excess_ms,
-            self.summary.median_loss_delta_pct
-        )
+        )?;
+        match self.summary.median_loss_delta_pct {
+            Some(loss_delta) => write!(f, "{loss_delta:>11.2}"),
+            None => write!(f, "{:>11}", "n/a"),
+        }
     }
 }
 
 /// The calibration rows as a table, followed by the suggested thresholds as
-/// the `--max-excess-ms` and `--max-loss-pct` flags to scan with.
+/// the `--max-excess-ms` and `--max-loss-pct` flags to scan with. When no
+/// node reported loss, `--max-loss-pct` is left out: the run gives no value
+/// for it.
 pub struct CalibrationReport<'a> {
     rows: &'a [CalibrationRow],
 }
@@ -57,17 +62,19 @@ impl fmt::Display for CalibrationReport<'_> {
         }
         let summaries: Vec<LatencySummary> =
             self.rows.iter().map(|row| row.summary).collect();
-        LatencyThresholds::suggested_from(&summaries).map_or(
-            Ok(()),
-            |suggested| {
-                write!(
-                    f,
-                    "\nsuggested: --max-excess-ms {:.1} --max-loss-pct {:.1}",
-                    suggested.max_excess_ms(),
-                    suggested.max_loss_delta_pp()
-                )
-            },
-        )
+        let Some(suggested) = SuggestedThresholds::from_calibration(&summaries)
+        else {
+            return Ok(());
+        };
+        write!(
+            f,
+            "\nsuggested: --max-excess-ms {:.1}",
+            suggested.max_excess_ms()
+        )?;
+        match suggested.max_loss_delta_pp() {
+            Some(loss_delta) => write!(f, " --max-loss-pct {loss_delta:.1}"),
+            None => write!(f, " (loss not reported, --max-loss-pct unchanged)"),
+        }
     }
 }
 
@@ -224,7 +231,7 @@ mod tests {
         label: &str,
         median_excess_ms: f64,
         p75_excess_ms: f64,
-        median_loss_delta_pct: f64,
+        median_loss_delta_pct: Option<f64>,
     ) -> CalibrationRow {
         CalibrationRow {
             label: label.into(),
@@ -240,8 +247,8 @@ mod tests {
     #[test]
     fn the_report_lists_each_node_and_suggests_the_scan_flags() {
         let rows = [
-            row("185.1.2.3 (Helsinki)", 4.95, 8.96, -0.25),
-            row("10.0.0.1 (Frankfurt am Main)", 5.404, 9.123, -1.5),
+            row("185.1.2.3 (Helsinki)", 4.95, 8.96, Some(-0.25)),
+            row("10.0.0.1 (Frankfurt am Main)", 5.404, 9.123, Some(-1.5)),
         ];
         let sut = CalibrationReport::new(&rows);
 
@@ -254,6 +261,23 @@ mod tests {
              10.0.0.1 (Frankfurt am Main)    5.40    9.12       -1.50\n\
              \n\
              suggested: --max-excess-ms 14.1 --max-loss-pct 0.0"
+        );
+    }
+
+    #[test]
+    fn a_report_without_reported_loss_prints_no_loss_flag() {
+        let rows = [row("185.1.2.3 (Helsinki)", 4.95, 8.96, None)];
+        let sut = CalibrationReport::new(&rows);
+
+        let rendered = sut.to_string();
+
+        assert_eq!(
+            rendered,
+            "node                         median     p75  loss-delta\n\
+             185.1.2.3 (Helsinki)            4.95    8.96         n/a\n\
+             \n\
+             suggested: --max-excess-ms 14.0 \
+             (loss not reported, --max-loss-pct unchanged)"
         );
     }
 

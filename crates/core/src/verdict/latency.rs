@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::Verdict;
-use crate::model::{AnchorSeries, Percent, PingSample, PingSweepFacts};
+use crate::model::{AnchorSeries, PingSample, PingSweepFacts};
 use crate::units::{duration_from_millis, millis};
 
 /// An anchor whose median RTT differs from its city group's median by more
@@ -45,33 +45,6 @@ impl LatencyThresholds {
         })
     }
 
-    /// Added on top of the worst p75 RTT excess of a calibration run, so the
-    /// suggested threshold leaves room above the known-good nodes it was
-    /// measured on.
-    pub const SUGGESTED_EXCESS_MARGIN: Duration = Duration::from_millis(5);
-
-    /// Suggests thresholds from the summaries of a calibration run against
-    /// known-good nodes: the worst p75 RTT excess plus
-    /// [`Self::SUGGESTED_EXCESS_MARGIN`], and the worst median loss delta,
-    /// raised to zero when it is negative.
-    ///
-    /// Returns `None` for an empty run, and when the worst p75 excess is so
-    /// negative that adding the margin still leaves no positive threshold.
-    pub fn suggested_from(summaries: &[LatencySummary]) -> Option<Self> {
-        let worst_p75_excess_ms = summaries
-            .iter()
-            .map(|summary| summary.p75_excess_ms)
-            .reduce(f64::max)?;
-        let worst_loss_delta_pp = summaries
-            .iter()
-            .map(|summary| summary.median_loss_delta_pct)
-            .reduce(f64::max)?;
-        let max_excess_ms =
-            worst_p75_excess_ms + millis(Self::SUGGESTED_EXCESS_MARGIN);
-        let max_loss_delta_pp = worst_loss_delta_pp.max(0.0);
-        Self::from_millis_and_points(max_excess_ms, max_loss_delta_pp).ok()
-    }
-
     /// The RTT excess threshold in milliseconds, the unit of the CLI flag.
     pub fn max_excess_ms(&self) -> f64 {
         millis(self.max_excess)
@@ -84,11 +57,67 @@ impl LatencyThresholds {
     }
 }
 
+/// Thresholds suggested by a calibration run against known-good nodes.
+///
+/// The loss delta is `None` when no node of the run had a loss figure on
+/// both sides: Globalping's `stats.loss` is optional, and the run then says
+/// nothing about loss.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SuggestedThresholds {
+    max_excess: Duration,
+    max_loss_delta: Option<PercentagePoints>,
+}
+
+impl SuggestedThresholds {
+    /// Added on top of the worst p75 RTT excess of a calibration run, so the
+    /// suggested threshold leaves room above the known-good nodes it was
+    /// measured on.
+    pub const EXCESS_MARGIN: Duration = Duration::from_millis(5);
+
+    /// The worst p75 RTT excess plus [`Self::EXCESS_MARGIN`], and the worst
+    /// reported median loss delta, raised to zero when it is negative.
+    ///
+    /// Returns `None` for an empty run, and when the worst p75 excess is so
+    /// negative that adding the margin still leaves no positive threshold.
+    pub fn from_calibration(summaries: &[LatencySummary]) -> Option<Self> {
+        let worst_p75_excess_ms = summaries
+            .iter()
+            .map(|summary| summary.p75_excess_ms)
+            .reduce(f64::max)?;
+        let max_excess = duration_from_millis(
+            worst_p75_excess_ms + millis(Self::EXCESS_MARGIN),
+        )
+        .ok()
+        .filter(|excess| !excess.is_zero())?;
+        let max_loss_delta = summaries
+            .iter()
+            .filter_map(|summary| summary.median_loss_delta_pct)
+            .reduce(f64::max)
+            .map(|worst| PercentagePoints(worst.max(0.0)));
+        Some(Self {
+            max_excess,
+            max_loss_delta,
+        })
+    }
+
+    /// The RTT excess threshold in milliseconds, the unit of the CLI flag.
+    pub fn max_excess_ms(&self) -> f64 {
+        millis(self.max_excess)
+    }
+
+    /// The loss delta threshold in percentage points, the unit of the CLI
+    /// flag; `None` when the run reported no loss.
+    pub fn max_loss_delta_pp(&self) -> Option<f64> {
+        self.max_loss_delta.map(|points| points.0)
+    }
+}
+
 /// The largest tolerated loss delta: a finite, non-negative number of
 /// percentage points.
 ///
-/// It is not a [`Percent`]: a threshold above 100 points is accepted and
-/// never trips, since a delta of two percentages stays within 100.
+/// It is not a [`Percent`](crate::model::Percent): a threshold above 100
+/// points is accepted and never trips, since a delta of two percentages stays
+/// within 100.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct PercentagePoints(f64);
 
@@ -125,8 +154,10 @@ pub enum InvalidLatencyThresholds {
 pub struct LatencySummary {
     pub median_excess_ms: f64,
     pub p75_excess_ms: f64,
-    /// Candidate loss minus anchor loss, in percentage points.
-    pub median_loss_delta_pct: f64,
+    /// Candidate loss minus anchor loss, in percentage points, over the
+    /// valid probes where both sides reported loss. `None` when no probe
+    /// did: Globalping's `stats.loss` is optional.
+    pub median_loss_delta_pct: Option<f64>,
     pub valid_probes: usize,
 }
 
@@ -227,16 +258,19 @@ pub fn summarize_latency(
         return Err(LatencySummaryError::NoUsableAnchors);
     }
 
-    let (excess, loss_delta): (Vec<f64>, Vec<f64>) = facts
+    let deltas: Vec<ProbeDelta> = facts
         .candidate()
         .iter()
         .enumerate()
         .filter_map(|(probe, candidate)| {
-            let delta =
-                ProbeDelta::against_best_anchor((*candidate)?, &kept, probe)?;
-            Some((delta.excess_ms, delta.loss_delta_pp))
+            ProbeDelta::against_best_anchor((*candidate)?, &kept, probe)
         })
-        .unzip();
+        .collect();
+    let excess: Vec<f64> = deltas.iter().map(|delta| delta.excess_ms).collect();
+    let loss_delta: Vec<f64> = deltas
+        .iter()
+        .filter_map(|delta| delta.loss_delta_pp)
+        .collect();
 
     if excess.len() < MIN_VALID_PROBES {
         return Err(LatencySummaryError::TooFewValidProbes {
@@ -249,7 +283,8 @@ pub fn summarize_latency(
     Ok(LatencySummary {
         median_excess_ms: median(&excess),
         p75_excess_ms: percentile75(&excess),
-        median_loss_delta_pct: median(&loss_delta),
+        median_loss_delta_pct: (!loss_delta.is_empty())
+            .then(|| median(&loss_delta)),
         valid_probes: excess.len(),
     })
 }
@@ -258,7 +293,8 @@ pub fn summarize_latency(
 /// same probe.
 struct ProbeDelta {
     excess_ms: f64,
-    loss_delta_pp: f64,
+    /// `None` when the candidate or the best anchor has no loss figure.
+    loss_delta_pp: Option<f64>,
 }
 
 impl ProbeDelta {
@@ -275,14 +311,12 @@ impl ProbeDelta {
             .min_by_key(|sample| sample.rtt())?;
         Some(Self {
             excess_ms: millis(candidate.rtt()) - millis(best.rtt()),
-            loss_delta_pp: loss_points(candidate) - loss_points(best),
+            loss_delta_pp: candidate
+                .loss()
+                .zip(best.loss())
+                .map(|(candidate, best)| candidate.get() - best.get()),
         })
     }
-}
-
-/// A sample without a loss figure counts as lossless.
-fn loss_points(sample: PingSample) -> f64 {
-    sample.loss().map_or(0.0, Percent::get)
 }
 
 pub fn judge_latency(
@@ -299,14 +333,20 @@ pub fn judge_latency(
         median_loss_delta_pct: loss_med,
         valid_probes,
     } = summary;
-    let detail = format!(
+    let rtt = format!(
         "median excess {med:.1}ms, p75 {p75:.1}ms across {valid_probes} probes"
     );
+    let detail = if loss_med.is_some() {
+        rtt
+    } else {
+        format!("{rtt}, loss not reported")
+    };
 
     let max_excess_ms = thresholds.max_excess_ms();
     let max_loss_delta_pp = thresholds.max_loss_delta_pp();
+    let loss_exceeded = loss_med.is_some_and(|loss| loss > max_loss_delta_pp);
 
-    if med > max_excess_ms || loss_med > max_loss_delta_pp {
+    if med > max_excess_ms || loss_exceeded {
         Verdict::fail(format!(
             "{detail}, threshold {max_excess_ms}ms/{max_loss_delta_pp}pp exceeded"
         ))
@@ -560,7 +600,7 @@ mod tests {
 
     fn calibrated(
         p75_excess_ms: f64,
-        median_loss_delta_pct: f64,
+        median_loss_delta_pct: Option<f64>,
     ) -> LatencySummary {
         LatencySummary {
             median_excess_ms: 0.0,
@@ -572,44 +612,151 @@ mod tests {
 
     #[test]
     fn an_empty_calibration_run_suggests_no_thresholds() {
-        let suggested = LatencyThresholds::suggested_from(&[]);
+        let suggested = SuggestedThresholds::from_calibration(&[]);
 
         assert_eq!(suggested, None);
     }
 
     #[test]
     fn the_suggestion_adds_five_ms_to_the_worst_p75_and_keeps_the_worst_loss() {
-        let summaries = [calibrated(8.96, 0.0), calibrated(9.12, 0.5)];
+        let summaries =
+            [calibrated(8.96, Some(0.0)), calibrated(9.12, Some(0.5))];
 
-        let suggested = LatencyThresholds::suggested_from(&summaries);
+        let suggested =
+            SuggestedThresholds::from_calibration(&summaries).unwrap();
 
         assert_eq!(
             suggested,
-            Some(
-                LatencyThresholds::from_millis_and_points(14.12, 0.5).unwrap()
-            )
+            SuggestedThresholds {
+                max_excess: Duration::from_micros(14_120),
+                max_loss_delta: Some(PercentagePoints(0.5)),
+            }
         );
     }
 
     #[test]
     fn a_negative_worst_loss_delta_is_suggested_as_zero() {
-        let summaries = [calibrated(1.0, -0.25), calibrated(2.0, -1.5)];
+        let summaries =
+            [calibrated(1.0, Some(-0.25)), calibrated(2.0, Some(-1.5))];
 
-        let suggested = LatencyThresholds::suggested_from(&summaries);
+        let suggested =
+            SuggestedThresholds::from_calibration(&summaries).unwrap();
 
-        assert_eq!(
-            suggested,
-            Some(LatencyThresholds::from_millis_and_points(7.0, 0.0).unwrap())
-        );
+        assert_eq!(suggested.max_loss_delta_pp(), Some(0.0));
+    }
+
+    #[test]
+    fn nodes_without_reported_loss_do_not_lower_the_suggested_loss() {
+        let summaries = [calibrated(1.0, None), calibrated(2.0, Some(0.75))];
+
+        let suggested =
+            SuggestedThresholds::from_calibration(&summaries).unwrap();
+
+        assert_eq!(suggested.max_loss_delta_pp(), Some(0.75));
+    }
+
+    #[test]
+    fn a_run_without_reported_loss_suggests_no_loss_threshold() {
+        let summaries = [calibrated(1.0, None), calibrated(2.0, None)];
+
+        let suggested =
+            SuggestedThresholds::from_calibration(&summaries).unwrap();
+
+        assert_eq!(suggested.max_loss_delta_pp(), None);
     }
 
     #[test]
     fn a_p75_too_negative_for_the_margin_suggests_no_thresholds() {
-        let summaries = [calibrated(-6.0, 0.0)];
+        let summaries = [calibrated(-6.0, Some(0.0))];
 
-        let suggested = LatencyThresholds::suggested_from(&summaries);
+        let suggested = SuggestedThresholds::from_calibration(&summaries);
 
         assert_eq!(suggested, None);
+    }
+
+    fn samples_with_loss(
+        rtt_ms: f64,
+        loss_pct: &[Option<f64>],
+    ) -> Vec<Option<PingSample>> {
+        loss_pct
+            .iter()
+            .map(|&loss| Some(PingSample::from_millis(rtt_ms, loss).unwrap()))
+            .collect()
+    }
+
+    /// Three probes report 10% loss against the anchor's 0%, five report no
+    /// loss at all. Counting the five as lossless made the median delta 0.
+    fn three_lossy_probes_and_five_without_loss() -> PingSweepFacts {
+        let candidate = samples_with_loss(
+            21.0,
+            &[
+                Some(10.0),
+                None,
+                Some(10.0),
+                None,
+                None,
+                Some(10.0),
+                None,
+                None,
+            ],
+        );
+        facts(candidate, vec![anchor("only", &[20.0; 8])])
+    }
+
+    #[test]
+    fn the_loss_delta_is_the_median_over_probes_that_reported_loss() {
+        let sut = three_lossy_probes_and_five_without_loss();
+
+        let summary = summarize_latency(&sut).unwrap();
+
+        assert_eq!(summary.median_loss_delta_pct, Some(10.0));
+    }
+
+    #[test]
+    fn probes_without_loss_do_not_dilute_a_loss_delta_over_threshold() {
+        let sut = three_lossy_probes_and_five_without_loss();
+
+        let verdict = judge_latency(&sut, &thresholds());
+
+        assert_eq!(verdict.severity, Severity::Fail, "{}", verdict.detail);
+    }
+
+    fn no_reported_loss(candidate_rtt_ms: f64) -> PingSweepFacts {
+        facts(
+            samples_with_loss(candidate_rtt_ms, &[None; 8]),
+            vec![anchor("only", &[20.0; 8])],
+        )
+    }
+
+    #[test]
+    fn without_reported_loss_the_summary_has_no_loss_delta() {
+        let sut = no_reported_loss(21.0);
+
+        let summary = summarize_latency(&sut).unwrap();
+
+        assert_eq!(summary.median_loss_delta_pct, None);
+    }
+
+    #[test]
+    fn without_reported_loss_only_the_rtt_is_judged_and_the_detail_says_so() {
+        let sut = no_reported_loss(21.0);
+
+        let verdict = judge_latency(&sut, &thresholds());
+
+        assert_eq!(verdict.severity, Severity::Ok);
+        assert_eq!(
+            verdict.detail,
+            "median excess 1.0ms, p75 1.0ms across 8 probes, loss not reported"
+        );
+    }
+
+    #[test]
+    fn without_reported_loss_a_large_rtt_excess_still_fails() {
+        let sut = no_reported_loss(80.0);
+
+        let verdict = judge_latency(&sut, &thresholds());
+
+        assert_eq!(verdict.severity, Severity::Fail, "{}", verdict.detail);
     }
 
     /// `cli::calibrate` reads these raw numbers directly, so they

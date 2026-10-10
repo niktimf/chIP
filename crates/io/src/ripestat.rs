@@ -23,6 +23,10 @@ pub enum RipestatError {
     Visibility(#[source] chip_core::model::InvalidRoutingFacts),
     #[error("RIPEstat returned no RIS peer data for this address")]
     NoPeerData,
+    #[error(
+        "RIPEstat reports the prefix {prefix} as announced with no origin AS"
+    )]
+    NoOrigins { prefix: Ipv4Net },
 }
 
 /// The part of a `routing-status` answer the client reads.
@@ -35,8 +39,8 @@ struct RoutingStatusBody {
 struct RoutingStatusData {
     resource: String,
     visibility: Visibility,
-    /// Only counted; a missing or `null` list counts as no origins.
-    #[serde(default)]
+    /// Only counted, and only for an announced prefix. `None` for a missing
+    /// or `null` list: the not-announced answer does not need one.
     origins: Option<Vec<serde::de::IgnoredAny>>,
 }
 
@@ -71,8 +75,14 @@ impl RoutingStatusData {
             self.visibility.v4.ris_peers_seeing,
             "visibility.v4.ris_peers_seeing",
         )?;
-        let origin_count =
-            narrow(self.origins.map_or(0, |origins| origins.len()), "origins")?;
+        // Every announcement has an origin AS, and RIPEstat lists it. A
+        // missing, `null` or empty list for an announced prefix is not
+        // "zero origins" for provenance to accept.
+        let origins = self
+            .origins
+            .filter(|origins| !origins.is_empty())
+            .ok_or(RipestatError::NoOrigins { prefix })?;
+        let origin_count = narrow(origins.len(), "origins")?;
         let facts = RoutingFacts::new(seeing, total, origin_count)
             .map_err(RipestatError::Visibility)?;
         Ok(Routing::Announced { prefix, facts })
@@ -172,7 +182,7 @@ mod tests {
         "data": {
             "resource": "203.0.112.0/22",
             "visibility": {"v4": {"ris_peers_seeing": 330, "total_ris_peers": 320}},
-            "origins": []
+            "origins": [{"origin": 64500, "route_objects": ["RIPE"]}]
         }
     }"#;
 
@@ -257,6 +267,55 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, RipestatError::NoPeerData), "{error:?}");
+    }
+
+    #[rstest::rstest]
+    #[case::a_missing_list(r#""visibility": {"v4": {"ris_peers_seeing": 300, "total_ris_peers": 320}}"#)]
+    #[case::a_null_list(r#""visibility": {"v4": {"ris_peers_seeing": 300, "total_ris_peers": 320}}, "origins": null"#)]
+    #[case::an_empty_list(r#""visibility": {"v4": {"ris_peers_seeing": 300, "total_ris_peers": 320}}, "origins": []"#)]
+    #[tokio::test]
+    async fn an_announced_prefix_without_origins_is_a_no_origins_error(
+        #[case] fields: &str,
+    ) {
+        let body = format!(
+            r#"{{"data": {{"resource": "203.0.112.0/22", {fields}}}}}"#
+        );
+        let (_server, sut) = client_answering(&body).await;
+
+        let error = sut
+            .routing_status(Ipv4Addr::new(203, 0, 113, 42))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RipestatError::NoOrigins { prefix }
+                    if prefix == "203.0.112.0/22".parse::<Ipv4Net>().unwrap()
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_not_announced_address_needs_no_origins_list() {
+        let (_server, sut) = client_answering(
+            r#"{"data": {"resource": "192.0.2.1",
+                "visibility": {"v4": {"ris_peers_seeing": 0, "total_ris_peers": 325}}}}"#,
+        )
+        .await;
+
+        let routing = sut
+            .routing_status(Ipv4Addr::new(203, 0, 113, 42))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            routing,
+            Routing::NotAnnounced {
+                total_ris_peers: NonZeroU32::new(325).unwrap(),
+            }
+        );
     }
 
     #[tokio::test]

@@ -1,5 +1,7 @@
 use crate::credentials::ProxycheckApiKey;
-use chip_core::model::{ReputationFacts, ReputationFlag, RiskScore};
+use chip_core::model::{
+    InvalidRiskScore, ReputationFacts, ReputationFlag, RiskScore,
+};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
@@ -17,6 +19,11 @@ pub enum ProxycheckError {
     MalformedEntry {
         ip: Ipv4Addr,
         source: serde_json::Error,
+    },
+    #[error("proxycheck.io entry for {ip} has an out-of-range risk score")]
+    RiskOutOfRange {
+        ip: Ipv4Addr,
+        source: InvalidRiskScore,
     },
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
@@ -70,19 +77,22 @@ struct RawOperator {
     name: Option<String>,
 }
 
-impl From<RawEntry> for ReputationFacts {
-    fn from(entry: RawEntry) -> Self {
+/// A risk above 100 is an error rather than "risk unknown": the rest of the
+/// entry is read strictly, and an unknown risk would hide a changed scale.
+impl TryFrom<RawEntry> for ReputationFacts {
+    type Error = InvalidRiskScore;
+
+    fn try_from(entry: RawEntry) -> Result<Self, Self::Error> {
         let RawEntry {
             detections,
             operator,
         } = entry;
-        Self {
+        let risk = detections.risk.map(RiskScore::try_from).transpose()?;
+        Ok(Self {
             flags: detections.flags(),
-            risk: detections
-                .risk
-                .and_then(|risk| RiskScore::try_from(risk).ok()),
+            risk,
             operator: operator.and_then(|operator| operator.name),
-        }
+        })
     }
 }
 
@@ -140,9 +150,10 @@ impl ProxycheckClient {
             .get_mut(ip.to_string())
             .ok_or(ProxycheckError::MissingEntry { ip })?
             .take();
-        serde_json::from_value::<RawEntry>(entry)
-            .map(ReputationFacts::from)
-            .map_err(|source| ProxycheckError::MalformedEntry { ip, source })
+        let entry = serde_json::from_value::<RawEntry>(entry)
+            .map_err(|source| ProxycheckError::MalformedEntry { ip, source })?;
+        ReputationFacts::try_from(entry)
+            .map_err(|source| ProxycheckError::RiskOutOfRange { ip, source })
     }
 }
 
@@ -379,6 +390,52 @@ mod tests {
             matches!(err, ProxycheckError::MalformedEntry { .. }),
             "{err:?}"
         );
+    }
+
+    /// A risk above 100 used to read as "risk unknown".
+    #[tokio::test]
+    async fn a_risk_above_one_hundred_is_an_out_of_range_error() {
+        let server = MockServer::start().await;
+        let sut = client_against(
+            &server,
+            "203.0.113.8",
+            r#"{"status": "ok", "203.0.113.8": {"detections": {
+                "proxy": false, "vpn": false, "compromised": false,
+                "scraper": false, "tor": false, "anonymous": false,
+                "risk": 150}}}"#,
+        )
+        .await;
+
+        let err = sut
+            .lookup("203.0.113.8".parse().unwrap())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "proxycheck.io entry for 203.0.113.8 has an out-of-range risk score"
+        );
+        assert_eq!(
+            std::error::Error::source(&err).map(ToString::to_string),
+            Some("risk score must be between 0 and 100, got 150".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_without_a_risk_score_has_an_unknown_risk() {
+        let server = MockServer::start().await;
+        let sut = client_against(
+            &server,
+            "203.0.113.8",
+            r#"{"status": "ok", "203.0.113.8": {"detections": {
+                "proxy": false, "vpn": false, "compromised": false,
+                "scraper": false, "tor": false, "anonymous": false}}}"#,
+        )
+        .await;
+
+        let facts = sut.lookup("203.0.113.8".parse().unwrap()).await.unwrap();
+
+        assert_eq!(facts.risk, None);
     }
 
     #[tokio::test]
