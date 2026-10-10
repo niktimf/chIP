@@ -30,7 +30,7 @@ use chip_core::checks::tunnel::service_geo::{
 use chip_core::checks::tunnel::services::ServiceTier;
 use chip_core::checks::tunnel::tampering::judge_tampering;
 use chip_core::report::gate;
-use chip_core::report::gate::GateId;
+use chip_core::report::gate::Gate;
 use chip_core::report::profile::{GateScope, ScanProfile};
 use chip_core::report::{CheckResult, Report, Verdict};
 use chip_core::values::CountryCode;
@@ -108,10 +108,8 @@ impl ScanProgress {
                 results.push(CheckResult::new(gate, Verdict::error(&detail)));
             }
         }
-        results.push(CheckResult::new(
-            gate::SCAN_DEADLINE,
-            Verdict::error(detail),
-        ));
+        results
+            .push(CheckResult::new(Gate::ScanDeadline, Verdict::error(detail)));
     }
 }
 
@@ -205,8 +203,8 @@ fn reputation_results(
         |facts| (judge_reputation(&facts), judge_reputation_operator(&facts)),
     );
     vec![
-        CheckResult::new(gate::REPUTATION, flags),
-        CheckResult::new(gate::REPUTATION_OPERATOR, operator),
+        CheckResult::new(Gate::Reputation, flags),
+        CheckResult::new(Gate::ReputationOperator, operator),
     ]
 }
 
@@ -254,15 +252,12 @@ pub async fn run_phase_a(
     let mut results = reputation_results(reputation);
     results.extend([
         CheckResult::new(
-            gate::BLOCKLISTS,
+            Gate::Blocklists,
             judge_blocklists(&block_lists.check(ip)),
         ),
+        CheckResult::new(Gate::RknRegistry, rkn_registry_verdict(registry, ip)),
         CheckResult::new(
-            gate::RKN_REGISTRY,
-            rkn_registry_verdict(registry, ip),
-        ),
-        CheckResult::new(
-            gate::PROVENANCE,
+            Gate::Provenance,
             provenance
                 .map_or_else(error_verdict, |routing| judge_routing(&routing)),
         ),
@@ -275,13 +270,13 @@ async fn geo_result(
     geo_client: &GeoIpClient,
     command: &ScanCommand,
 ) -> CheckResult {
-    match command.profile().scope(gate::GEO) {
+    match command.profile().scope(Gate::Geo) {
         GateScope::Judged => {
             let facts = geo_client.consensus(command.ip()).await;
             let verdict = judge_geo(&facts, command.country());
-            CheckResult::new(gate::GEO, verdict)
+            CheckResult::new(Gate::Geo, verdict)
         }
-        GateScope::Skipped(reason) => CheckResult::skipped(gate::GEO, reason),
+        GateScope::Skipped(reason) => CheckResult::skipped(Gate::Geo, reason),
     }
 }
 
@@ -448,8 +443,8 @@ async fn record_latency(
     city_targets: &[PingTarget],
     progress: &ScanProgress,
 ) {
-    if !command.profile().judges(gate::LATENCY) {
-        progress.add(command.profile().skipped([gate::LATENCY]));
+    if !command.profile().judges(Gate::Latency) {
+        progress.add(command.profile().skipped([Gate::Latency]));
         return;
     }
     let runs =
@@ -457,7 +452,7 @@ async fn record_latency(
             Ok(runs) => runs,
             Err(error) => {
                 progress.add([CheckResult::new(
-                    gate::LATENCY,
+                    Gate::Latency,
                     error_verdict(
                         anyhow::Error::new(error).context("anchor task failed"),
                     ),
@@ -473,7 +468,7 @@ async fn record_latency(
             },
         )
     });
-    progress.add([CheckResult::new(gate::LATENCY, latency)]);
+    progress.add([CheckResult::new(Gate::Latency, latency)]);
 }
 
 async fn run_globalping_measurements(
@@ -485,8 +480,8 @@ async fn run_globalping_measurements(
     progress: &ScanProgress,
 ) {
     // Without a listener the candidate ping would only feed the latency gate.
-    if listener.is_none() && !command.profile().judges(gate::LATENCY) {
-        progress.add(command.profile().skipped([gate::LATENCY]));
+    if listener.is_none() && !command.profile().judges(Gate::Latency) {
+        progress.add(command.profile().skipped([Gate::Latency]));
         return;
     }
     let locations = Locations::ru(command.probes());
@@ -495,7 +490,7 @@ async fn run_globalping_measurements(
         Ok(id) => id,
         Err(error) => {
             progress.add(globalping_failure_results(
-                gate::LATENCY,
+                Gate::Latency,
                 error,
                 listener,
             ));
@@ -507,7 +502,7 @@ async fn run_globalping_measurements(
             Ok(samples) => samples,
             Err(error) => {
                 progress.add(globalping_failure_results(
-                    gate::LATENCY,
+                    Gate::Latency,
                     error,
                     listener,
                 ));
@@ -527,7 +522,7 @@ async fn run_globalping_measurements(
         let verdict =
             reach_verdict(client, &candidate_id, command.ip(), port, control)
                 .await;
-        progress.add([CheckResult::new(gate::REACH, verdict)]);
+        progress.add([CheckResult::new(Gate::Reach, verdict)]);
     }
 }
 
@@ -535,14 +530,14 @@ async fn run_globalping_measurements(
 /// the gate whose step failed, the latency gate, which needs every step, and
 /// the reach gate when a verified listener was waiting to be measured.
 fn globalping_failure_results(
-    failed: GateId,
+    failed: Gate,
     error: impl Into<anyhow::Error>,
     listener: Option<NonZeroU16>,
 ) -> Vec<CheckResult> {
     let detail = error_detail(error);
-    [failed, gate::LATENCY]
+    [failed, Gate::Latency]
         .into_iter()
-        .chain(listener.map(|_| gate::REACH))
+        .chain(listener.map(|_| Gate::Reach))
         .unique()
         .map(|gate| CheckResult::new(gate, Verdict::error(detail.clone())))
         .collect()
@@ -556,7 +551,7 @@ fn tunnel_results(verdict: &Verdict) -> Vec<CheckResult> {
 
 async fn record_service(
     progress: &ScanProgress,
-    gate: GateId,
+    gate: Gate,
     work: impl std::future::Future<Output = ServiceState>,
     tier: ServiceTier,
 ) {
@@ -566,7 +561,7 @@ async fn record_service(
 
 async fn record_portal(client: &TunnelClient, progress: &ScanProgress) {
     let verdict = judge_tampering(&probe_portal_endpoints(client).await);
-    progress.add([CheckResult::new(gate::TAMPERING, verdict)]);
+    progress.add([CheckResult::new(Gate::Tampering, verdict)]);
 }
 
 async fn run_tunnel_checks(
@@ -596,25 +591,25 @@ async fn record_primary_services(
     tokio::join!(
         record_service(
             progress,
-            gate::SERVICE_CHATGPT_WEB,
+            Gate::ServiceChatgptWeb,
             probe_chatgpt_web(client),
             ServiceTier::Primary
         ),
         record_service(
             progress,
-            gate::SERVICE_CHATGPT_APP,
+            Gate::ServiceChatgptApp,
             probe_chatgpt_app(client),
             ServiceTier::Primary
         ),
         record_service(
             progress,
-            gate::SERVICE_GEMINI,
+            Gate::ServiceGemini,
             probe_gemini(client),
             ServiceTier::Primary
         ),
         record_service(
             progress,
-            gate::SERVICE_YOUTUBE_PREMIUM,
+            Gate::ServiceYoutubePremium,
             probe_youtube_premium(client),
             ServiceTier::Primary
         ),
@@ -628,25 +623,25 @@ async fn record_secondary_services(
     tokio::join!(
         record_service(
             progress,
-            gate::SERVICE_NETFLIX,
+            Gate::ServiceNetflix,
             probe_netflix(client),
             ServiceTier::Secondary
         ),
         record_service(
             progress,
-            gate::SERVICE_CLAUDE,
+            Gate::ServiceClaude,
             probe_claude(client),
             ServiceTier::Secondary
         ),
         record_service(
             progress,
-            gate::SERVICE_TIKTOK,
+            Gate::ServiceTiktok,
             probe_tiktok(client),
             ServiceTier::Secondary
         ),
         record_service(
             progress,
-            gate::SERVICE_NOTEBOOKLM,
+            Gate::ServiceNotebooklm,
             probe_notebooklm(client),
             ServiceTier::Secondary
         ),
@@ -666,11 +661,11 @@ async fn record_service_geo(
             let observations = probe_service_geo(client).await;
             progress.add([
                 CheckResult::new(
-                    gate::SERVICE_GEO,
+                    Gate::ServiceGeo,
                     judge_service_country(&observations.votes, country),
                 ),
                 CheckResult::new(
-                    gate::SERVICE_GEO_CDN,
+                    Gate::ServiceGeoCdn,
                     judge_cdn_edge(&observations.edges),
                 ),
             ]);
@@ -679,7 +674,7 @@ async fn record_service_geo(
             let captcha =
                 probe_search_captcha(client, CAPTCHA_RETRY_AFTER).await;
             progress.add([CheckResult::new(
-                gate::SERVICE_GEO_CAPTCHA,
+                Gate::ServiceGeoCaptcha,
                 judge_search_captcha(&captcha),
             )]);
         },
@@ -687,19 +682,19 @@ async fn record_service_geo(
             let states = probe_ai_endpoints(client).await;
             progress.add([
                 CheckResult::new(
-                    gate::AI_OPENAI,
+                    Gate::AiOpenai,
                     judge_ai_endpoint(&states.openai),
                 ),
                 CheckResult::new(
-                    gate::AI_ANTHROPIC,
+                    Gate::AiAnthropic,
                     judge_ai_endpoint(&states.anthropic),
                 ),
                 CheckResult::new(
-                    gate::AI_GEMINI,
+                    Gate::AiGemini,
                     judge_ai_endpoint(&states.gemini),
                 ),
                 CheckResult::new(
-                    gate::AI_DEEPSEEK,
+                    Gate::AiDeepseek,
                     judge_ai_endpoint(&states.deepseek),
                 ),
             ]);
@@ -763,7 +758,7 @@ async fn start_listener(
                         let _logged: Option<CheckResult> =
                             stop_listener(session).await;
                         progress.add([CheckResult::new(
-                            gate::REACH,
+                            Gate::Reach,
                             error_verdict(error),
                         )]);
                         return None;
@@ -773,20 +768,20 @@ async fn start_listener(
             Ok(ListenerOutcome::PortInUse) => {}
             Ok(ListenerOutcome::Failed(detail)) => {
                 progress.add([CheckResult::new(
-                    gate::REACH,
+                    Gate::Reach,
                     Verdict::error(format!("listener failed: {detail}")),
                 )]);
                 return None;
             }
             Err(error) => {
                 progress
-                    .add([CheckResult::new(gate::REACH, error_verdict(error))]);
+                    .add([CheckResult::new(Gate::Reach, error_verdict(error))]);
                 return None;
             }
         }
     }
     progress.add([CheckResult::new(
-        gate::REACH,
+        Gate::Reach,
         Verdict::error("candidate ports 443 and 8443 are already in use"),
     )]);
     None
@@ -814,12 +809,12 @@ enum GlobalpingSetupError {
 impl GlobalpingSetupError {
     /// The gate whose own step failed: the quota check has a gate of its
     /// own, the anchors are needed only by the latency gate.
-    const fn gate(&self) -> GateId {
+    const fn gate(&self) -> Gate {
         match self {
             Self::QuotaExhausted { .. } | Self::QuotaUnavailable(_) => {
-                gate::GLOBALPING_QUOTA
+                Gate::GlobalpingQuota
             }
-            Self::AnchorsUnavailable(_) => gate::LATENCY,
+            Self::AnchorsUnavailable(_) => Gate::Latency,
         }
     }
 }
@@ -888,7 +883,7 @@ async fn stop_listener(session: &SshSession) -> Option<CheckResult> {
                 "temporary listener cleanup failed"
             );
             Some(CheckResult::new(
-                gate::LISTENER_CLEANUP,
+                Gate::ListenerCleanup,
                 Verdict::error(detail),
             ))
         }
@@ -905,7 +900,7 @@ fn skipped_ssh_results() -> Vec<CheckResult> {
 fn unavailable_ssh_results(error: chip_io::ssh::SshError) -> Vec<CheckResult> {
     let detail =
         error_detail(anyhow::Error::new(error).context("SSH unavailable"));
-    std::iter::once(CheckResult::new(gate::SSH, Verdict::error(detail.clone())))
+    std::iter::once(CheckResult::new(Gate::Ssh, Verdict::error(detail.clone())))
         .chain(
             gate::ssh_gates().map(|gate| {
                 CheckResult::new(gate, Verdict::error(detail.clone()))
@@ -1083,7 +1078,7 @@ async fn run_steal_check(session: &SshSession, progress: &ScanProgress) {
         }
         Err(error) => error_verdict(error),
     };
-    progress.add([CheckResult::new(gate::STEAL, verdict)]);
+    progress.add([CheckResult::new(Gate::Steal, verdict)]);
 }
 
 async fn run_ssh_checks(
@@ -1122,10 +1117,10 @@ async fn run_neighbor_checks(command: &ScanCommand, progress: &ScanProgress) {
     );
     progress.add([
         CheckResult::new(
-            gate::NEIGHBORS_PTR,
+            Gate::NeighborsPtr,
             judge_candidate_ptr(&candidate_ptr),
         ),
-        CheckResult::new(gate::NEIGHBORS, judge_neighbor_extremes(&probes)),
+        CheckResult::new(Gate::Neighbors, judge_neighbor_extremes(&probes)),
     ]);
 }
 
@@ -1192,7 +1187,7 @@ pub async fn run_scan(command: &ScanCommand) -> Report {
         Err(error) => {
             return Report {
                 results: vec![CheckResult::new(
-                    gate::HTTP_CLIENT,
+                    Gate::HttpClient,
                     error_verdict(error),
                 )],
             };
@@ -1342,7 +1337,7 @@ mod tests {
     fn no_ssh_skips_the_listener_ssh_and_tunnel_gates() {
         let results = skipped_ssh_results();
 
-        let skipped: HashSet<GateId> = results
+        let skipped: HashSet<Gate> = results
             .iter()
             .filter(|result| result.is_skipped())
             .map(CheckResult::gate)
@@ -1351,24 +1346,24 @@ mod tests {
         assert_eq!(
             skipped,
             HashSet::from([
-                gate::REACH,
-                gate::STEAL,
-                gate::TAMPERING,
-                gate::SERVICE_CHATGPT_WEB,
-                gate::SERVICE_CHATGPT_APP,
-                gate::SERVICE_GEMINI,
-                gate::SERVICE_YOUTUBE_PREMIUM,
-                gate::SERVICE_NETFLIX,
-                gate::SERVICE_CLAUDE,
-                gate::SERVICE_TIKTOK,
-                gate::SERVICE_NOTEBOOKLM,
-                gate::SERVICE_GEO,
-                gate::SERVICE_GEO_CAPTCHA,
-                gate::SERVICE_GEO_CDN,
-                gate::AI_OPENAI,
-                gate::AI_ANTHROPIC,
-                gate::AI_GEMINI,
-                gate::AI_DEEPSEEK,
+                Gate::Reach,
+                Gate::Steal,
+                Gate::Tampering,
+                Gate::ServiceChatgptWeb,
+                Gate::ServiceChatgptApp,
+                Gate::ServiceGemini,
+                Gate::ServiceYoutubePremium,
+                Gate::ServiceNetflix,
+                Gate::ServiceClaude,
+                Gate::ServiceTiktok,
+                Gate::ServiceNotebooklm,
+                Gate::ServiceGeo,
+                Gate::ServiceGeoCaptcha,
+                Gate::ServiceGeoCdn,
+                Gate::AiOpenai,
+                Gate::AiAnthropic,
+                Gate::AiGemini,
+                Gate::AiDeepseek,
             ])
         );
     }
@@ -1430,7 +1425,7 @@ mod tests {
         };
 
         let results = globalping_failure_results(
-            gate::GLOBALPING_QUOTA,
+            Gate::GlobalpingQuota,
             failure,
             verified_listener(),
         );
@@ -1439,12 +1434,9 @@ mod tests {
         assert_eq!(
             results,
             [
-                CheckResult::new(
-                    gate::GLOBALPING_QUOTA,
-                    Verdict::error(detail)
-                ),
-                CheckResult::new(gate::LATENCY, Verdict::error(detail)),
-                CheckResult::new(gate::REACH, Verdict::error(detail)),
+                CheckResult::new(Gate::GlobalpingQuota, Verdict::error(detail)),
+                CheckResult::new(Gate::Latency, Verdict::error(detail)),
+                CheckResult::new(Gate::Reach, Verdict::error(detail)),
             ]
         );
     }
@@ -1459,7 +1451,7 @@ mod tests {
             });
 
         let results =
-            globalping_failure_results(gate::GLOBALPING_QUOTA, failure, None);
+            globalping_failure_results(Gate::GlobalpingQuota, failure, None);
 
         let detail = "could not read Globalping quota: \
                       globalping request failed: read limits: \
@@ -1467,11 +1459,8 @@ mod tests {
         assert_eq!(
             results,
             [
-                CheckResult::new(
-                    gate::GLOBALPING_QUOTA,
-                    Verdict::error(detail)
-                ),
-                CheckResult::new(gate::LATENCY, Verdict::error(detail)),
+                CheckResult::new(Gate::GlobalpingQuota, Verdict::error(detail)),
+                CheckResult::new(Gate::Latency, Verdict::error(detail)),
             ]
         );
     }
@@ -1484,7 +1473,7 @@ mod tests {
         };
 
         let results = globalping_failure_results(
-            gate::LATENCY,
+            Gate::Latency,
             failure,
             verified_listener(),
         );
@@ -1494,8 +1483,8 @@ mod tests {
         assert_eq!(
             results,
             [
-                CheckResult::new(gate::LATENCY, Verdict::error(detail)),
-                CheckResult::new(gate::REACH, Verdict::error(detail)),
+                CheckResult::new(Gate::Latency, Verdict::error(detail)),
+                CheckResult::new(Gate::Reach, Verdict::error(detail)),
             ]
         );
     }
@@ -1508,7 +1497,7 @@ mod tests {
 
         let reported = sut.gate();
 
-        assert_eq!(reported, gate::LATENCY);
+        assert_eq!(reported, Gate::Latency);
     }
 
     #[test]
@@ -1520,25 +1509,25 @@ mod tests {
 
         let reported = sut.gate();
 
-        assert_eq!(reported, gate::GLOBALPING_QUOTA);
+        assert_eq!(reported, Gate::GlobalpingQuota);
     }
 
     #[test]
     fn deadline_keeps_completed_failures_and_marks_only_missing_gates() {
         let sut = ScanProgress::default();
-        sut.add([CheckResult::new(gate::REACH, Verdict::fail("blocked"))]);
+        sut.add([CheckResult::new(Gate::Reach, Verdict::fail("blocked"))]);
 
         sut.deadline(Duration::from_secs(1));
 
         let results = sut.finish();
         let reach: Vec<_> = results
             .iter()
-            .filter(|result| result.gate() == gate::REACH)
+            .filter(|result| result.gate() == Gate::Reach)
             .map(CheckResult::severity)
             .collect();
         let latency: Vec<_> = results
             .iter()
-            .filter(|result| result.gate() == gate::LATENCY)
+            .filter(|result| result.gate() == Gate::Latency)
             .map(CheckResult::severity)
             .collect();
         assert_eq!(reach, [Severity::Fail]);
@@ -1552,17 +1541,17 @@ mod tests {
         apply_rules(
             ScanProfile::Exit,
             overrides,
-            vec![CheckResult::new(gate::REPUTATION, verdict)],
+            vec![CheckResult::new(Gate::Reputation, verdict)],
         )
     }
 
-    fn skipping(id: GateId) -> chip_core::report::gate::GateOverrides {
+    fn skipping(id: Gate) -> chip_core::report::gate::GateOverrides {
         let mut overrides = chip_core::report::gate::GateOverrides::default();
         overrides.skip.insert(id);
         overrides
     }
 
-    fn escalating(id: GateId) -> chip_core::report::gate::GateOverrides {
+    fn escalating(id: Gate) -> chip_core::report::gate::GateOverrides {
         let mut overrides = chip_core::report::gate::GateOverrides::default();
         overrides.escalate.insert(id);
         overrides
@@ -1573,7 +1562,7 @@ mod tests {
         let sut = FailurePolicy::FailFast;
         let results = reputation_result(
             Verdict::fail("blocked"),
-            &skipping(gate::REPUTATION),
+            &skipping(Gate::Reputation),
         );
 
         let stops = sut.stops_after(&results);
@@ -1586,7 +1575,7 @@ mod tests {
         let sut = FailurePolicy::FailFast;
         let results = reputation_result(
             Verdict::warn("suspicious"),
-            &escalating(gate::REPUTATION),
+            &escalating(Gate::Reputation),
         );
 
         let stops = sut.stops_after(&results);

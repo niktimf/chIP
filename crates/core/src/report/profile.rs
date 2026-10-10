@@ -1,5 +1,5 @@
 use crate::report::CheckResult;
-use crate::report::gate::{BridgePolicy, GateId};
+use crate::report::gate::{BridgePolicy, Gate};
 use crate::values::CountryCode;
 
 /// Which gates a scan judges, chosen by the country the candidate was
@@ -9,7 +9,7 @@ use crate::values::CountryCode;
 /// advance, foreign services see it as Russian or refuse it, and the RIPE
 /// Atlas anchors the latency gate compares against are abroad, so those gates
 /// are reported as `SKIP` instead of being judged. Which gates that covers
-/// is a per-gate fact of the registry (`gate::GATES`), not a naming rule.
+/// is a per-gate fact ([`Gate::bridge`]), not a naming rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanProfile {
     Exit,
@@ -35,7 +35,7 @@ impl ScanProfile {
         }
     }
 
-    pub const fn scope(self, gate: GateId) -> GateScope {
+    pub const fn scope(self, gate: Gate) -> GateScope {
         match self {
             Self::Exit => GateScope::Judged,
             Self::RuBridge => match gate.bridge() {
@@ -47,7 +47,7 @@ impl ScanProfile {
         }
     }
 
-    pub fn judges(self, gate: GateId) -> bool {
+    pub fn judges(self, gate: Gate) -> bool {
         self.scope(gate) == GateScope::Judged
     }
 
@@ -66,7 +66,7 @@ impl ScanProfile {
     /// whose probes were never started.
     pub fn skipped(
         self,
-        gates: impl IntoIterator<Item = GateId>,
+        gates: impl IntoIterator<Item = Gate>,
     ) -> Vec<CheckResult> {
         gates
             .into_iter()
@@ -83,15 +83,9 @@ impl ScanProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::gate::{
-        AI_ANTHROPIC, AI_DEEPSEEK, AI_GEMINI, AI_OPENAI, GATES, GEO, LATENCY,
-        SERVICE_CHATGPT_APP, SERVICE_CHATGPT_WEB, SERVICE_CLAUDE,
-        SERVICE_GEMINI, SERVICE_GEO, SERVICE_GEO_CAPTCHA, SERVICE_GEO_CDN,
-        SERVICE_NETFLIX, SERVICE_NOTEBOOKLM, SERVICE_TIKTOK,
-        SERVICE_YOUTUBE_PREMIUM, TAMPERING,
-    };
     use crate::report::{Severity, Verdict};
     use std::collections::HashSet;
+    use strum::IntoEnumIterator;
 
     #[rstest::rstest]
     #[case::russia_in_any_case("ru", ScanProfile::RuBridge)]
@@ -111,35 +105,32 @@ mod tests {
     /// follows the name rule that `ScanProfile::scope` used before the gate
     /// registry: `geo`, `latency`, and every `service:`, `service-geo` and
     /// `ai:` gate.
-    const FOREIGN_EXIT_ONLY: [GateId; 17] = [
-        GEO,
-        LATENCY,
-        SERVICE_CHATGPT_WEB,
-        SERVICE_CHATGPT_APP,
-        SERVICE_GEMINI,
-        SERVICE_YOUTUBE_PREMIUM,
-        SERVICE_NETFLIX,
-        SERVICE_CLAUDE,
-        SERVICE_TIKTOK,
-        SERVICE_NOTEBOOKLM,
-        SERVICE_GEO,
-        SERVICE_GEO_CAPTCHA,
-        SERVICE_GEO_CDN,
-        AI_OPENAI,
-        AI_ANTHROPIC,
-        AI_GEMINI,
-        AI_DEEPSEEK,
+    const FOREIGN_EXIT_ONLY: [Gate; 17] = [
+        Gate::Geo,
+        Gate::Latency,
+        Gate::ServiceChatgptWeb,
+        Gate::ServiceChatgptApp,
+        Gate::ServiceGemini,
+        Gate::ServiceYoutubePremium,
+        Gate::ServiceNetflix,
+        Gate::ServiceClaude,
+        Gate::ServiceTiktok,
+        Gate::ServiceNotebooklm,
+        Gate::ServiceGeo,
+        Gate::ServiceGeoCaptcha,
+        Gate::ServiceGeoCdn,
+        Gate::AiOpenai,
+        Gate::AiAnthropic,
+        Gate::AiGemini,
+        Gate::AiDeepseek,
     ];
 
     #[test]
     fn a_bridge_skips_exactly_the_gates_meant_for_a_foreign_exit() {
         let sut = ScanProfile::RuBridge;
 
-        let skipped: HashSet<GateId> = GATES
-            .iter()
-            .copied()
-            .filter(|&gate| !sut.judges(gate))
-            .collect();
+        let skipped: HashSet<Gate> =
+            Gate::iter().filter(|&gate| !sut.judges(gate)).collect();
 
         assert_eq!(skipped, HashSet::from(FOREIGN_EXIT_ONLY));
     }
@@ -148,18 +139,16 @@ mod tests {
     fn an_exit_judges_every_gate() {
         let sut = ScanProfile::Exit;
 
-        let skipped: Vec<GateId> = GATES
-            .iter()
-            .copied()
-            .filter(|&gate| !sut.judges(gate))
-            .collect();
+        let skipped: Vec<Gate> =
+            Gate::iter().filter(|&gate| !sut.judges(gate)).collect();
 
-        assert_eq!(skipped, Vec::<GateId>::new());
+        assert_eq!(skipped, Vec::<Gate>::new());
     }
 
     #[test]
     fn an_excluded_failure_becomes_a_skip_with_the_reason() {
-        let result = CheckResult::new(LATENCY, Verdict::error("no anchors"));
+        let result =
+            CheckResult::new(Gate::Latency, Verdict::error("no anchors"));
 
         let out = ScanProfile::RuBridge.apply(result);
 
@@ -170,10 +159,10 @@ mod tests {
 
     #[test]
     fn skipped_reports_only_the_excluded_gates() {
-        let out = ScanProfile::RuBridge.skipped([TAMPERING, SERVICE_NETFLIX]);
+        let out = ScanProfile::RuBridge
+            .skipped([Gate::Tampering, Gate::ServiceNetflix]);
 
-        let gates: Vec<_> =
-            out.iter().map(|result| result.gate().as_str()).collect();
-        assert_eq!(gates, ["service:netflix"]);
+        let gates: Vec<Gate> = out.iter().map(CheckResult::gate).collect();
+        assert_eq!(gates, [Gate::ServiceNetflix]);
     }
 }

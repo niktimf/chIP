@@ -280,27 +280,27 @@ async fn run_calibrate_command(
 #[cfg(test)]
 mod tests {
     use chip_core::report::Verdict;
-    use chip_core::report::gate::{GEO, LATENCY, REACH, REPUTATION};
+    use chip_core::report::gate::Gate;
 
     use super::*;
 
     #[rstest::rstest]
     #[case::a_warning_and_a_skipped_gate_pass(
         vec![
-            CheckResult::new(GEO, Verdict::warn("RU 60%")),
-            CheckResult::skipped(REACH, "ports are already in use"),
+            CheckResult::new(Gate::Geo, Verdict::warn("RU 60%")),
+            CheckResult::skipped(Gate::Reach, "ports are already in use"),
         ],
         0
     )]
     #[case::a_failure_fails(
         vec![
-            CheckResult::new(REPUTATION, Verdict::fail("vpn")),
-            CheckResult::new(LATENCY, Verdict::error("no probes")),
+            CheckResult::new(Gate::Reputation, Verdict::fail("vpn")),
+            CheckResult::new(Gate::Latency, Verdict::error("no probes")),
         ],
         1
     )]
     #[case::an_error_without_a_failure_is_undetermined(
-        vec![CheckResult::new(LATENCY, Verdict::error("no probes"))],
+        vec![CheckResult::new(Gate::Latency, Verdict::error("no probes"))],
         2
     )]
     fn the_json_report_carries_the_exit_code_pipelines_rely_on(
@@ -318,10 +318,10 @@ mod tests {
     fn the_json_report_keeps_its_schema_1_document() {
         let report = Report {
             results: vec![
-                CheckResult::new(REPUTATION, Verdict::fail("vpn")),
-                CheckResult::new(GEO, Verdict::warn("RU 60%")),
-                CheckResult::new(LATENCY, Verdict::error("no probes")),
-                CheckResult::skipped(REACH, "ports are already in use"),
+                CheckResult::new(Gate::Reputation, Verdict::fail("vpn")),
+                CheckResult::new(Gate::Geo, Verdict::warn("RU 60%")),
+                CheckResult::new(Gate::Latency, Verdict::error("no probes")),
+                CheckResult::skipped(Gate::Reach, "ports are already in use"),
             ],
         };
 

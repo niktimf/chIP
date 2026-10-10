@@ -1,11 +1,11 @@
-use crate::report::gate::GateId;
+use crate::report::gate::Gate;
 use crate::report::{Severity, Verdict};
 
 /// A `Verdict` attached to the gate id that produced it — the unit the
 /// report, `--gate`, and `--skip-gate` all operate on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckResult {
-    gate: GateId,
+    gate: Gate,
     detail: String,
     outcome: CheckOutcome,
 }
@@ -17,7 +17,7 @@ enum CheckOutcome {
 }
 
 impl CheckResult {
-    pub fn new(gate: GateId, verdict: Verdict) -> Self {
+    pub fn new(gate: Gate, verdict: Verdict) -> Self {
         Self {
             gate,
             detail: verdict.detail,
@@ -25,7 +25,7 @@ impl CheckResult {
         }
     }
 
-    pub fn skipped(gate: GateId, reason: impl Into<String>) -> Self {
+    pub fn skipped(gate: Gate, reason: impl Into<String>) -> Self {
         Self {
             gate,
             detail: reason.into(),
@@ -33,7 +33,7 @@ impl CheckResult {
         }
     }
 
-    pub const fn gate(&self) -> GateId {
+    pub const fn gate(&self) -> Gate {
         self.gate
     }
 
@@ -75,12 +75,12 @@ impl CheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::gate::{GEO, REACH};
+    use crate::report::gate::Gate;
 
     #[test]
     fn a_skipped_check_is_labelled_skip_and_keeps_the_reason_it_carried() {
         let sut = CheckResult::skipped(
-            REACH,
+            Gate::Reach,
             "ports 443 and 8443 are already in use",
         );
 
@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn a_judged_check_is_labelled_by_its_severity() {
-        let sut = CheckResult::new(GEO, Verdict::warn("50/50 split"));
+        let sut = CheckResult::new(Gate::Geo, Verdict::warn("50/50 split"));
 
         assert_eq!(sut.label(), "WARN");
     }

@@ -7,7 +7,7 @@ use std::str::FromStr;
 use chip_core::checks::globalping::latency::{
     InvalidLatencyThresholds, LatencyThresholds,
 };
-use chip_core::report::gate::{GateId, GateOverrides};
+use chip_core::report::gate::{Gate, GateOverrides};
 use chip_core::report::profile::ScanProfile;
 use chip_core::report::{CheckResult, Severity};
 use chip_core::values::{CityName, CountryCode, InvalidCityName};
@@ -220,11 +220,11 @@ struct ScanArgs {
     /// here rather than silently never matching. Repeatable and
     /// comma-separated.
     #[arg(long = "gate", value_delimiter = ',')]
-    gate: Vec<GateId>,
+    gate: Vec<Gate>,
     /// Turn this gate off, e.g. `--skip-gate reach`. It is reported as SKIP
     /// and cannot change the exit code. Repeatable and comma-separated.
     #[arg(long = "skip-gate", value_delimiter = ',')]
-    skip_gate: Vec<GateId>,
+    skip_gate: Vec<Gate>,
     /// Compare latency against this address instead of the RIPE Atlas anchors
     /// picked for the city.
     #[arg(long)]
@@ -578,7 +578,6 @@ mod tests {
     use std::collections::HashSet;
 
     use chip_core::report::Verdict;
-    use chip_core::report::gate;
 
     use super::*;
 
@@ -786,7 +785,7 @@ mod tests {
         #[case] verdict: Verdict,
         #[case] expected: bool,
     ) {
-        let results = [CheckResult::new(gate::GEO, verdict)];
+        let results = [CheckResult::new(Gate::Geo, verdict)];
 
         let actual = sut.stops_after(&results);
 
@@ -812,11 +811,11 @@ mod tests {
     )]
     #[case::misspelled_gate(
         &["scan", "203.0.113.1", "--country", "FI", "--gate", "service:clade"],
-        "'service:clade' is not a known gate id"
+        "invalid value 'service:clade' for '--gate <GATE>'"
     )]
     #[case::misspelled_skip_gate(
         &["scan", "203.0.113.1", "--country", "FI", "--skip-gate", "raech"],
-        "'raech' is not a known gate id"
+        "invalid value 'raech' for '--skip-gate <SKIP_GATE>'"
     )]
     fn malformed_values_are_rejected_during_parsing(
         #[case] args: &[&str],
@@ -849,9 +848,9 @@ mod tests {
         assert_eq!(
             command.gate_overrides().escalate,
             HashSet::from([
-                gate::SERVICE_CLAUDE,
-                gate::NEIGHBORS,
-                gate::REPUTATION_OPERATOR,
+                Gate::ServiceClaude,
+                Gate::Neighbors,
+                Gate::ReputationOperator,
             ])
         );
     }
